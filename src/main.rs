@@ -11,7 +11,6 @@ struct Profile {
     name: &'static str,
     port: u16,
     user_data_dir: &'static str,
-    default_url: &'static str,
 }
 
 const PROFILES: &[Profile] = &[
@@ -19,13 +18,11 @@ const PROFILES: &[Profile] = &[
         name: "note",
         port: 9222,
         user_data_dir: "~/.config/google-chrome-note",
-        default_url: "https://note.com/",
     },
     Profile {
         name: "sana-twitter",
         port: 9223,
         user_data_dir: "~/.config/google-chrome-sana-twitter",
-        default_url: "https://x.com/",
     },
 ];
 
@@ -103,8 +100,8 @@ fn require_profile(args: &[String]) -> Result<Profile, String> {
 fn list_profiles() {
     for profile in PROFILES {
         println!(
-            "{}\tport={}\tuser_data_dir={}\tdefault_url={}",
-            profile.name, profile.port, profile.user_data_dir, profile.default_url
+            "{}\tport={}\tuser_data_dir={}",
+            profile.name, profile.port, profile.user_data_dir
         );
     }
 }
@@ -137,7 +134,6 @@ fn ensure_chrome(profile: Profile) -> Result<(), String> {
         .arg("--no-first-run")
         .arg("--no-default-browser-check")
         .arg("--disable-gpu")
-        .arg(profile.default_url)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())

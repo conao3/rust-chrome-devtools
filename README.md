@@ -7,7 +7,7 @@ The tool is designed to be called as a regular CLI from agent skills. It is not 
 ## Design
 
 - Profiles are explicit: every operation that targets a browser profile requires `--profile <name>`.
-- Profiles own their Chrome user data directory, DevTools port, and default URL.
+- Profiles own their Chrome user data directory and DevTools port.
 - The CLI may execute `chrome-devtools-mcp` internally for a selected profile.
 - MCP input and output are passed through without reimplementing individual Chrome DevTools tools.
 - Hermes-side Chrome DevTools MCP registration is not required for this workflow.
