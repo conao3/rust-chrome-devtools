@@ -1,30 +1,35 @@
 use std::env;
+use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-#[derive(Clone, Copy, Debug)]
-struct Profile {
-    name: &'static str,
-    port: u16,
-    user_data_dir: &'static str,
+#[derive(Clone, Debug)]
+struct Config {
+    profiles: Vec<Profile>,
 }
 
-const PROFILES: &[Profile] = &[
-    Profile {
-        name: "note",
-        port: 9222,
-        user_data_dir: "~/.config/google-chrome-note",
-    },
-    Profile {
-        name: "sana-twitter",
-        port: 9223,
-        user_data_dir: "~/.config/google-chrome-sana-twitter",
-    },
-];
+#[derive(Clone, Debug)]
+struct Profile {
+    name: String,
+    port: u16,
+    user_data_dir: String,
+}
+
+#[derive(Default)]
+struct ProfileBuilder {
+    name: Option<String>,
+    port: Option<u16>,
+    user_data_dir: Option<String>,
+}
+
+const CONFIG_RELATIVE_PATH: &str = ".config/chrome-devtools/config.toml";
+const DEFAULT_PROFILE_NAME: &str = "default";
+const DEFAULT_PROFILE_PORT: u16 = 9222;
+const DEFAULT_PROFILE_USER_DATA_DIR: &str = "~/.config/chrome-devtools/profiles/default";
 
 fn main() {
     if let Err(error) = run() {
@@ -34,6 +39,7 @@ fn main() {
 }
 
 fn run() -> Result<(), String> {
+    let config = load_or_create_config()?;
     let mut args = env::args().skip(1);
     let Some(object) = args.next() else {
         print_usage();
@@ -54,14 +60,14 @@ fn run() -> Result<(), String> {
 
     match (object.as_str(), action.as_str()) {
         ("mcp", "call") => {
-            let profile = require_profile(&rest)?;
-            ensure_chrome(profile)?;
-            exec_mcp(profile)
+            let profile = require_profile(&config, &rest)?;
+            ensure_chrome(&profile)?;
+            exec_mcp(&profile)
         }
         ("mcp", "list") => {
-            let profile = require_profile(&rest)?;
-            ensure_chrome(profile)?;
-            list_mcp_tools(profile)
+            let profile = require_profile(&config, &rest)?;
+            ensure_chrome(&profile)?;
+            list_mcp_tools(&profile)
         }
         ("mcp", "help") => {
             reject_extra_args(&rest)?;
@@ -69,17 +75,17 @@ fn run() -> Result<(), String> {
             Ok(())
         }
         ("profile", "status") => {
-            let profile = require_profile(&rest)?;
-            print_status(profile);
+            let profile = require_profile(&config, &rest)?;
+            print_status(&profile);
             Ok(())
         }
         ("profile", "stop") => {
-            let profile = require_profile(&rest)?;
-            stop_profile(profile)
+            let profile = require_profile(&config, &rest)?;
+            stop_profile(&profile)
         }
         ("profile", "list") => {
             reject_extra_args(&rest)?;
-            list_profiles();
+            list_profiles(&config);
             Ok(())
         }
         (_, "help" | "--help" | "-h") => {
@@ -90,6 +96,161 @@ fn run() -> Result<(), String> {
     }
 }
 
+fn load_or_create_config() -> Result<Config, String> {
+    let path = config_path()?;
+    if !path.exists() {
+        create_default_config(&path)?;
+    }
+
+    let content = fs::read_to_string(&path)
+        .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
+    parse_config(&content).map_err(|error| format!("failed to parse {}: {error}", path.display()))
+}
+
+fn create_default_config(path: &Path) -> Result<(), String> {
+    let Some(parent) = path.parent() else {
+        return Err(format!("config path has no parent: {}", path.display()));
+    };
+
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("failed to create {}: {error}", parent.display()))?;
+    fs::create_dir_all(expand_home(DEFAULT_PROFILE_USER_DATA_DIR)?)
+        .map_err(|error| format!("failed to create default profile user data dir: {error}"))?;
+    fs::write(path, default_config_content())
+        .map_err(|error| format!("failed to write {}: {error}", path.display()))
+}
+
+fn default_config_content() -> String {
+    format!(
+        "[[profiles]]\nname = \"{DEFAULT_PROFILE_NAME}\"\nport = {DEFAULT_PROFILE_PORT}\nuser_data_dir = \"{DEFAULT_PROFILE_USER_DATA_DIR}\"\n"
+    )
+}
+
+fn parse_config(content: &str) -> Result<Config, String> {
+    let mut profiles = Vec::new();
+    let mut current: Option<ProfileBuilder> = None;
+
+    for (line_number, raw_line) in content.lines().enumerate() {
+        let line_number = line_number + 1;
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        if line == "[[profiles]]" {
+            push_profile(&mut profiles, current.take(), line_number)?;
+            current = Some(ProfileBuilder::default());
+            continue;
+        }
+
+        let Some((key, value)) = line.split_once('=') else {
+            return Err(format!("line {line_number}: expected key = value"));
+        };
+        let Some(profile) = current.as_mut() else {
+            return Err(format!(
+                "line {line_number}: profile fields must be inside [[profiles]]"
+            ));
+        };
+
+        let key = key.trim();
+        let value = value.trim();
+        match key {
+            "name" => profile.name = Some(parse_toml_string(value, line_number)?),
+            "port" => {
+                profile.port = Some(
+                    value
+                        .parse::<u16>()
+                        .map_err(|error| format!("line {line_number}: invalid port: {error}"))?,
+                );
+            }
+            "user_data_dir" => profile.user_data_dir = Some(parse_toml_string(value, line_number)?),
+            unknown => {
+                return Err(format!(
+                    "line {line_number}: unknown profile key: {unknown}"
+                ))
+            }
+        }
+    }
+
+    push_profile(&mut profiles, current.take(), content.lines().count() + 1)?;
+
+    if profiles.is_empty() {
+        return Err("config must define at least one [[profiles]] entry".to_string());
+    }
+
+    Ok(Config { profiles })
+}
+
+fn push_profile(
+    profiles: &mut Vec<Profile>,
+    builder: Option<ProfileBuilder>,
+    line_number: usize,
+) -> Result<(), String> {
+    let Some(builder) = builder else {
+        return Ok(());
+    };
+
+    let name = builder
+        .name
+        .ok_or_else(|| format!("line {line_number}: profile is missing name"))?;
+    let port = builder
+        .port
+        .ok_or_else(|| format!("line {line_number}: profile {name} is missing port"))?;
+    let user_data_dir = builder
+        .user_data_dir
+        .ok_or_else(|| format!("line {line_number}: profile {name} is missing user_data_dir"))?;
+
+    if profiles.iter().any(|profile| profile.name == name) {
+        return Err(format!("duplicate profile name: {name}"));
+    }
+
+    profiles.push(Profile {
+        name,
+        port,
+        user_data_dir,
+    });
+    Ok(())
+}
+
+fn parse_toml_string(value: &str, line_number: usize) -> Result<String, String> {
+    let Some(inner) = value
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+    else {
+        return Err(format!("line {line_number}: expected quoted string"));
+    };
+
+    let mut parsed = String::new();
+    let mut chars = inner.chars();
+    while let Some(character) = chars.next() {
+        if character != '\\' {
+            parsed.push(character);
+            continue;
+        }
+
+        let Some(escaped) = chars.next() else {
+            return Err(format!("line {line_number}: dangling escape in string"));
+        };
+        match escaped {
+            '\\' => parsed.push('\\'),
+            '"' => parsed.push('"'),
+            'n' => parsed.push('\n'),
+            'r' => parsed.push('\r'),
+            't' => parsed.push('\t'),
+            other => return Err(format!("line {line_number}: unsupported escape: \\{other}")),
+        }
+    }
+
+    Ok(parsed)
+}
+
+fn config_path() -> Result<PathBuf, String> {
+    let Some(home) = env::var_os("HOME") else {
+        return Err("HOME is not set".to_string());
+    };
+    Ok(PathBuf::from(home).join(CONFIG_RELATIVE_PATH))
+}
+
 fn reject_extra_args(args: &[String]) -> Result<(), String> {
     if args.is_empty() {
         Ok(())
@@ -98,7 +259,7 @@ fn reject_extra_args(args: &[String]) -> Result<(), String> {
     }
 }
 
-fn require_profile(args: &[String]) -> Result<Profile, String> {
+fn require_profile(config: &Config, args: &[String]) -> Result<Profile, String> {
     let mut profile_name = None;
     let mut index = 0;
 
@@ -119,15 +280,16 @@ fn require_profile(args: &[String]) -> Result<Profile, String> {
         return Err("--profile is required".to_string());
     };
 
-    PROFILES
+    config
+        .profiles
         .iter()
         .find(|profile| profile.name == profile_name)
-        .copied()
+        .cloned()
         .ok_or_else(|| format!("unknown profile: {profile_name}"))
 }
 
-fn list_profiles() {
-    for profile in PROFILES {
+fn list_profiles(config: &Config) {
+    for profile in &config.profiles {
         println!(
             "{}\tport={}\tuser_data_dir={}",
             profile.name, profile.port, profile.user_data_dir
@@ -135,7 +297,7 @@ fn list_profiles() {
     }
 }
 
-fn print_status(profile: Profile) {
+fn print_status(profile: &Profile) {
     let state = if is_devtools_ready(profile.port) {
         "ready"
     } else {
@@ -148,13 +310,13 @@ fn print_status(profile: Profile) {
     );
 }
 
-fn ensure_chrome(profile: Profile) -> Result<(), String> {
+fn ensure_chrome(profile: &Profile) -> Result<(), String> {
     if is_devtools_ready(profile.port) {
         return Ok(());
     }
 
     let chrome = env::var("CHROME").unwrap_or_else(|_| "google-chrome-stable".to_string());
-    let user_data_dir = expand_home(profile.user_data_dir)?;
+    let user_data_dir = expand_home(&profile.user_data_dir)?;
 
     Command::new(chrome)
         .arg("--remote-debugging-address=127.0.0.1")
@@ -172,7 +334,7 @@ fn ensure_chrome(profile: Profile) -> Result<(), String> {
     wait_for_devtools(profile.port, Duration::from_secs(15))
 }
 
-fn exec_mcp(profile: Profile) -> Result<(), String> {
+fn exec_mcp(profile: &Profile) -> Result<(), String> {
     let status = mcp_command(profile)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
@@ -187,7 +349,7 @@ fn exec_mcp(profile: Profile) -> Result<(), String> {
     }
 }
 
-fn list_mcp_tools(profile: Profile) -> Result<(), String> {
+fn list_mcp_tools(profile: &Profile) -> Result<(), String> {
     let mut child = mcp_command(profile)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -227,7 +389,7 @@ fn list_mcp_tools(profile: Profile) -> Result<(), String> {
     Ok(())
 }
 
-fn mcp_command(profile: Profile) -> Command {
+fn mcp_command(profile: &Profile) -> Command {
     let mut command = Command::new("npx");
     command
         .arg("-y")
@@ -291,8 +453,8 @@ fn terminate_child(child: &mut Child) {
     let _ = child.wait();
 }
 
-fn stop_profile(profile: Profile) -> Result<(), String> {
-    let user_data_dir = expand_home(profile.user_data_dir)?;
+fn stop_profile(profile: &Profile) -> Result<(), String> {
+    let user_data_dir = expand_home(&profile.user_data_dir)?;
     let pattern = format!("--user-data-dir={}", user_data_dir.display());
 
     let status = Command::new("pkill")
@@ -366,12 +528,12 @@ fn expand_home(path: &str) -> Result<PathBuf, String> {
 
 fn print_usage() {
     eprintln!(
-        "Usage:\n  chrome-devtools mcp list --profile <profile>\n  chrome-devtools mcp call --profile <profile>\n  chrome-devtools mcp help\n  chrome-devtools profile status --profile <profile>\n  chrome-devtools profile stop --profile <profile>\n  chrome-devtools profile list"
+        "Usage:\n  chrome-devtools mcp list --profile <profile>\n  chrome-devtools mcp call --profile <profile>\n  chrome-devtools mcp help\n  chrome-devtools profile status --profile <profile>\n  chrome-devtools profile stop --profile <profile>\n  chrome-devtools profile list\n\nConfig:\n  ~/.config/chrome-devtools/config.toml is created on startup if missing."
     );
 }
 
 fn print_mcp_help() {
     println!(
-        "chrome-devtools mcp\n\nUsage:\n  chrome-devtools mcp list --profile <profile>\n  chrome-devtools mcp call --profile <profile>\n  chrome-devtools mcp help\n\nCommands:\n  list    Start or reuse Chrome for the selected profile, query tools/list, and print the raw MCP JSON response.\n\n  call    Start or reuse Chrome for the selected profile, then run chrome-devtools-mcp over stdio.\n          MCP JSON-RPC input is read from stdin and output is written to stdout.\n\n  help    Show this help.\n\nExamples:\n  chrome-devtools mcp list --profile sana-twitter\n  chrome-devtools mcp call --profile sana-twitter\n  printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{{}},\"clientInfo\":{{\"name\":\"probe\",\"version\":\"0.0.0\"}}}}}}' | chrome-devtools mcp call --profile sana-twitter\n\nNotes:\n  Profiles define the Chrome user data directory and DevTools port.\n  The call command does not reimplement MCP tools; it delegates to chrome-devtools-mcp."
+        "chrome-devtools mcp\n\nUsage:\n  chrome-devtools mcp list --profile <profile>\n  chrome-devtools mcp call --profile <profile>\n  chrome-devtools mcp help\n\nCommands:\n  list    Start or reuse Chrome for the selected profile, query tools/list, and print the raw MCP JSON response.\n\n  call    Start or reuse Chrome for the selected profile, then run chrome-devtools-mcp over stdio.\n          MCP JSON-RPC input is read from stdin and output is written to stdout.\n\n  help    Show this help.\n\nExamples:\n  chrome-devtools mcp list --profile default\n  chrome-devtools mcp call --profile default\n  printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{{}},\"clientInfo\":{{\"name\":\"probe\",\"version\":\"0.0.0\"}}}}}}' | chrome-devtools mcp call --profile default\n\nConfig:\n  Profiles are read from ~/.config/chrome-devtools/config.toml.\n  If the config file is missing, chrome-devtools creates a default profile using ~/.config/chrome-devtools/profiles/default.\n  Prefer user_data_dir values under ~/.config/chrome-devtools/profiles/<profile-name>.\n\nNotes:\n  Profiles define the Chrome user data directory and DevTools port.\n  The call command does not reimplement MCP tools; it delegates to chrome-devtools-mcp."
     );
 }
