@@ -24,6 +24,8 @@ chrome-devtools profile stop --profile sana-twitter
 
 `mcp call` starts or reuses the Chrome instance for the selected profile, then runs `chrome-devtools-mcp` with that profile's DevTools URL. Standard input, output, and error are inherited so MCP messages pass through the upstream process.
 
+`mcp help` prints MCP-specific usage, examples, and notes about stdio JSON-RPC forwarding.
+
 ## Development
 
 This repository intentionally provides Rust through the Nix flake development shell. Do not assume `cargo` is installed globally.

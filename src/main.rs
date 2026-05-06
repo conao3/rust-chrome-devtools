@@ -60,7 +60,7 @@ fn run() -> Result<(), String> {
         }
         ("mcp", "help") => {
             reject_extra_args(&rest)?;
-            print_usage();
+            print_mcp_help();
             Ok(())
         }
         ("profile", "status") => {
@@ -253,5 +253,11 @@ fn expand_home(path: &str) -> Result<PathBuf, String> {
 fn print_usage() {
     eprintln!(
         "Usage:\n  chrome-devtools mcp call --profile <profile>\n  chrome-devtools mcp help\n  chrome-devtools profile status --profile <profile>\n  chrome-devtools profile stop --profile <profile>\n  chrome-devtools profile list"
+    );
+}
+
+fn print_mcp_help() {
+    println!(
+        "chrome-devtools mcp\n\nUsage:\n  chrome-devtools mcp call --profile <profile>\n  chrome-devtools mcp help\n\nCommands:\n  call    Start or reuse Chrome for the selected profile, then run chrome-devtools-mcp over stdio.\n          MCP JSON-RPC input is read from stdin and output is written to stdout.\n\n  help    Show this help.\n\nExamples:\n  chrome-devtools mcp call --profile sana-twitter\n  printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{{}},\"clientInfo\":{{\"name\":\"probe\",\"version\":\"0.0.0\"}}}}}}' | chrome-devtools mcp call --profile sana-twitter\n\nNotes:\n  Profiles define the Chrome user data directory and DevTools port.\n  The call command does not reimplement MCP tools; it delegates to chrome-devtools-mcp."
     );
 }
