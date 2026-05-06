@@ -53,10 +53,15 @@ fn run() -> Result<(), String> {
     let rest = args.collect::<Vec<_>>();
 
     match (object.as_str(), action.as_str()) {
-        ("mcp", "exec") => {
+        ("mcp", "call") => {
             let profile = require_profile(&rest)?;
             ensure_chrome(profile)?;
             exec_mcp(profile)
+        }
+        ("mcp", "help") => {
+            reject_extra_args(&rest)?;
+            print_usage();
+            Ok(())
         }
         ("profile", "status") => {
             let profile = require_profile(&rest)?;
@@ -247,6 +252,6 @@ fn expand_home(path: &str) -> Result<PathBuf, String> {
 
 fn print_usage() {
     eprintln!(
-        "Usage:\n  chrome-devtools mcp exec --profile <profile>\n  chrome-devtools profile status --profile <profile>\n  chrome-devtools profile stop --profile <profile>\n  chrome-devtools profile list"
+        "Usage:\n  chrome-devtools mcp call --profile <profile>\n  chrome-devtools mcp help\n  chrome-devtools profile status --profile <profile>\n  chrome-devtools profile stop --profile <profile>\n  chrome-devtools profile list"
     );
 }
