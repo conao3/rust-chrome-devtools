@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "Profile-aware CLI for running Chrome DevTools MCP with isolated Chrome user data directories"
 license = "Apache-2.0"
+repository = "https://github.com/conao3/rust-chrome-devtools"
 
 [[bin]]
 name = "chrome-devtools"
