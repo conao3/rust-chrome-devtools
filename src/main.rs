@@ -1,8 +1,8 @@
 use std::env;
-use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{SocketAddr, TcpStream};
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -57,6 +57,11 @@ fn run() -> Result<(), String> {
             let profile = require_profile(&rest)?;
             ensure_chrome(profile)?;
             exec_mcp(profile)
+        }
+        ("mcp", "list") => {
+            let profile = require_profile(&rest)?;
+            ensure_chrome(profile)?;
+            list_mcp_tools(profile)
         }
         ("mcp", "help") => {
             reject_extra_args(&rest)?;
@@ -168,11 +173,7 @@ fn ensure_chrome(profile: Profile) -> Result<(), String> {
 }
 
 fn exec_mcp(profile: Profile) -> Result<(), String> {
-    let status = Command::new("npx")
-        .arg("-y")
-        .arg("chrome-devtools-mcp@latest")
-        .arg("--browser-url")
-        .arg(format!("http://127.0.0.1:{}", profile.port))
+    let status = mcp_command(profile)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
@@ -186,12 +187,117 @@ fn exec_mcp(profile: Profile) -> Result<(), String> {
     }
 }
 
+fn list_mcp_tools(profile: Profile) -> Result<(), String> {
+    let mut child = mcp_command(profile)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .map_err(|error| format!("failed to run chrome-devtools-mcp: {error}"))?;
+
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| "failed to open chrome-devtools-mcp stdin".to_string())?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "failed to open chrome-devtools-mcp stdout".to_string())?;
+    let mut reader = BufReader::new(stdout);
+
+    write_json_line(
+        &mut stdin,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{"roots":{"listChanged":false}},"clientInfo":{"name":"chrome-devtools","version":"0.1.0"}}}"#,
+    )?;
+    read_response(&mut reader, &mut stdin, 1)?;
+
+    write_json_line(
+        &mut stdin,
+        r#"{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}"#,
+    )?;
+    write_json_line(
+        &mut stdin,
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#,
+    )?;
+
+    let tools = read_response(&mut reader, &mut stdin, 2)?;
+    println!("{tools}");
+
+    terminate_child(&mut child);
+    Ok(())
+}
+
+fn mcp_command(profile: Profile) -> Command {
+    let mut command = Command::new("npx");
+    command
+        .arg("-y")
+        .arg("chrome-devtools-mcp@latest")
+        .arg("--browser-url")
+        .arg(format!("http://127.0.0.1:{}", profile.port))
+        .arg("--no-usage-statistics")
+        .arg("--no-performance-crux");
+    command
+}
+
+fn write_json_line(stdin: &mut impl Write, json: &str) -> Result<(), String> {
+    stdin
+        .write_all(json.as_bytes())
+        .and_then(|_| stdin.write_all(b"\n"))
+        .and_then(|_| stdin.flush())
+        .map_err(|error| format!("failed to write MCP request: {error}"))
+}
+
+fn read_response(
+    reader: &mut impl BufRead,
+    stdin: &mut impl Write,
+    target_id: u64,
+) -> Result<String, String> {
+    let target = format!(r#""id":{target_id}"#);
+
+    loop {
+        let mut line = String::new();
+        let bytes = reader
+            .read_line(&mut line)
+            .map_err(|error| format!("failed to read MCP response: {error}"))?;
+        if bytes == 0 {
+            return Err("chrome-devtools-mcp closed stdout before responding".to_string());
+        }
+
+        let line = line.trim_end().to_string();
+        if line.contains(r#""method":"roots/list""#) {
+            if let Some(id) = extract_jsonrpc_id(&line) {
+                let response = format!(r#"{{"jsonrpc":"2.0","id":{id},"result":{{"roots":[]}}}}"#);
+                write_json_line(stdin, &response)?;
+            }
+            continue;
+        }
+
+        if line.contains(&target) {
+            return Ok(line);
+        }
+    }
+}
+
+fn extract_jsonrpc_id(line: &str) -> Option<u64> {
+    let marker = r#""id":"#;
+    let start = line.find(marker)? + marker.len();
+    let rest = &line[start..];
+    let end = rest.find(|character: char| !character.is_ascii_digit())?;
+    rest[..end].parse().ok()
+}
+
+fn terminate_child(child: &mut Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 fn stop_profile(profile: Profile) -> Result<(), String> {
     let user_data_dir = expand_home(profile.user_data_dir)?;
     let pattern = format!("--user-data-dir={}", user_data_dir.display());
 
     let status = Command::new("pkill")
         .arg("-f")
+        .arg("--")
         .arg(&pattern)
         .status()
         .map_err(|error| format!("failed to run pkill: {error}"))?;
@@ -220,17 +326,25 @@ fn wait_for_devtools(port: u16, timeout: Duration) -> Result<(), String> {
 }
 
 fn is_devtools_ready(port: u16) -> bool {
-    let Ok(mut stream) = TcpStream::connect(("127.0.0.1", port)) else {
+    let address = SocketAddr::from(([127, 0, 0, 1], port));
+    let Ok(mut stream) = TcpStream::connect_timeout(&address, Duration::from_millis(250)) else {
         return false;
     };
+
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
 
     let request = b"GET /json/version HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
     if stream.write_all(request).is_err() {
         return false;
     }
 
-    let mut response = String::new();
-    stream.read_to_string(&mut response).is_ok() && response.contains("200 OK")
+    let mut response = [0; 4096];
+    let Ok(bytes) = stream.read(&mut response) else {
+        return false;
+    };
+
+    String::from_utf8_lossy(&response[..bytes]).contains("200 OK")
 }
 
 fn expand_home(path: &str) -> Result<PathBuf, String> {
@@ -252,12 +366,12 @@ fn expand_home(path: &str) -> Result<PathBuf, String> {
 
 fn print_usage() {
     eprintln!(
-        "Usage:\n  chrome-devtools mcp call --profile <profile>\n  chrome-devtools mcp help\n  chrome-devtools profile status --profile <profile>\n  chrome-devtools profile stop --profile <profile>\n  chrome-devtools profile list"
+        "Usage:\n  chrome-devtools mcp list --profile <profile>\n  chrome-devtools mcp call --profile <profile>\n  chrome-devtools mcp help\n  chrome-devtools profile status --profile <profile>\n  chrome-devtools profile stop --profile <profile>\n  chrome-devtools profile list"
     );
 }
 
 fn print_mcp_help() {
     println!(
-        "chrome-devtools mcp\n\nUsage:\n  chrome-devtools mcp call --profile <profile>\n  chrome-devtools mcp help\n\nCommands:\n  call    Start or reuse Chrome for the selected profile, then run chrome-devtools-mcp over stdio.\n          MCP JSON-RPC input is read from stdin and output is written to stdout.\n\n  help    Show this help.\n\nExamples:\n  chrome-devtools mcp call --profile sana-twitter\n  printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{{}},\"clientInfo\":{{\"name\":\"probe\",\"version\":\"0.0.0\"}}}}}}' | chrome-devtools mcp call --profile sana-twitter\n\nNotes:\n  Profiles define the Chrome user data directory and DevTools port.\n  The call command does not reimplement MCP tools; it delegates to chrome-devtools-mcp."
+        "chrome-devtools mcp\n\nUsage:\n  chrome-devtools mcp list --profile <profile>\n  chrome-devtools mcp call --profile <profile>\n  chrome-devtools mcp help\n\nCommands:\n  list    Start or reuse Chrome for the selected profile, query tools/list, and print the raw MCP JSON response.\n\n  call    Start or reuse Chrome for the selected profile, then run chrome-devtools-mcp over stdio.\n          MCP JSON-RPC input is read from stdin and output is written to stdout.\n\n  help    Show this help.\n\nExamples:\n  chrome-devtools mcp list --profile sana-twitter\n  chrome-devtools mcp call --profile sana-twitter\n  printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{{}},\"clientInfo\":{{\"name\":\"probe\",\"version\":\"0.0.0\"}}}}}}' | chrome-devtools mcp call --profile sana-twitter\n\nNotes:\n  Profiles define the Chrome user data directory and DevTools port.\n  The call command does not reimplement MCP tools; it delegates to chrome-devtools-mcp."
     );
 }

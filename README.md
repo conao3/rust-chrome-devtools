@@ -15,12 +15,15 @@ The tool is designed to be called as a regular CLI from agent skills. It is not 
 ## Commands
 
 ```sh
+chrome-devtools mcp list --profile sana-twitter
 chrome-devtools mcp call --profile sana-twitter
 chrome-devtools mcp help
 chrome-devtools profile list
 chrome-devtools profile status --profile sana-twitter
 chrome-devtools profile stop --profile sana-twitter
 ```
+
+`mcp list` starts or reuses the Chrome instance for the selected profile, queries `tools/list`, and prints the raw MCP JSON response.
 
 `mcp call` starts or reuses the Chrome instance for the selected profile, then runs `chrome-devtools-mcp` with that profile's DevTools URL. Standard input, output, and error are inherited so MCP messages pass through the upstream process.
 
