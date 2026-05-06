@@ -15,13 +15,13 @@ The tool is designed to be called as a regular CLI from agent skills. It is not 
 ## Commands
 
 ```sh
-chrome-devtools profile exec --profile sana-twitter
+chrome-devtools mcp exec --profile sana-twitter
 chrome-devtools profile list
 chrome-devtools profile status --profile sana-twitter
 chrome-devtools profile stop --profile sana-twitter
 ```
 
-`profile exec` starts or reuses the Chrome instance for the selected profile, then runs `chrome-devtools-mcp` with that profile's DevTools URL. Standard input, output, and error are inherited so MCP messages pass through the upstream process.
+`mcp exec` starts or reuses the Chrome instance for the selected profile, then runs `chrome-devtools-mcp` with that profile's DevTools URL. Standard input, output, and error are inherited so MCP messages pass through the upstream process.
 
 ## Development
 
