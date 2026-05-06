@@ -1,5 +1,5 @@
 {
-  description = "Rust development environment for chrome-devtools-cli";
+  description = "Rust development environment for chrome-devtools";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";

@@ -232,6 +232,6 @@ fn expand_home(path: &str) -> Result<PathBuf, String> {
 
 fn print_usage() {
     eprintln!(
-        "Usage:\n  chrome-devtools-cli exec --profile <profile>\n  chrome-devtools-cli status --profile <profile>\n  chrome-devtools-cli stop --profile <profile>\n  chrome-devtools-cli list"
+        "Usage:\n  chrome-devtools exec --profile <profile>\n  chrome-devtools status --profile <profile>\n  chrome-devtools stop --profile <profile>\n  chrome-devtools list"
     );
 }

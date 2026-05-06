@@ -1,6 +1,6 @@
-# chrome-devtools-cli
+# chrome-devtools
 
-`chrome-devtools-cli` is a profile-aware command-line wrapper for running Chrome DevTools MCP operations with isolated Chrome user data directories.
+`chrome-devtools` is a profile-aware command-line wrapper for running Chrome DevTools MCP operations with isolated Chrome user data directories.
 
 The tool is designed to be called as a regular CLI from agent skills. It is not registered in Hermes as an MCP server.
 
@@ -15,10 +15,10 @@ The tool is designed to be called as a regular CLI from agent skills. It is not 
 ## Commands
 
 ```sh
-chrome-devtools-cli exec --profile sana-twitter
-chrome-devtools-cli list
-chrome-devtools-cli status --profile sana-twitter
-chrome-devtools-cli stop --profile sana-twitter
+chrome-devtools exec --profile sana-twitter
+chrome-devtools list
+chrome-devtools status --profile sana-twitter
+chrome-devtools stop --profile sana-twitter
 ```
 
 `exec` starts or reuses the Chrome instance for the selected profile, then runs `chrome-devtools-mcp` with that profile's DevTools URL. Standard input, output, and error are inherited so MCP messages pass through the upstream process.

@@ -3,5 +3,5 @@
 version = 4
 
 [[package]]
-name = "chrome-devtools-cli"
+name = "chrome-devtools"
 version = "0.1.0"
