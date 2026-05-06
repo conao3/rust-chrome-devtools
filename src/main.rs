@@ -35,37 +35,56 @@ fn main() {
 
 fn run() -> Result<(), String> {
     let mut args = env::args().skip(1);
-    let Some(command) = args.next() else {
+    let Some(object) = args.next() else {
         print_usage();
-        return Err("missing command".to_string());
+        return Err("missing object".to_string());
+    };
+
+    if matches!(object.as_str(), "help" | "--help" | "-h") {
+        print_usage();
+        return Ok(());
+    }
+
+    let Some(action) = args.next() else {
+        print_usage();
+        return Err(format!("missing action for object: {object}"));
     };
 
     let rest = args.collect::<Vec<_>>();
 
-    match command.as_str() {
-        "exec" => {
+    match (object.as_str(), action.as_str()) {
+        ("profile", "exec") => {
             let profile = require_profile(&rest)?;
             ensure_chrome(profile)?;
             exec_mcp(profile)
         }
-        "status" => {
+        ("profile", "status") => {
             let profile = require_profile(&rest)?;
             print_status(profile);
             Ok(())
         }
-        "stop" => {
+        ("profile", "stop") => {
             let profile = require_profile(&rest)?;
             stop_profile(profile)
         }
-        "list" => {
+        ("profile", "list") => {
+            reject_extra_args(&rest)?;
             list_profiles();
             Ok(())
         }
-        "help" | "--help" | "-h" => {
+        (_, "help" | "--help" | "-h") => {
             print_usage();
             Ok(())
         }
-        other => Err(format!("unknown command: {other}")),
+        _ => Err(format!("unknown command: {object} {action}")),
+    }
+}
+
+fn reject_extra_args(args: &[String]) -> Result<(), String> {
+    if args.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("unknown argument: {}", args[0]))
     }
 }
 
@@ -115,7 +134,7 @@ fn print_status(profile: Profile) {
 
     println!(
         "profile={} status={} port={} user_data_dir={}",
-        profile.name, profile.port, state, profile.user_data_dir
+        profile.name, state, profile.port, profile.user_data_dir
     );
 }
 
@@ -228,6 +247,6 @@ fn expand_home(path: &str) -> Result<PathBuf, String> {
 
 fn print_usage() {
     eprintln!(
-        "Usage:\n  chrome-devtools exec --profile <profile>\n  chrome-devtools status --profile <profile>\n  chrome-devtools stop --profile <profile>\n  chrome-devtools list"
+        "Usage:\n  chrome-devtools profile exec --profile <profile>\n  chrome-devtools profile status --profile <profile>\n  chrome-devtools profile stop --profile <profile>\n  chrome-devtools profile list"
     );
 }
