@@ -30,6 +30,7 @@ const CONFIG_RELATIVE_PATH: &str = ".config/chrome-devtools/config.toml";
 const DEFAULT_PROFILE_NAME: &str = "default";
 const DEFAULT_PROFILE_PORT: u16 = 9222;
 const DEFAULT_PROFILE_USER_DATA_DIR: &str = "~/.config/chrome-devtools/profiles/default";
+const PROFILE_USER_DATA_DIR_PREFIX: &str = "~/.config/chrome-devtools/profiles";
 
 fn main() {
     if let Err(error) = run() {
@@ -121,9 +122,7 @@ fn create_default_config(path: &Path) -> Result<(), String> {
 }
 
 fn default_config_content() -> String {
-    format!(
-        "[[profiles]]\nname = \"{DEFAULT_PROFILE_NAME}\"\nport = {DEFAULT_PROFILE_PORT}\nuser_data_dir = \"{DEFAULT_PROFILE_USER_DATA_DIR}\"\n"
-    )
+    format!("[[profiles]]\nname = \"{DEFAULT_PROFILE_NAME}\"\nport = {DEFAULT_PROFILE_PORT}\n")
 }
 
 fn parse_config(content: &str) -> Result<Config, String> {
@@ -198,7 +197,7 @@ fn push_profile(
         .ok_or_else(|| format!("line {line_number}: profile {name} is missing port"))?;
     let user_data_dir = builder
         .user_data_dir
-        .ok_or_else(|| format!("line {line_number}: profile {name} is missing user_data_dir"))?;
+        .unwrap_or_else(|| default_user_data_dir_for_profile(&name));
 
     if profiles.iter().any(|profile| profile.name == name) {
         return Err(format!("duplicate profile name: {name}"));
@@ -210,6 +209,10 @@ fn push_profile(
         user_data_dir,
     });
     Ok(())
+}
+
+fn default_user_data_dir_for_profile(name: &str) -> String {
+    format!("{PROFILE_USER_DATA_DIR_PREFIX}/{name}")
 }
 
 fn parse_toml_string(value: &str, line_number: usize) -> Result<String, String> {
@@ -534,6 +537,6 @@ fn print_usage() {
 
 fn print_mcp_help() {
     println!(
-        "chrome-devtools mcp\n\nUsage:\n  chrome-devtools mcp list --profile <profile>\n  chrome-devtools mcp call --profile <profile>\n  chrome-devtools mcp help\n\nCommands:\n  list    Start or reuse Chrome for the selected profile, query tools/list, and print the raw MCP JSON response.\n\n  call    Start or reuse Chrome for the selected profile, then run chrome-devtools-mcp over stdio.\n          MCP JSON-RPC input is read from stdin and output is written to stdout.\n\n  help    Show this help.\n\nExamples:\n  chrome-devtools mcp list --profile default\n  chrome-devtools mcp call --profile default\n  printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{{}},\"clientInfo\":{{\"name\":\"probe\",\"version\":\"0.0.0\"}}}}}}' | chrome-devtools mcp call --profile default\n\nConfig:\n  Profiles are read from ~/.config/chrome-devtools/config.toml.\n  If the config file is missing, chrome-devtools creates a default profile using ~/.config/chrome-devtools/profiles/default.\n  Prefer user_data_dir values under ~/.config/chrome-devtools/profiles/<profile-name>.\n\nNotes:\n  Profiles define the Chrome user data directory and DevTools port.\n  The call command does not reimplement MCP tools; it delegates to chrome-devtools-mcp."
+        "chrome-devtools mcp\n\nUsage:\n  chrome-devtools mcp list --profile <profile>\n  chrome-devtools mcp call --profile <profile>\n  chrome-devtools mcp help\n\nCommands:\n  list    Start or reuse Chrome for the selected profile, query tools/list, and print the raw MCP JSON response.\n\n  call    Start or reuse Chrome for the selected profile, then run chrome-devtools-mcp over stdio.\n          MCP JSON-RPC input is read from stdin and output is written to stdout.\n\n  help    Show this help.\n\nExamples:\n  chrome-devtools mcp list --profile default\n  chrome-devtools mcp call --profile default\n  printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{{}},\"clientInfo\":{{\"name\":\"probe\",\"version\":\"0.0.0\"}}}}}}' | chrome-devtools mcp call --profile default\n\nConfig:\n  Profiles are read from ~/.config/chrome-devtools/config.toml.\n  If the config file is missing, chrome-devtools creates a default profile using ~/.config/chrome-devtools/profiles/default.\n  user_data_dir is optional; when omitted, it defaults to ~/.config/chrome-devtools/profiles/<profile-name>.\n  Prefer user_data_dir values under ~/.config/chrome-devtools/profiles/<profile-name>.\n\nNotes:\n  Profiles define the Chrome user data directory and DevTools port.\n  The call command does not reimplement MCP tools; it delegates to chrome-devtools-mcp."
     );
 }

@@ -10,6 +10,7 @@ The tool is designed to be called as a regular CLI from agent skills. It is not 
 - Profiles own their Chrome user data directory and DevTools port.
 - Profiles are read from `~/.config/chrome-devtools/config.toml`.
 - If the config file is missing on startup, the CLI creates a `default` profile using `~/.config/chrome-devtools/profiles/default`.
+- `user_data_dir` is optional; when omitted, it defaults to `~/.config/chrome-devtools/profiles/<profile-name>`.
 - Prefer `user_data_dir` values under `~/.config/chrome-devtools/profiles/<profile-name>` so Chrome profile data stays with the tool config.
 - The CLI may execute `chrome-devtools-mcp` internally for a selected profile.
 - MCP input and output are passed through without reimplementing individual Chrome DevTools tools.
@@ -21,7 +22,6 @@ The tool is designed to be called as a regular CLI from agent skills. It is not 
 [[profiles]]
 name = "default"
 port = 9222
-user_data_dir = "~/.config/chrome-devtools/profiles/default"
 ```
 
 ## Commands
