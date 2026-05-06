@@ -1,0 +1,10 @@
+[package]
+name = "chrome-devtools-cli"
+version = "0.1.0"
+edition = "2021"
+description = "Profile-aware CLI for running Chrome DevTools MCP with isolated Chrome user data directories"
+license = "MIT"
+
+[[bin]]
+name = "chrome-devtools-cli"
+path = "src/main.rs"

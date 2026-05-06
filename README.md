@@ -12,7 +12,7 @@ The tool is designed to be called as a regular CLI from agent skills. It is not 
 - MCP input and output are passed through without reimplementing individual Chrome DevTools tools.
 - Hermes-side Chrome DevTools MCP registration is not required for this workflow.
 
-## Planned commands
+## Commands
 
 ```sh
 chrome-devtools-cli exec --profile sana-twitter
@@ -20,6 +20,8 @@ chrome-devtools-cli list
 chrome-devtools-cli status --profile sana-twitter
 chrome-devtools-cli stop --profile sana-twitter
 ```
+
+`exec` starts or reuses the Chrome instance for the selected profile, then runs `chrome-devtools-mcp` with that profile's DevTools URL. Standard input, output, and error are inherited so MCP messages pass through the upstream process.
 
 ## Development
 
