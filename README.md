@@ -4,6 +4,32 @@
 
 The tool is designed to be called as a regular CLI from agent skills. It is not registered in Hermes as an MCP server.
 
+## Agent Skill Installation
+
+This repository is also a single-skill repository. Install the skill with the Vercel Labs `skills` CLI:
+
+```sh
+npx skills add https://github.com/conao3/rust-chrome-devtools
+```
+
+Install it for Codex explicitly:
+
+```sh
+npx skills add https://github.com/conao3/rust-chrome-devtools -a codex
+```
+
+Install it globally:
+
+```sh
+npx skills add https://github.com/conao3/rust-chrome-devtools -g
+```
+
+For local development, install from a checkout:
+
+```sh
+npx skills add ./rust-chrome-devtools
+```
+
 ## Design
 
 - Profiles are explicit: every operation that targets a browser profile requires `--profile <name>`.
