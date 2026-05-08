@@ -41,6 +41,9 @@ npx skills add ./rust-chrome-devtools
 - The CLI may execute `chrome-devtools-mcp` internally for a selected profile.
 - MCP input and output are passed through without reimplementing individual Chrome DevTools tools.
 - Hermes-side Chrome DevTools MCP registration is not required for this workflow.
+- Snapshot `uid` values are MCP-process-local. Keep `take_snapshot -> click/fill` in the same `mcp call` stream.
+- `mcp call` and `mcp list` take a per-profile lock under `~/.cache/chrome-devtools/locks` so competing agents do not interleave MCP processes for the same Chrome profile.
+- The planned daemon direction is one long-lived broker per profile, so multiple agents do not create competing MCP processes for the same Chrome profile.
 
 ## Configuration
 
@@ -64,6 +67,12 @@ chrome-devtools profile stop --profile default
 `mcp list` starts or reuses the Chrome instance for the selected profile, queries `tools/list`, and prints the raw MCP JSON response.
 
 `mcp call` starts or reuses the Chrome instance for the selected profile, then runs `chrome-devtools-mcp` with that profile's DevTools URL. Standard input, output, and error are inherited so MCP messages pass through the upstream process.
+
+Important: `take_snapshot` result `uid` values are local to the running MCP process. Do not split `take_snapshot` and later `click`/`fill` calls across separate `chrome-devtools mcp call` invocations. Keep the MCP process alive for the whole interaction sequence.
+
+`mcp call` and `mcp list` take a per-profile lock under `~/.cache/chrome-devtools/locks`. This is a conservative guardrail until the daemon exists: one profile gets one MCP process at a time, which avoids snapshot-cache and active-tab races. The default wait is 300 seconds and can be changed with `CHROME_DEVTOOLS_LOCK_TIMEOUT_SECS`.
+
+See [`docs/session-daemon-design.md`](docs/session-daemon-design.md) for the planned per-profile daemon/broker direction.
 
 `mcp help` prints MCP-specific usage, examples, and notes about stdio JSON-RPC forwarding.
 

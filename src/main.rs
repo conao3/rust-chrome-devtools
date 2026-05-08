@@ -1,5 +1,5 @@
 use std::env;
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
@@ -27,6 +27,7 @@ struct ProfileBuilder {
 }
 
 const CONFIG_RELATIVE_PATH: &str = ".config/chrome-devtools/config.toml";
+const CACHE_RELATIVE_PATH: &str = ".cache/chrome-devtools";
 const DEFAULT_PROFILE_NAME: &str = "default";
 const DEFAULT_PROFILE_PORT: u16 = 9222;
 const DEFAULT_PROFILE_USER_DATA_DIR: &str = "~/.config/chrome-devtools/profiles/default";
@@ -62,11 +63,13 @@ fn run() -> Result<(), String> {
     match (object.as_str(), action.as_str()) {
         ("mcp", "call") => {
             let profile = require_profile(&config, &rest)?;
+            let _lock = acquire_profile_lock(&profile)?;
             ensure_chrome(&profile)?;
             exec_mcp(&profile)
         }
         ("mcp", "list") => {
             let profile = require_profile(&config, &rest)?;
+            let _lock = acquire_profile_lock(&profile)?;
             ensure_chrome(&profile)?;
             list_mcp_tools(&profile)
         }
@@ -252,6 +255,108 @@ fn config_path() -> Result<PathBuf, String> {
         return Err("HOME is not set".to_string());
     };
     Ok(PathBuf::from(home).join(CONFIG_RELATIVE_PATH))
+}
+
+fn cache_dir() -> Result<PathBuf, String> {
+    let Some(home) = env::var_os("HOME") else {
+        return Err("HOME is not set".to_string());
+    };
+    Ok(PathBuf::from(home).join(CACHE_RELATIVE_PATH))
+}
+
+struct ProfileLock {
+    path: PathBuf,
+}
+
+impl Drop for ProfileLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn acquire_profile_lock(profile: &Profile) -> Result<ProfileLock, String> {
+    let lock_dir = cache_dir()?.join("locks");
+    fs::create_dir_all(&lock_dir)
+        .map_err(|error| format!("failed to create {}: {error}", lock_dir.display()))?;
+
+    let path = lock_dir.join(format!("{}.lock", safe_lock_name(&profile.name)));
+    let timeout = lock_timeout();
+    let started = Instant::now();
+
+    loop {
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(mut file) => {
+                writeln!(file, "pid={}", std::process::id())
+                    .map_err(|error| format!("failed to write {}: {error}", path.display()))?;
+                writeln!(file, "profile={}", profile.name)
+                    .map_err(|error| format!("failed to write {}: {error}", path.display()))?;
+                return Ok(ProfileLock { path });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                if remove_stale_lock(&path)? {
+                    continue;
+                }
+                if started.elapsed() >= timeout {
+                    return Err(format!(
+                        "profile {} is locked by another chrome-devtools MCP session: {}",
+                        profile.name,
+                        path.display()
+                    ));
+                }
+                thread::sleep(Duration::from_millis(250));
+            }
+            Err(error) => {
+                return Err(format!("failed to create {}: {error}", path.display()));
+            }
+        }
+    }
+}
+
+fn lock_timeout() -> Duration {
+    env::var("CHROME_DEVTOOLS_LOCK_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or_else(|| Duration::from_secs(300))
+}
+
+fn remove_stale_lock(path: &Path) -> Result<bool, String> {
+    let content = fs::read_to_string(path)
+        .map_err(|error| format!("failed to read lock {}: {error}", path.display()))?;
+    let Some(pid) = parse_lock_pid(&content) else {
+        return Ok(false);
+    };
+
+    if process_exists(pid) {
+        return Ok(false);
+    }
+
+    fs::remove_file(path)
+        .map_err(|error| format!("failed to remove stale lock {}: {error}", path.display()))?;
+    Ok(true)
+}
+
+fn parse_lock_pid(content: &str) -> Option<u32> {
+    content.lines().find_map(|line| {
+        line.strip_prefix("pid=")
+            .and_then(|value| value.trim().parse::<u32>().ok())
+    })
+}
+
+fn process_exists(pid: u32) -> bool {
+    PathBuf::from(format!("/proc/{pid}")).exists()
+}
+
+fn safe_lock_name(name: &str) -> String {
+    name.chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 fn reject_extra_args(args: &[String]) -> Result<(), String> {
@@ -531,12 +636,12 @@ fn expand_home(path: &str) -> Result<PathBuf, String> {
 
 fn print_usage() {
     eprintln!(
-        "Usage:\n  chrome-devtools mcp list --profile <profile>\n  chrome-devtools mcp call --profile <profile>\n  chrome-devtools mcp help\n  chrome-devtools profile status --profile <profile>\n  chrome-devtools profile stop --profile <profile>\n  chrome-devtools profile list\n\nConfig:\n  ~/.config/chrome-devtools/config.toml is created on startup if missing."
+        "Usage:\n  chrome-devtools mcp list --profile <profile>\n  chrome-devtools mcp call --profile <profile>\n  chrome-devtools mcp help\n  chrome-devtools profile status --profile <profile>\n  chrome-devtools profile stop --profile <profile>\n  chrome-devtools profile list\n\nConfig:\n  ~/.config/chrome-devtools/config.toml is created on startup if missing.\n\nConcurrency:\n  MCP commands take a per-profile lock under ~/.cache/chrome-devtools/locks.\n  Set CHROME_DEVTOOLS_LOCK_TIMEOUT_SECS to override the default 300 second wait."
     );
 }
 
 fn print_mcp_help() {
     println!(
-        "chrome-devtools mcp\n\nUsage:\n  chrome-devtools mcp list --profile <profile>\n  chrome-devtools mcp call --profile <profile>\n  chrome-devtools mcp help\n\nCommands:\n  list    Start or reuse Chrome for the selected profile, query tools/list, and print the raw MCP JSON response.\n\n  call    Start or reuse Chrome for the selected profile, then run chrome-devtools-mcp over stdio.\n          MCP JSON-RPC input is read from stdin and output is written to stdout.\n\n  help    Show this help.\n\nExamples:\n  chrome-devtools mcp list --profile default\n  chrome-devtools mcp call --profile default\n  printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{{}},\"clientInfo\":{{\"name\":\"probe\",\"version\":\"0.0.0\"}}}}}}' | chrome-devtools mcp call --profile default\n\nConfig:\n  Profiles are read from ~/.config/chrome-devtools/config.toml.\n  If the config file is missing, chrome-devtools creates a default profile using ~/.config/chrome-devtools/profiles/default.\n  user_data_dir is optional; when omitted, it defaults to ~/.config/chrome-devtools/profiles/<profile-name>.\n  Prefer user_data_dir values under ~/.config/chrome-devtools/profiles/<profile-name>.\n\nNotes:\n  Profiles define the Chrome user data directory and DevTools port.\n  The call command does not reimplement MCP tools; it delegates to chrome-devtools-mcp."
+        "chrome-devtools mcp\n\nUsage:\n  chrome-devtools mcp list --profile <profile>\n  chrome-devtools mcp call --profile <profile>\n  chrome-devtools mcp help\n\nCommands:\n  list    Start or reuse Chrome for the selected profile, query tools/list, and print the raw MCP JSON response.\n\n  call    Start or reuse Chrome for the selected profile, then run chrome-devtools-mcp over stdio.\n          MCP JSON-RPC input is read from stdin and output is written to stdout.\n\n  help    Show this help.\n\nExamples:\n  chrome-devtools mcp list --profile default\n  chrome-devtools mcp call --profile default\n  printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{{}},\"clientInfo\":{{\"name\":\"probe\",\"version\":\"0.0.0\"}}}}}}' | chrome-devtools mcp call --profile default\n\nConfig:\n  Profiles are read from ~/.config/chrome-devtools/config.toml.\n  If the config file is missing, chrome-devtools creates a default profile using ~/.config/chrome-devtools/profiles/default.\n  user_data_dir is optional; when omitted, it defaults to ~/.config/chrome-devtools/profiles/<profile-name>.\n  Prefer user_data_dir values under ~/.config/chrome-devtools/profiles/<profile-name>.\n\nConcurrency:\n  MCP commands take a per-profile lock under ~/.cache/chrome-devtools/locks.\n  This keeps take_snapshot and later uid-based click/fill calls in one non-interleaved MCP process.\n  Set CHROME_DEVTOOLS_LOCK_TIMEOUT_SECS to override the default 300 second wait.\n\nNotes:\n  Profiles define the Chrome user data directory and DevTools port.\n  The call command does not reimplement MCP tools; it delegates to chrome-devtools-mcp.\n  Snapshot uid values are only valid inside the MCP process that produced them.\n  Do not split take_snapshot and later click/fill calls across separate mcp call invocations."
     );
 }

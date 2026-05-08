@@ -12,6 +12,9 @@ Use `chrome-devtools` when you need browser automation through Chrome DevTools M
 - Always choose an explicit profile. Do not rely on an implicit browser instance.
 - Prefer `chrome-devtools mcp call --profile <name>` for real browser operations.
 - Keep `mcp call` running as a persistent stdio session while performing multiple actions.
+- `take_snapshot` result `uid` values are only valid inside the MCP process/session that produced them.
+- Never split `take_snapshot` and a later `click`/`fill` using those uids across separate `chrome-devtools mcp call` processes.
+- `mcp call` and `mcp list` currently take a per-profile lock under `~/.cache/chrome-devtools/locks`; treat this as the pre-daemon safety layer.
 - Take a fresh snapshot before using `click`, `fill`, or other uid-based actions.
 - Use uids only within the same MCP session that produced the snapshot.
 - Do not start or kill the user's regular Chrome unless explicitly asked.
@@ -45,6 +48,8 @@ chrome-devtools profile status --profile conao3
 ```
 
 ## MCP Session Workflow
+
+`take_snapshot` and subsequent uid-based `click` / `fill` calls must stay in the same MCP process. A common failure mode is taking a snapshot in one CLI invocation and clicking in another, which can produce `No snapshot found for page 1` because the snapshot cache is MCP-session-local. The CLI now serializes `mcp call` / `mcp list` per profile with a lock under `~/.cache/chrome-devtools/locks`; this is the conservative pre-daemon behavior.
 
 Start a persistent MCP process:
 
