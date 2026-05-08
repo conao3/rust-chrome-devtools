@@ -1,7 +1,9 @@
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
+use std::net::Shutdown;
 use std::net::{SocketAddr, TcpStream};
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
@@ -32,6 +34,7 @@ const DEFAULT_PROFILE_NAME: &str = "default";
 const DEFAULT_PROFILE_PORT: u16 = 9222;
 const DEFAULT_PROFILE_USER_DATA_DIR: &str = "~/.config/chrome-devtools/profiles/default";
 const PROFILE_USER_DATA_DIR_PREFIX: &str = "~/.config/chrome-devtools/profiles";
+const DAEMON_READY_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn main() {
     if let Err(error) = run() {
@@ -63,11 +66,19 @@ fn run() -> Result<(), String> {
     match (object.as_str(), action.as_str()) {
         ("mcp", "call") => {
             let profile = require_profile(&config, &rest)?;
+            call_daemon(&profile)
+        }
+        ("mcp", "list") => {
+            let profile = require_profile(&config, &rest)?;
+            list_mcp_tools_via_daemon(&profile)
+        }
+        ("mcp", "direct-call") => {
+            let profile = require_profile(&config, &rest)?;
             let _lock = acquire_profile_lock(&profile)?;
             ensure_chrome(&profile)?;
             exec_mcp(&profile)
         }
-        ("mcp", "list") => {
+        ("mcp", "direct-list") => {
             let profile = require_profile(&config, &rest)?;
             let _lock = acquire_profile_lock(&profile)?;
             ensure_chrome(&profile)?;
@@ -91,6 +102,22 @@ fn run() -> Result<(), String> {
             reject_extra_args(&rest)?;
             list_profiles(&config);
             Ok(())
+        }
+        ("daemon", "start") => {
+            let profile = require_profile(&config, &rest)?;
+            start_daemon(&profile)
+        }
+        ("daemon", "run") => {
+            let profile = require_profile(&config, &rest)?;
+            run_daemon(&profile)
+        }
+        ("daemon", "status") => {
+            let profile = require_profile(&config, &rest)?;
+            print_daemon_status(&profile)
+        }
+        ("daemon", "stop") => {
+            let profile = require_profile(&config, &rest)?;
+            stop_daemon(&profile)
         }
         (_, "help" | "--help" | "-h") => {
             print_usage();
@@ -359,6 +386,416 @@ fn safe_lock_name(name: &str) -> String {
         .collect()
 }
 
+fn daemon_dir() -> Result<PathBuf, String> {
+    Ok(cache_dir()?.join("daemons"))
+}
+
+fn daemon_socket_path(profile: &Profile) -> Result<PathBuf, String> {
+    Ok(daemon_dir()?.join(format!("{}.sock", safe_lock_name(&profile.name))))
+}
+
+fn daemon_pid_path(profile: &Profile) -> Result<PathBuf, String> {
+    Ok(daemon_dir()?.join(format!("{}.pid", safe_lock_name(&profile.name))))
+}
+
+fn daemon_log_path(profile: &Profile) -> Result<PathBuf, String> {
+    Ok(daemon_dir()?.join(format!("{}.log", safe_lock_name(&profile.name))))
+}
+
+fn start_daemon(profile: &Profile) -> Result<(), String> {
+    if is_daemon_ready(profile)? {
+        println!(
+            "profile={} daemon=ready socket={}",
+            profile.name,
+            daemon_socket_path(profile)?.display()
+        );
+        return Ok(());
+    }
+
+    let dir = daemon_dir()?;
+    fs::create_dir_all(&dir)
+        .map_err(|error| format!("failed to create {}: {error}", dir.display()))?;
+    cleanup_stale_daemon_files(profile)?;
+
+    let current_exe = env::current_exe()
+        .map_err(|error| format!("failed to locate current executable: {error}"))?;
+    let log_path = daemon_log_path(profile)?;
+    let log = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .map_err(|error| format!("failed to open {}: {error}", log_path.display()))?;
+    let log_for_stderr = log
+        .try_clone()
+        .map_err(|error| format!("failed to clone daemon log handle: {error}"))?;
+
+    let child = Command::new(current_exe)
+        .arg("daemon")
+        .arg("run")
+        .arg("--profile")
+        .arg(&profile.name)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(log_for_stderr))
+        .spawn()
+        .map_err(|error| format!("failed to start daemon: {error}"))?;
+
+    wait_for_daemon(profile, DAEMON_READY_TIMEOUT).map_err(|error| {
+        format!(
+            "failed to start daemon process {} for profile {}: {error}; log={}",
+            child.id(),
+            profile.name,
+            log_path.display()
+        )
+    })?;
+
+    println!(
+        "profile={} daemon=started pid={} socket={}",
+        profile.name,
+        child.id(),
+        daemon_socket_path(profile)?.display()
+    );
+    Ok(())
+}
+
+fn run_daemon(profile: &Profile) -> Result<(), String> {
+    let dir = daemon_dir()?;
+    fs::create_dir_all(&dir)
+        .map_err(|error| format!("failed to create {}: {error}", dir.display()))?;
+    let socket_path = daemon_socket_path(profile)?;
+    let pid_path = daemon_pid_path(profile)?;
+    let _lock = acquire_profile_lock(profile)?;
+
+    if socket_path.exists() {
+        fs::remove_file(&socket_path).map_err(|error| {
+            format!(
+                "failed to remove stale socket {}: {error}",
+                socket_path.display()
+            )
+        })?;
+    }
+
+    ensure_chrome(profile)?;
+    let mut mcp = mcp_command(profile)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .map_err(|error| format!("failed to run chrome-devtools-mcp: {error}"))?;
+    let mut mcp_stdin = mcp
+        .stdin
+        .take()
+        .ok_or_else(|| "failed to open chrome-devtools-mcp stdin".to_string())?;
+    let mcp_stdout = mcp
+        .stdout
+        .take()
+        .ok_or_else(|| "failed to open chrome-devtools-mcp stdout".to_string())?;
+    let mut mcp_reader = BufReader::new(mcp_stdout);
+    initialize_daemon_mcp(&mut mcp_stdin, &mut mcp_reader)?;
+
+    fs::write(&pid_path, format!("{}\n", std::process::id()))
+        .map_err(|error| format!("failed to write {}: {error}", pid_path.display()))?;
+
+    let listener = UnixListener::bind(&socket_path)
+        .map_err(|error| format!("failed to bind {}: {error}", socket_path.display()))?;
+
+    for stream in listener.incoming() {
+        let mut stream =
+            stream.map_err(|error| format!("failed to accept daemon client: {error}"))?;
+        let should_stop = handle_daemon_client(&mut stream, &mut mcp_stdin, &mut mcp_reader)?;
+        if should_stop {
+            break;
+        }
+        if let Some(status) = mcp
+            .try_wait()
+            .map_err(|error| format!("failed to poll chrome-devtools-mcp: {error}"))?
+        {
+            return Err(format!("chrome-devtools-mcp exited with {status}"));
+        }
+    }
+
+    terminate_child(&mut mcp);
+    let _ = fs::remove_file(&socket_path);
+    let _ = fs::remove_file(&pid_path);
+    Ok(())
+}
+
+fn initialize_daemon_mcp(
+    mcp_stdin: &mut impl Write,
+    mcp_reader: &mut impl BufRead,
+) -> Result<(), String> {
+    write_json_line(
+        mcp_stdin,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{"roots":{"listChanged":false}},"clientInfo":{"name":"chrome-devtools-daemon","version":"0.1.0"}}}"#,
+    )?;
+    read_response(mcp_reader, mcp_stdin, 1)?;
+    write_json_line(
+        mcp_stdin,
+        r#"{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}"#,
+    )
+}
+
+fn handle_daemon_client(
+    stream: &mut UnixStream,
+    mcp_stdin: &mut impl Write,
+    mcp_reader: &mut impl BufRead,
+) -> Result<bool, String> {
+    let mut request = String::new();
+    stream
+        .read_to_string(&mut request)
+        .map_err(|error| format!("failed to read daemon client request: {error}"))?;
+
+    let trimmed = request.trim_end();
+    if trimmed == "__chrome_devtools_daemon__:status" {
+        stream
+            .write_all(b"daemon=ready\n")
+            .map_err(|error| format!("failed to write daemon status response: {error}"))?;
+        return Ok(false);
+    }
+    if trimmed == "__chrome_devtools_daemon__:stop" {
+        stream
+            .write_all(b"daemon=stopping\n")
+            .map_err(|error| format!("failed to write daemon stop response: {error}"))?;
+        return Ok(true);
+    }
+
+    let mut pending_ids = Vec::new();
+    let mut forwarded_any = false;
+    for line in request.lines() {
+        let line = line.trim_end();
+        if line.is_empty() {
+            continue;
+        }
+        if json_has_method(line, "initialize") {
+            if let Some(id) = extract_jsonrpc_id(line) {
+                let response = daemon_initialize_response(id);
+                stream
+                    .write_all(response.as_bytes())
+                    .and_then(|_| stream.write_all(b"\n"))
+                    .and_then(|_| stream.flush())
+                    .map_err(|error| {
+                        format!("failed to write daemon initialize response: {error}")
+                    })?;
+            }
+            continue;
+        }
+        if json_has_method(line, "notifications/initialized") {
+            continue;
+        }
+        if let Some(id) = extract_jsonrpc_id(line) {
+            pending_ids.push(id);
+        }
+        write_json_line(mcp_stdin, line)?;
+        forwarded_any = true;
+    }
+
+    if !forwarded_any {
+        return Ok(false);
+    }
+
+    if pending_ids.is_empty() {
+        return Ok(false);
+    }
+
+    while !pending_ids.is_empty() {
+        let mut line = String::new();
+        let bytes = mcp_reader
+            .read_line(&mut line)
+            .map_err(|error| format!("failed to read MCP response: {error}"))?;
+        if bytes == 0 {
+            return Err("chrome-devtools-mcp closed stdout before responding".to_string());
+        }
+        let line = line.trim_end().to_string();
+        if json_has_method(&line, "roots/list") {
+            if let Some(id) = extract_jsonrpc_id(&line) {
+                let response = format!(r#"{{"jsonrpc":"2.0","id":{id},"result":{{"roots":[]}}}}"#);
+                write_json_line(mcp_stdin, &response)?;
+            }
+            continue;
+        }
+
+        stream
+            .write_all(line.as_bytes())
+            .and_then(|_| stream.write_all(b"\n"))
+            .and_then(|_| stream.flush())
+            .map_err(|error| format!("failed to write daemon client response: {error}"))?;
+
+        if let Some(id) = extract_jsonrpc_id(&line) {
+            pending_ids.retain(|pending| *pending != id);
+        }
+    }
+
+    Ok(false)
+}
+
+fn call_daemon(profile: &Profile) -> Result<(), String> {
+    ensure_daemon(profile)?;
+    let socket_path = daemon_socket_path(profile)?;
+    let mut stream = UnixStream::connect(&socket_path)
+        .map_err(|error| format!("failed to connect {}: {error}", socket_path.display()))?;
+
+    let mut input = String::new();
+    std::io::stdin()
+        .read_to_string(&mut input)
+        .map_err(|error| format!("failed to read stdin: {error}"))?;
+    stream
+        .write_all(input.as_bytes())
+        .and_then(|_| stream.shutdown(Shutdown::Write))
+        .map_err(|error| format!("failed to send daemon request: {error}"))?;
+
+    let mut output = Vec::new();
+    stream
+        .read_to_end(&mut output)
+        .map_err(|error| format!("failed to read daemon response: {error}"))?;
+    std::io::stdout()
+        .write_all(&output)
+        .and_then(|_| std::io::stdout().flush())
+        .map_err(|error| format!("failed to write stdout: {error}"))
+}
+
+fn list_mcp_tools_via_daemon(profile: &Profile) -> Result<(), String> {
+    let request = concat!(
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{"roots":{"listChanged":false}},"clientInfo":{"name":"chrome-devtools","version":"0.1.0"}}}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#,
+        "\n",
+    );
+    let response = send_daemon_request(profile, request)?;
+    if let Some(line) = response
+        .lines()
+        .rev()
+        .find(|line| extract_jsonrpc_id(line) == Some(2))
+    {
+        println!("{line}");
+    } else {
+        print!("{response}");
+    }
+    Ok(())
+}
+
+fn ensure_daemon(profile: &Profile) -> Result<(), String> {
+    if is_daemon_ready(profile)? {
+        return Ok(());
+    }
+    start_daemon(profile)
+}
+
+fn wait_for_daemon(profile: &Profile, timeout: Duration) -> Result<(), String> {
+    let started = Instant::now();
+    while started.elapsed() < timeout {
+        if is_daemon_ready(profile)? {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+    Err(format!(
+        "daemon did not become ready within {} seconds",
+        timeout.as_secs()
+    ))
+}
+
+fn is_daemon_ready(profile: &Profile) -> Result<bool, String> {
+    let socket_path = daemon_socket_path(profile)?;
+    if !socket_path.exists() {
+        return Ok(false);
+    }
+    match send_daemon_control(profile, "status") {
+        Ok(response) => Ok(response.contains("daemon=ready")),
+        Err(_) => Ok(false),
+    }
+}
+
+fn print_daemon_status(profile: &Profile) -> Result<(), String> {
+    let socket_path = daemon_socket_path(profile)?;
+    let pid_path = daemon_pid_path(profile)?;
+    let ready = is_daemon_ready(profile)?;
+    let pid = read_pid_file(&pid_path)
+        .map(|pid| pid.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    println!(
+        "profile={} daemon={} pid={} socket={}",
+        profile.name,
+        if ready { "ready" } else { "stopped" },
+        pid,
+        socket_path.display()
+    );
+    Ok(())
+}
+
+fn stop_daemon(profile: &Profile) -> Result<(), String> {
+    if is_daemon_ready(profile)? {
+        let response = send_daemon_control(profile, "stop")?;
+        print!("{response}");
+        wait_for_daemon_stop(profile, Duration::from_secs(5))?;
+        return Ok(());
+    }
+
+    let pid_path = daemon_pid_path(profile)?;
+    if let Some(pid) = read_pid_file(&pid_path) {
+        let status = Command::new("kill")
+            .arg(pid.to_string())
+            .status()
+            .map_err(|error| format!("failed to run kill: {error}"))?;
+        if !status.success() {
+            return Err(format!("kill exited with {status}"));
+        }
+    }
+    cleanup_stale_daemon_files(profile)
+}
+
+fn wait_for_daemon_stop(profile: &Profile, timeout: Duration) -> Result<(), String> {
+    let started = Instant::now();
+    while started.elapsed() < timeout {
+        if !is_daemon_ready(profile)? {
+            cleanup_stale_daemon_files(profile)?;
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    Err(format!(
+        "daemon did not stop within {} seconds",
+        timeout.as_secs()
+    ))
+}
+
+fn send_daemon_control(profile: &Profile, command: &str) -> Result<String, String> {
+    send_daemon_request(profile, &format!("__chrome_devtools_daemon__:{command}\n"))
+}
+
+fn send_daemon_request(profile: &Profile, request: &str) -> Result<String, String> {
+    let socket_path = daemon_socket_path(profile)?;
+    let mut stream = UnixStream::connect(&socket_path)
+        .map_err(|error| format!("failed to connect {}: {error}", socket_path.display()))?;
+    stream
+        .write_all(request.as_bytes())
+        .and_then(|_| stream.shutdown(Shutdown::Write))
+        .map_err(|error| format!("failed to send daemon request: {error}"))?;
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .map_err(|error| format!("failed to read daemon response: {error}"))?;
+    Ok(response)
+}
+
+fn read_pid_file(path: &Path) -> Option<u32> {
+    fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+fn cleanup_stale_daemon_files(profile: &Profile) -> Result<(), String> {
+    let pid_path = daemon_pid_path(profile)?;
+    if let Some(pid) = read_pid_file(&pid_path) {
+        if process_exists(pid) {
+            return Ok(());
+        }
+    }
+    let socket_path = daemon_socket_path(profile)?;
+    let _ = fs::remove_file(socket_path);
+    let _ = fs::remove_file(pid_path);
+    Ok(())
+}
+
 fn reject_extra_args(args: &[String]) -> Result<(), String> {
     if args.is_empty() {
         Ok(())
@@ -498,10 +935,14 @@ fn list_mcp_tools(profile: &Profile) -> Result<(), String> {
 }
 
 fn mcp_command(profile: &Profile) -> Command {
-    let mut command = Command::new("npx");
+    let mut command = if let Ok(program) = env::var("CHROME_DEVTOOLS_MCP_COMMAND") {
+        Command::new(program)
+    } else {
+        let mut command = Command::new("npx");
+        command.arg("-y").arg("chrome-devtools-mcp@latest");
+        command
+    };
     command
-        .arg("-y")
-        .arg("chrome-devtools-mcp@latest")
         .arg("--browser-url")
         .arg(format!("http://127.0.0.1:{}", profile.port))
         .arg("--no-usage-statistics")
@@ -522,8 +963,6 @@ fn read_response(
     stdin: &mut impl Write,
     target_id: u64,
 ) -> Result<String, String> {
-    let target = format!(r#""id":{target_id}"#);
-
     loop {
         let mut line = String::new();
         let bytes = reader
@@ -534,7 +973,7 @@ fn read_response(
         }
 
         let line = line.trim_end().to_string();
-        if line.contains(r#""method":"roots/list""#) {
+        if json_has_method(&line, "roots/list") {
             if let Some(id) = extract_jsonrpc_id(&line) {
                 let response = format!(r#"{{"jsonrpc":"2.0","id":{id},"result":{{"roots":[]}}}}"#);
                 write_json_line(stdin, &response)?;
@@ -542,18 +981,42 @@ fn read_response(
             continue;
         }
 
-        if line.contains(&target) {
+        if extract_jsonrpc_id(&line) == Some(target_id) {
             return Ok(line);
         }
     }
 }
 
+fn daemon_initialize_response(id: u64) -> String {
+    format!(
+        r#"{{"jsonrpc":"2.0","id":{id},"result":{{"protocolVersion":"2025-06-18","capabilities":{{}},"serverInfo":{{"name":"chrome-devtools-daemon","version":"0.1.0"}}}}}}"#
+    )
+}
+
+fn json_has_method(line: &str, method: &str) -> bool {
+    compact_json_line(line).contains(&format!(r#""method":"{method}""#))
+}
+
+fn compact_json_line(line: &str) -> String {
+    line.chars()
+        .filter(|character| !character.is_whitespace())
+        .collect()
+}
+
 fn extract_jsonrpc_id(line: &str) -> Option<u64> {
+    let compact = compact_json_line(line);
     let marker = r#""id":"#;
-    let start = line.find(marker)? + marker.len();
-    let rest = &line[start..];
-    let end = rest.find(|character: char| !character.is_ascii_digit())?;
-    rest[..end].parse().ok()
+    let start = compact.find(marker)? + marker.len();
+    let rest = &compact[start..];
+    let digits = rest
+        .chars()
+        .take_while(|character| character.is_ascii_digit())
+        .collect::<String>();
+    if digits.is_empty() {
+        None
+    } else {
+        digits.parse().ok()
+    }
 }
 
 fn terminate_child(child: &mut Child) {
@@ -636,12 +1099,12 @@ fn expand_home(path: &str) -> Result<PathBuf, String> {
 
 fn print_usage() {
     eprintln!(
-        "Usage:\n  chrome-devtools mcp list --profile <profile>\n  chrome-devtools mcp call --profile <profile>\n  chrome-devtools mcp help\n  chrome-devtools profile status --profile <profile>\n  chrome-devtools profile stop --profile <profile>\n  chrome-devtools profile list\n\nConfig:\n  ~/.config/chrome-devtools/config.toml is created on startup if missing.\n\nConcurrency:\n  MCP commands take a per-profile lock under ~/.cache/chrome-devtools/locks.\n  Set CHROME_DEVTOOLS_LOCK_TIMEOUT_SECS to override the default 300 second wait."
+        "Usage:\n  chrome-devtools mcp list --profile <profile>\n  chrome-devtools mcp call --profile <profile>\n  chrome-devtools mcp direct-list --profile <profile>\n  chrome-devtools mcp direct-call --profile <profile>\n  chrome-devtools mcp help\n  chrome-devtools daemon start --profile <profile>\n  chrome-devtools daemon status --profile <profile>\n  chrome-devtools daemon stop --profile <profile>\n  chrome-devtools profile status --profile <profile>\n  chrome-devtools profile stop --profile <profile>\n  chrome-devtools profile list\n\nConfig:\n  ~/.config/chrome-devtools/config.toml is created on startup if missing.\n\nConcurrency:\n  MCP commands take a per-profile lock under ~/.cache/chrome-devtools/locks.\n  Set CHROME_DEVTOOLS_LOCK_TIMEOUT_SECS to override the default 300 second wait."
     );
 }
 
 fn print_mcp_help() {
     println!(
-        "chrome-devtools mcp\n\nUsage:\n  chrome-devtools mcp list --profile <profile>\n  chrome-devtools mcp call --profile <profile>\n  chrome-devtools mcp help\n\nCommands:\n  list    Start or reuse Chrome for the selected profile, query tools/list, and print the raw MCP JSON response.\n\n  call    Start or reuse Chrome for the selected profile, then run chrome-devtools-mcp over stdio.\n          MCP JSON-RPC input is read from stdin and output is written to stdout.\n\n  help    Show this help.\n\nExamples:\n  chrome-devtools mcp list --profile default\n  chrome-devtools mcp call --profile default\n  printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{{}},\"clientInfo\":{{\"name\":\"probe\",\"version\":\"0.0.0\"}}}}}}' | chrome-devtools mcp call --profile default\n\nConfig:\n  Profiles are read from ~/.config/chrome-devtools/config.toml.\n  If the config file is missing, chrome-devtools creates a default profile using ~/.config/chrome-devtools/profiles/default.\n  user_data_dir is optional; when omitted, it defaults to ~/.config/chrome-devtools/profiles/<profile-name>.\n  Prefer user_data_dir values under ~/.config/chrome-devtools/profiles/<profile-name>.\n\nConcurrency:\n  MCP commands take a per-profile lock under ~/.cache/chrome-devtools/locks.\n  This keeps take_snapshot and later uid-based click/fill calls in one non-interleaved MCP process.\n  Set CHROME_DEVTOOLS_LOCK_TIMEOUT_SECS to override the default 300 second wait.\n\nNotes:\n  Profiles define the Chrome user data directory and DevTools port.\n  The call command does not reimplement MCP tools; it delegates to chrome-devtools-mcp.\n  Snapshot uid values are only valid inside the MCP process that produced them.\n  Do not split take_snapshot and later click/fill calls across separate mcp call invocations."
+        "chrome-devtools mcp\n\nUsage:\n  chrome-devtools mcp list --profile <profile>\n  chrome-devtools mcp call --profile <profile>\n  chrome-devtools mcp direct-list --profile <profile>\n  chrome-devtools mcp direct-call --profile <profile>\n  chrome-devtools mcp help\n\nCommands:\n  list         Start the selected profile daemon if needed, query tools/list through it, and print the raw MCP JSON response.\n\n  call         Start the selected profile daemon if needed, then forward stdin MCP JSON-RPC lines through its long-lived MCP process.\n\n  direct-list  Bypass the daemon, run chrome-devtools-mcp directly, query tools/list, and print the raw MCP JSON response.\n\n  direct-call  Bypass the daemon, run chrome-devtools-mcp directly over stdio. Use only for fallback/manual debugging.\n\n  help         Show this help.\n\nExamples:\n  chrome-devtools daemon start --profile default\n  chrome-devtools mcp list --profile default\n  chrome-devtools mcp call --profile default\n  printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{{}},\"clientInfo\":{{\"name\":\"probe\",\"version\":\"0.0.0\"}}}}}}' | chrome-devtools mcp call --profile default\n\nConfig:\n  Profiles are read from ~/.config/chrome-devtools/config.toml.\n  If the config file is missing, chrome-devtools creates a default profile using ~/.config/chrome-devtools/profiles/default.\n  user_data_dir is optional; when omitted, it defaults to ~/.config/chrome-devtools/profiles/<profile-name>.\n  Prefer user_data_dir values under ~/.config/chrome-devtools/profiles/<profile-name>.\n\nDaemon:\n  mcp call and mcp list route through one long-lived per-profile daemon by default.\n  Daemon sockets and pid files live under ~/.cache/chrome-devtools/daemons.\n  direct-call and direct-list bypass the daemon and take a per-profile lock under ~/.cache/chrome-devtools/locks.\n  Set CHROME_DEVTOOLS_LOCK_TIMEOUT_SECS to override the direct-mode/default daemon lock wait.\n\nNotes:\n  Profiles define the Chrome user data directory and DevTools port.\n  The call command does not reimplement MCP tools; it delegates to a daemon-owned chrome-devtools-mcp process.\n  Snapshot uid values are only valid inside the MCP process that produced them.\n  Daemon-routed calls preserve that MCP process across invocations until the daemon stops."
     );
 }
