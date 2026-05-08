@@ -25,7 +25,7 @@ jobs:
     outputs:
       new_version: ${{ steps.bump.outputs.new_version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
       - uses: dtolnay/rust-toolchain@stable
@@ -77,11 +77,11 @@ jobs:
       name: crates.io
       url: https://crates.io/crates/chrome-devtools
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           ref: v${{ needs.version-bump.outputs.new_version }}
       - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/cache@v4
+      - uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry/index/
@@ -93,7 +93,7 @@ jobs:
             ${{ runner.os }}-cargo-publish-
             ${{ runner.os }}-cargo-
       - run: cargo publish --dry-run
-      - uses: rust-lang/crates-io-auth-action@v1
+      - uses: rust-lang/crates-io-auth-action@v1.0.4
         id: auth
       - run: cargo publish
         env:
