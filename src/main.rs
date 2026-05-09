@@ -677,6 +677,7 @@ fn call_daemon(profile: &Profile) -> Result<(), String> {
 }
 
 fn list_mcp_tools_via_daemon(profile: &Profile) -> Result<(), String> {
+    ensure_daemon(profile)?;
     let request = concat!(
         r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{"roots":{"listChanged":false}},"clientInfo":{"name":"chrome-devtools","version":"0.1.0"}}}"#,
         "\n",
@@ -700,6 +701,7 @@ fn list_mcp_tools_via_daemon(profile: &Profile) -> Result<(), String> {
 
 fn ensure_daemon(profile: &Profile) -> Result<(), String> {
     if is_daemon_ready(profile)? {
+        ensure_chrome(profile)?;
         return Ok(());
     }
     start_daemon(profile, true)
