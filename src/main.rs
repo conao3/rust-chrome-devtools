@@ -105,7 +105,7 @@ fn run() -> Result<(), String> {
         }
         ("daemon", "start") => {
             let profile = require_profile(&config, &rest)?;
-            start_daemon(&profile)
+            start_daemon(&profile, false)
         }
         ("daemon", "run") => {
             let profile = require_profile(&config, &rest)?;
@@ -402,13 +402,15 @@ fn daemon_log_path(profile: &Profile) -> Result<PathBuf, String> {
     Ok(daemon_dir()?.join(format!("{}.log", safe_lock_name(&profile.name))))
 }
 
-fn start_daemon(profile: &Profile) -> Result<(), String> {
+fn start_daemon(profile: &Profile, quiet: bool) -> Result<(), String> {
     if is_daemon_ready(profile)? {
-        println!(
-            "profile={} daemon=ready socket={}",
-            profile.name,
-            daemon_socket_path(profile)?.display()
-        );
+        if !quiet {
+            println!(
+                "profile={} daemon=ready socket={}",
+                profile.name,
+                daemon_socket_path(profile)?.display()
+            );
+        }
         return Ok(());
     }
 
@@ -449,12 +451,14 @@ fn start_daemon(profile: &Profile) -> Result<(), String> {
         )
     })?;
 
-    println!(
-        "profile={} daemon=started pid={} socket={}",
-        profile.name,
-        child.id(),
-        daemon_socket_path(profile)?.display()
-    );
+    if !quiet {
+        println!(
+            "profile={} daemon=started pid={} socket={}",
+            profile.name,
+            child.id(),
+            daemon_socket_path(profile)?.display()
+        );
+    }
     Ok(())
 }
 
@@ -540,32 +544,41 @@ fn handle_daemon_client(
     mcp_stdin: &mut impl Write,
     mcp_reader: &mut impl BufRead,
 ) -> Result<bool, String> {
-    let mut request = String::new();
-    stream
-        .read_to_string(&mut request)
-        .map_err(|error| format!("failed to read daemon client request: {error}"))?;
-
-    let trimmed = request.trim_end();
-    if trimmed == "__chrome_devtools_daemon__:status" {
+    let mut client_reader = BufReader::new(
         stream
-            .write_all(b"daemon=ready\n")
-            .map_err(|error| format!("failed to write daemon status response: {error}"))?;
-        return Ok(false);
-    }
-    if trimmed == "__chrome_devtools_daemon__:stop" {
-        stream
-            .write_all(b"daemon=stopping\n")
-            .map_err(|error| format!("failed to write daemon stop response: {error}"))?;
-        return Ok(true);
-    }
+            .try_clone()
+            .map_err(|error| format!("failed to clone daemon client stream: {error}"))?,
+    );
+    let mut line = String::new();
 
-    let mut pending_ids = Vec::new();
-    let mut forwarded_any = false;
-    for line in request.lines() {
+    loop {
+        line.clear();
+        let bytes = client_reader
+            .read_line(&mut line)
+            .map_err(|error| format!("failed to read daemon client request: {error}"))?;
+        if bytes == 0 {
+            return Ok(false);
+        }
+
         let line = line.trim_end();
         if line.is_empty() {
             continue;
         }
+        if line == "__chrome_devtools_daemon__:status" {
+            stream
+                .write_all(b"daemon=ready\n")
+                .and_then(|_| stream.flush())
+                .map_err(|error| format!("failed to write daemon status response: {error}"))?;
+            return Ok(false);
+        }
+        if line == "__chrome_devtools_daemon__:stop" {
+            stream
+                .write_all(b"daemon=stopping\n")
+                .and_then(|_| stream.flush())
+                .map_err(|error| format!("failed to write daemon stop response: {error}"))?;
+            return Ok(true);
+        }
+
         if json_has_method(line, "initialize") {
             if let Some(id) = extract_jsonrpc_id(line) {
                 let response = daemon_initialize_response(id);
@@ -582,50 +595,43 @@ fn handle_daemon_client(
         if json_has_method(line, "notifications/initialized") {
             continue;
         }
-        if let Some(id) = extract_jsonrpc_id(line) {
-            pending_ids.push(id);
-        }
-        write_json_line(mcp_stdin, line)?;
-        forwarded_any = true;
-    }
 
-    if !forwarded_any {
-        return Ok(false);
-    }
-
-    if pending_ids.is_empty() {
-        return Ok(false);
-    }
-
-    while !pending_ids.is_empty() {
-        let mut line = String::new();
-        let bytes = mcp_reader
-            .read_line(&mut line)
-            .map_err(|error| format!("failed to read MCP response: {error}"))?;
-        if bytes == 0 {
-            return Err("chrome-devtools-mcp closed stdout before responding".to_string());
-        }
-        let line = line.trim_end().to_string();
-        if json_has_method(&line, "roots/list") {
-            if let Some(id) = extract_jsonrpc_id(&line) {
-                let response = format!(r#"{{"jsonrpc":"2.0","id":{id},"result":{{"roots":[]}}}}"#);
-                write_json_line(mcp_stdin, &response)?;
-            }
+        let Some(pending_id) = extract_jsonrpc_id(line) else {
+            write_json_line(mcp_stdin, line)?;
             continue;
-        }
+        };
 
-        stream
-            .write_all(line.as_bytes())
-            .and_then(|_| stream.write_all(b"\n"))
-            .and_then(|_| stream.flush())
-            .map_err(|error| format!("failed to write daemon client response: {error}"))?;
+        write_json_line(mcp_stdin, line)?;
 
-        if let Some(id) = extract_jsonrpc_id(&line) {
-            pending_ids.retain(|pending| *pending != id);
+        loop {
+            let mut response_line = String::new();
+            let bytes = mcp_reader
+                .read_line(&mut response_line)
+                .map_err(|error| format!("failed to read MCP response: {error}"))?;
+            if bytes == 0 {
+                return Err("chrome-devtools-mcp closed stdout before responding".to_string());
+            }
+            let response_line = response_line.trim_end().to_string();
+            if json_has_method(&response_line, "roots/list") {
+                if let Some(id) = extract_jsonrpc_id(&response_line) {
+                    let response =
+                        format!(r#"{{"jsonrpc":"2.0","id":{id},"result":{{"roots":[]}}}}"#);
+                    write_json_line(mcp_stdin, &response)?;
+                }
+                continue;
+            }
+
+            stream
+                .write_all(response_line.as_bytes())
+                .and_then(|_| stream.write_all(b"\n"))
+                .and_then(|_| stream.flush())
+                .map_err(|error| format!("failed to write daemon client response: {error}"))?;
+
+            if extract_jsonrpc_id(&response_line) == Some(pending_id) {
+                break;
+            }
         }
     }
-
-    Ok(false)
 }
 
 fn call_daemon(profile: &Profile) -> Result<(), String> {
@@ -633,24 +639,41 @@ fn call_daemon(profile: &Profile) -> Result<(), String> {
     let socket_path = daemon_socket_path(profile)?;
     let mut stream = UnixStream::connect(&socket_path)
         .map_err(|error| format!("failed to connect {}: {error}", socket_path.display()))?;
+    let mut read_stream = stream
+        .try_clone()
+        .map_err(|error| format!("failed to clone daemon stream: {error}"))?;
 
-    let mut input = String::new();
-    std::io::stdin()
-        .read_to_string(&mut input)
-        .map_err(|error| format!("failed to read stdin: {error}"))?;
-    stream
-        .write_all(input.as_bytes())
-        .and_then(|_| stream.shutdown(Shutdown::Write))
-        .map_err(|error| format!("failed to send daemon request: {error}"))?;
+    let stdin_to_daemon = thread::spawn(move || -> Result<(), String> {
+        let mut stdin = std::io::stdin().lock();
+        std::io::copy(&mut stdin, &mut stream)
+            .map_err(|error| format!("failed to send daemon request: {error}"))?;
+        stream
+            .shutdown(Shutdown::Write)
+            .map_err(|error| format!("failed to close daemon request stream: {error}"))?;
+        Ok(())
+    });
 
-    let mut output = Vec::new();
-    stream
-        .read_to_end(&mut output)
-        .map_err(|error| format!("failed to read daemon response: {error}"))?;
-    std::io::stdout()
-        .write_all(&output)
-        .and_then(|_| std::io::stdout().flush())
-        .map_err(|error| format!("failed to write stdout: {error}"))
+    let mut daemon_reader = BufReader::new(&mut read_stream);
+    let mut stdout = std::io::stdout().lock();
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let bytes = daemon_reader
+            .read_line(&mut line)
+            .map_err(|error| format!("failed to read daemon response: {error}"))?;
+        if bytes == 0 {
+            break;
+        }
+        stdout
+            .write_all(line.as_bytes())
+            .and_then(|_| stdout.flush())
+            .map_err(|error| format!("failed to write stdout: {error}"))?;
+    }
+
+    stdin_to_daemon
+        .join()
+        .map_err(|_| "stdin forwarding thread panicked".to_string())??;
+    Ok(())
 }
 
 fn list_mcp_tools_via_daemon(profile: &Profile) -> Result<(), String> {
@@ -679,7 +702,7 @@ fn ensure_daemon(profile: &Profile) -> Result<(), String> {
     if is_daemon_ready(profile)? {
         return Ok(());
     }
-    start_daemon(profile)
+    start_daemon(profile, true)
 }
 
 fn wait_for_daemon(profile: &Profile, timeout: Duration) -> Result<(), String> {
