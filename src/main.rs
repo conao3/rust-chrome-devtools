@@ -44,7 +44,6 @@ fn main() {
 }
 
 fn run() -> Result<(), String> {
-    let config = load_or_create_config()?;
     let mut args = env::args().skip(1);
     let Some(object) = args.next() else {
         print_usage();
@@ -55,7 +54,12 @@ fn run() -> Result<(), String> {
         print_usage();
         return Ok(());
     }
+    if matches!(object.as_str(), "version" | "--version" | "-V") {
+        print_version();
+        return Ok(());
+    }
 
+    let config = load_or_create_config()?;
     let Some(action) = args.next() else {
         print_usage();
         return Err(format!("missing action for object: {object}"));
@@ -1124,8 +1128,12 @@ fn expand_home(path: &str) -> Result<PathBuf, String> {
 
 fn print_usage() {
     eprintln!(
-        "Usage:\n  chrome-devtools mcp list --profile <profile>\n  chrome-devtools mcp call --profile <profile>\n  chrome-devtools mcp direct-list --profile <profile>\n  chrome-devtools mcp direct-call --profile <profile>\n  chrome-devtools mcp help\n  chrome-devtools daemon start --profile <profile>\n  chrome-devtools daemon status --profile <profile>\n  chrome-devtools daemon stop --profile <profile>\n  chrome-devtools profile status --profile <profile>\n  chrome-devtools profile stop --profile <profile>\n  chrome-devtools profile list\n\nConfig:\n  ~/.config/chrome-devtools/config.toml is created on startup if missing.\n\nConcurrency:\n  MCP commands take a per-profile lock under ~/.cache/chrome-devtools/locks.\n  Set CHROME_DEVTOOLS_LOCK_TIMEOUT_SECS to override the default 300 second wait."
+        "Usage:\n  chrome-devtools --version\n  chrome-devtools mcp list --profile <profile>\n  chrome-devtools mcp call --profile <profile>\n  chrome-devtools mcp direct-list --profile <profile>\n  chrome-devtools mcp direct-call --profile <profile>\n  chrome-devtools mcp help\n  chrome-devtools daemon start --profile <profile>\n  chrome-devtools daemon status --profile <profile>\n  chrome-devtools daemon stop --profile <profile>\n  chrome-devtools profile status --profile <profile>\n  chrome-devtools profile stop --profile <profile>\n  chrome-devtools profile list\n\nConfig:\n  ~/.config/chrome-devtools/config.toml is created on startup if missing.\n\nConcurrency:\n  MCP commands take a per-profile lock under ~/.cache/chrome-devtools/locks.\n  Set CHROME_DEVTOOLS_LOCK_TIMEOUT_SECS to override the default 300 second wait."
     );
+}
+
+fn print_version() {
+    println!("chrome-devtools {}", env!("CARGO_PKG_VERSION"));
 }
 
 fn print_mcp_help() {
