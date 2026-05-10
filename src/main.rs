@@ -68,67 +68,119 @@ fn run() -> Result<(), String> {
     let rest = args.collect::<Vec<_>>();
 
     match (object.as_str(), action.as_str()) {
+        ("mcp", "help" | "--help" | "-h") => {
+            print_mcp_help();
+            Ok(())
+        }
+        ("profile", "help" | "--help" | "-h") => {
+            print_profile_help();
+            Ok(())
+        }
+        ("daemon", "help" | "--help" | "-h") => {
+            print_daemon_help();
+            Ok(())
+        }
         ("mcp", "call") => {
+            if wants_help(&rest) {
+                print_mcp_call_help();
+                return Ok(());
+            }
             let profile = require_profile(&config, &rest)?;
             call_daemon(&profile)
         }
         ("mcp", "list") => {
+            if wants_help(&rest) {
+                print_mcp_list_help();
+                return Ok(());
+            }
             let profile = require_profile(&config, &rest)?;
             list_mcp_tools_via_daemon(&profile)
         }
         ("mcp", "direct-call") => {
+            if wants_help(&rest) {
+                print_mcp_direct_call_help();
+                return Ok(());
+            }
             let profile = require_profile(&config, &rest)?;
             let _lock = acquire_profile_lock(&profile)?;
             ensure_chrome(&profile)?;
             exec_mcp(&profile)
         }
         ("mcp", "direct-list") => {
+            if wants_help(&rest) {
+                print_mcp_direct_list_help();
+                return Ok(());
+            }
             let profile = require_profile(&config, &rest)?;
             let _lock = acquire_profile_lock(&profile)?;
             ensure_chrome(&profile)?;
             list_mcp_tools(&profile)
         }
-        ("mcp", "help") => {
-            reject_extra_args(&rest)?;
-            print_mcp_help();
-            Ok(())
-        }
         ("profile", "status") => {
+            if wants_help(&rest) {
+                print_profile_status_help();
+                return Ok(());
+            }
             let profile = require_profile(&config, &rest)?;
             print_status(&profile);
             Ok(())
         }
         ("profile", "stop") => {
+            if wants_help(&rest) {
+                print_profile_stop_help();
+                return Ok(());
+            }
             let profile = require_profile(&config, &rest)?;
             stop_profile(&profile)
         }
         ("profile", "list") => {
+            if wants_help(&rest) {
+                print_profile_list_help();
+                return Ok(());
+            }
             reject_extra_args(&rest)?;
             list_profiles(&config);
             Ok(())
         }
         ("daemon", "start") => {
+            if wants_help(&rest) {
+                print_daemon_start_help();
+                return Ok(());
+            }
             let profile = require_profile(&config, &rest)?;
             start_daemon(&profile, false)
         }
         ("daemon", "run") => {
+            if wants_help(&rest) {
+                print_daemon_run_help();
+                return Ok(());
+            }
             let profile = require_profile(&config, &rest)?;
             run_daemon(&profile)
         }
         ("daemon", "status") => {
+            if wants_help(&rest) {
+                print_daemon_status_help();
+                return Ok(());
+            }
             let profile = require_profile(&config, &rest)?;
             print_daemon_status(&profile)
         }
         ("daemon", "stop") => {
+            if wants_help(&rest) {
+                print_daemon_stop_help();
+                return Ok(());
+            }
             let profile = require_profile(&config, &rest)?;
             stop_daemon(&profile)
         }
-        (_, "help" | "--help" | "-h") => {
-            print_usage();
-            Ok(())
-        }
         _ => Err(format!("unknown command: {object} {action}")),
     }
+}
+
+fn wants_help(args: &[String]) -> bool {
+    args.iter()
+        .any(|arg| matches!(arg.as_str(), "--help" | "-h" | "help"))
 }
 
 fn load_or_create_config() -> Result<Config, String> {
@@ -1138,6 +1190,84 @@ fn print_version() {
 
 fn print_mcp_help() {
     println!(
-        "chrome-devtools mcp\n\nUsage:\n  chrome-devtools mcp list --profile <profile>\n  chrome-devtools mcp call --profile <profile>\n  chrome-devtools mcp direct-list --profile <profile>\n  chrome-devtools mcp direct-call --profile <profile>\n  chrome-devtools mcp help\n\nCommands:\n  list         Start the selected profile daemon if needed, query tools/list through it, and print the raw MCP JSON response.\n\n  call         Start the selected profile daemon if needed, then forward stdin MCP JSON-RPC lines through its long-lived MCP process.\n\n  direct-list  Bypass the daemon, run chrome-devtools-mcp directly, query tools/list, and print the raw MCP JSON response.\n\n  direct-call  Bypass the daemon, run chrome-devtools-mcp directly over stdio. Use only for fallback/manual debugging.\n\n  help         Show this help.\n\nExamples:\n  chrome-devtools daemon start --profile default\n  chrome-devtools mcp list --profile default\n  chrome-devtools mcp call --profile default\n  printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{{}},\"clientInfo\":{{\"name\":\"probe\",\"version\":\"0.0.0\"}}}}}}' | chrome-devtools mcp call --profile default\n\nConfig:\n  Profiles are read from ~/.config/chrome-devtools/config.toml.\n  If the config file is missing, chrome-devtools creates a default profile using ~/.config/chrome-devtools/profiles/default.\n  user_data_dir is optional; when omitted, it defaults to ~/.config/chrome-devtools/profiles/<profile-name>.\n  Prefer user_data_dir values under ~/.config/chrome-devtools/profiles/<profile-name>.\n\nDaemon:\n  mcp call and mcp list route through one long-lived per-profile daemon by default.\n  Daemon sockets and pid files live under ~/.cache/chrome-devtools/daemons.\n  direct-call and direct-list bypass the daemon and take a per-profile lock under ~/.cache/chrome-devtools/locks.\n  Set CHROME_DEVTOOLS_LOCK_TIMEOUT_SECS to override the direct-mode/default daemon lock wait.\n\nNotes:\n  Profiles define the Chrome user data directory and DevTools port.\n  The call command does not reimplement MCP tools; it delegates to a daemon-owned chrome-devtools-mcp process.\n  Snapshot uid values are only valid inside the MCP process that produced them.\n  Daemon-routed calls preserve that MCP process across invocations until the daemon stops."
+        "chrome-devtools mcp\n\nUsage:\n  chrome-devtools mcp list --profile <profile>\n  chrome-devtools mcp call --profile <profile>\n  chrome-devtools mcp direct-list --profile <profile>\n  chrome-devtools mcp direct-call --profile <profile>\n  chrome-devtools mcp help\n\nCommands:\n  list         Start the selected profile daemon if needed, query tools/list through it, and print the raw MCP JSON response.\n\n  call         Start the selected profile daemon if needed, then forward stdin MCP JSON-RPC lines through its long-lived MCP process.\n\n  direct-list  Bypass the daemon, run chrome-devtools-mcp directly, query tools/list, and print the raw MCP JSON response.\n\n  direct-call  Bypass the daemon, run chrome-devtools-mcp directly over stdio. Use only for fallback/manual debugging.\n\n  help         Show this help.\n\nOptions:\n  -h, --help   Show this help and exit.\n\nExamples:\n  chrome-devtools daemon start --profile default\n  chrome-devtools mcp list --profile default\n  chrome-devtools mcp call --profile default\n  printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{{}},\"clientInfo\":{{\"name\":\"probe\",\"version\":\"0.0.0\"}}}}}}' | chrome-devtools mcp call --profile default\n\nConfig:\n  Profiles are read from ~/.config/chrome-devtools/config.toml.\n  If the config file is missing, chrome-devtools creates a default profile using ~/.config/chrome-devtools/profiles/default.\n  user_data_dir is optional; when omitted, it defaults to ~/.config/chrome-devtools/profiles/<profile-name>.\n  Prefer user_data_dir values under ~/.config/chrome-devtools/profiles/<profile-name>.\n\nDaemon:\n  mcp call and mcp list route through one long-lived per-profile daemon by default.\n  Daemon sockets and pid files live under ~/.cache/chrome-devtools/daemons.\n  direct-call and direct-list bypass the daemon and take a per-profile lock under ~/.cache/chrome-devtools/locks.\n  Set CHROME_DEVTOOLS_LOCK_TIMEOUT_SECS to override the direct-mode/default daemon lock wait.\n\nNotes:\n  Profiles define the Chrome user data directory and DevTools port.\n  The call command does not reimplement MCP tools; it delegates to a daemon-owned chrome-devtools-mcp process.\n  Snapshot uid values are only valid inside the MCP process that produced them.\n  Daemon-routed calls preserve that MCP process across invocations until the daemon stops."
+    );
+}
+
+fn print_profile_help() {
+    println!(
+        "chrome-devtools profile\n\nUsage:\n  chrome-devtools profile list\n  chrome-devtools profile status --profile <profile>\n  chrome-devtools profile stop --profile <profile>\n\nCommands:\n  list    List all profiles defined in the config file.\n  status  Show whether the Chrome instance bound to the given profile is running.\n  stop    Stop the Chrome instance bound to the given profile.\n\nOptions:\n  -h, --help  Show this help and exit."
+    );
+}
+
+fn print_daemon_help() {
+    println!(
+        "chrome-devtools daemon\n\nUsage:\n  chrome-devtools daemon start --profile <profile>\n  chrome-devtools daemon status --profile <profile>\n  chrome-devtools daemon stop --profile <profile>\n\nCommands:\n  start   Start a background daemon for the profile, or report that one is already ready.\n  status  Show whether the per-profile daemon is ready, along with its pid and socket path.\n  stop    Ask the per-profile daemon to stop and clean up its socket/pid files.\n\nOptions:\n  -h, --help  Show this help and exit.\n\nNotes:\n  Daemon metadata lives under ~/.cache/chrome-devtools/daemons."
+    );
+}
+
+fn print_mcp_call_help() {
+    println!(
+        "chrome-devtools mcp call\n\nUsage:\n  chrome-devtools mcp call --profile <profile>\n\nDescription:\n  Start the selected profile daemon if needed, then forward stdin MCP JSON-RPC\n  lines through its long-lived chrome-devtools-mcp process and print responses.\n\nOptions:\n  --profile <name>  Required. Profile name from ~/.config/chrome-devtools/config.toml.\n  -h, --help        Show this help and exit.\n\nExamples:\n  printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{{}}}}' \\\n    | chrome-devtools mcp call --profile default"
+    );
+}
+
+fn print_mcp_list_help() {
+    println!(
+        "chrome-devtools mcp list\n\nUsage:\n  chrome-devtools mcp list --profile <profile>\n\nDescription:\n  Start the selected profile daemon if needed, query tools/list through it,\n  and print the raw MCP JSON response.\n\nOptions:\n  --profile <name>  Required. Profile name from ~/.config/chrome-devtools/config.toml.\n  -h, --help        Show this help and exit."
+    );
+}
+
+fn print_mcp_direct_call_help() {
+    println!(
+        "chrome-devtools mcp direct-call\n\nUsage:\n  chrome-devtools mcp direct-call --profile <profile>\n\nDescription:\n  Bypass the daemon and run chrome-devtools-mcp directly over stdio.\n  Use only for fallback/manual debugging; this mode cannot preserve snapshot\n  state across independent process invocations.\n\nOptions:\n  --profile <name>  Required. Profile name from ~/.config/chrome-devtools/config.toml.\n  -h, --help        Show this help and exit.\n\nNotes:\n  Acquires a per-profile lock under ~/.cache/chrome-devtools/locks.\n  Set CHROME_DEVTOOLS_LOCK_TIMEOUT_SECS to override the 300 second wait."
+    );
+}
+
+fn print_mcp_direct_list_help() {
+    println!(
+        "chrome-devtools mcp direct-list\n\nUsage:\n  chrome-devtools mcp direct-list --profile <profile>\n\nDescription:\n  Bypass the daemon, run chrome-devtools-mcp directly, query tools/list, and\n  print the raw MCP JSON response.\n\nOptions:\n  --profile <name>  Required. Profile name from ~/.config/chrome-devtools/config.toml.\n  -h, --help        Show this help and exit.\n\nNotes:\n  Acquires a per-profile lock under ~/.cache/chrome-devtools/locks."
+    );
+}
+
+fn print_profile_status_help() {
+    println!(
+        "chrome-devtools profile status\n\nUsage:\n  chrome-devtools profile status --profile <profile>\n\nDescription:\n  Show whether the Chrome DevTools endpoint for the given profile is reachable,\n  along with its port and user_data_dir.\n\nOptions:\n  --profile <name>  Required. Profile name from ~/.config/chrome-devtools/config.toml.\n  -h, --help        Show this help and exit."
+    );
+}
+
+fn print_profile_stop_help() {
+    println!(
+        "chrome-devtools profile stop\n\nUsage:\n  chrome-devtools profile stop --profile <profile>\n\nDescription:\n  Stop the Chrome instance bound to the given profile by matching processes\n  whose command line contains --user-data-dir=<profile user_data_dir>.\n\nOptions:\n  --profile <name>  Required. Profile name from ~/.config/chrome-devtools/config.toml.\n  -h, --help        Show this help and exit."
+    );
+}
+
+fn print_profile_list_help() {
+    println!(
+        "chrome-devtools profile list\n\nUsage:\n  chrome-devtools profile list\n\nDescription:\n  Print all profiles defined in ~/.config/chrome-devtools/config.toml, one per\n  line, as: <name>\\tport=<port>\\tuser_data_dir=<path>.\n\nOptions:\n  -h, --help  Show this help and exit."
+    );
+}
+
+fn print_daemon_start_help() {
+    println!(
+        "chrome-devtools daemon start\n\nUsage:\n  chrome-devtools daemon start --profile <profile>\n\nDescription:\n  Start a background daemon for the profile if one is not already running.\n  The daemon owns one chrome-devtools-mcp process and serializes MCP calls\n  over a Unix socket under ~/.cache/chrome-devtools/daemons.\n\nOptions:\n  --profile <name>  Required. Profile name from ~/.config/chrome-devtools/config.toml.\n  -h, --help        Show this help and exit."
+    );
+}
+
+fn print_daemon_run_help() {
+    println!(
+        "chrome-devtools daemon run\n\nUsage:\n  chrome-devtools daemon run --profile <profile>\n\nDescription:\n  Run the per-profile broker in the foreground. This subcommand is normally\n  spawned by `daemon start` and is not intended to be invoked directly.\n\nOptions:\n  --profile <name>  Required. Profile name from ~/.config/chrome-devtools/config.toml.\n  -h, --help        Show this help and exit."
+    );
+}
+
+fn print_daemon_status_help() {
+    println!(
+        "chrome-devtools daemon status\n\nUsage:\n  chrome-devtools daemon status --profile <profile>\n\nDescription:\n  Print whether the per-profile daemon is ready or stopped, with its pid and\n  Unix socket path.\n\nOptions:\n  --profile <name>  Required. Profile name from ~/.config/chrome-devtools/config.toml.\n  -h, --help        Show this help and exit."
+    );
+}
+
+fn print_daemon_stop_help() {
+    println!(
+        "chrome-devtools daemon stop\n\nUsage:\n  chrome-devtools daemon stop --profile <profile>\n\nDescription:\n  Ask the per-profile daemon to stop and clean up its socket and pid files.\n  If the daemon is unreachable but a pid file exists, fall back to sending it\n  a TERM signal via kill.\n\nOptions:\n  --profile <name>  Required. Profile name from ~/.config/chrome-devtools/config.toml.\n  -h, --help        Show this help and exit."
     );
 }
