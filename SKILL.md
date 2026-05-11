@@ -90,6 +90,28 @@ Use snapshot uids while the same profile daemon is alive:
 {"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"click","arguments":{"uid":"1_8"}}}
 ```
 
+## Scenario Execution
+
+For batched/automated workflows, `mcp exec` runs a JSON scenario file through the same per-profile daemon and returns a JSON array of results. Prefer this over hand-assembling JSON-RPC with `mcp call` when you have a fixed sequence of tool calls plus sleeps:
+
+```sh
+cat > /tmp/scenario.json <<'JSON'
+[
+  { "type": "tool", "name": "navigate_page", "args": { "type": "reload", "timeout": 15000 } },
+  { "type": "sleep_ms", "ms": 5000, "label": "wait-load" },
+  { "type": "tool", "name": "evaluate_script", "label": "title", "args": { "function": "() => document.title" } }
+]
+JSON
+
+chrome-devtools mcp exec --profile conao3 --script /tmp/scenario.json
+```
+
+Step shapes:
+- `{ "type": "tool", "name": "<mcp-tool>", "args": {...}, "label": "<optional>" }`
+- `{ "type": "sleep_ms", "ms": <u64>, "label": "<optional>" }`
+
+The output is a JSON array; each element carries the step type, optional label, and the `result` / `error` returned by the MCP tool. Snapshot uids reused inside one scenario stay valid because every step runs through the same daemon-owned MCP session.
+
 ## Common Commands
 
 List available MCP tools:

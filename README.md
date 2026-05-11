@@ -58,6 +58,7 @@ port = 9222
 ```sh
 chrome-devtools mcp list --profile default
 chrome-devtools mcp call --profile default
+chrome-devtools mcp exec --profile default --script scenario.json
 chrome-devtools mcp help
 chrome-devtools daemon start --profile default
 chrome-devtools daemon status --profile default
@@ -70,6 +71,16 @@ chrome-devtools profile stop --profile default
 `mcp list` starts the profile daemon when needed, queries `tools/list` through that daemon, and prints the raw MCP JSON response.
 
 `mcp call` starts the profile daemon when needed, forwards stdin JSON-RPC lines to the daemon-owned `chrome-devtools-mcp` process, waits for the matching JSON-RPC responses, and prints them to stdout. Each CLI invocation is serialized by the daemon, but the MCP process stays alive across invocations.
+
+`mcp exec` reads a JSON array of steps from `--script` and runs each step in order through the profile daemon. One `initialize` handshake is performed; then each `tool` step is issued as a `tools/call` and each `sleep_ms` step pauses the runner. Results are printed as a JSON array to stdout, so callers can inspect them programmatically without parsing line-delimited JSON-RPC. Step shapes:
+
+```json
+[
+  { "type": "tool", "name": "navigate_page", "args": { "type": "reload" } },
+  { "type": "sleep_ms", "ms": 5000, "label": "wait-load" },
+  { "type": "tool", "name": "evaluate_script", "label": "title", "args": { "function": "() => document.title" } }
+]
+```
 
 Important: `take_snapshot` result `uid` values are local to the running MCP process. The daemon keeps that MCP process alive for the selected profile, so a later `click`/`fill` can use snapshot state from an earlier daemon-routed invocation as long as the daemon has not restarted.
 

@@ -88,6 +88,13 @@ fn run() -> Result<(), String> {
             let profile = require_profile(&config, &rest)?;
             call_daemon(&profile)
         }
+        ("mcp", "exec") => {
+            if wants_help(&rest) {
+                print_mcp_exec_help();
+                return Ok(());
+            }
+            exec_scenario(&config, &rest)
+        }
         ("mcp", "list") => {
             if wants_help(&rest) {
                 print_mcp_list_help();
@@ -732,6 +739,138 @@ fn call_daemon(profile: &Profile) -> Result<(), String> {
     Ok(())
 }
 
+fn exec_scenario(config: &Config, args: &[String]) -> Result<(), String> {
+    let (profile_name, script_path) = parse_exec_args(args)?;
+    let profile = find_profile(config, &profile_name)?;
+    let script_content = fs::read_to_string(&script_path)
+        .map_err(|error| format!("failed to read {script_path}: {error}"))?;
+    let steps_value: serde_json::Value = serde_json::from_str(&script_content)
+        .map_err(|error| format!("failed to parse {script_path}: {error}"))?;
+    let steps = steps_value
+        .as_array()
+        .ok_or_else(|| "script must be a JSON array of steps".to_string())?;
+
+    ensure_daemon(&profile)?;
+    let socket_path = daemon_socket_path(&profile)?;
+    let mut stream = UnixStream::connect(&socket_path)
+        .map_err(|error| format!("failed to connect {}: {error}", socket_path.display()))?;
+    let mut read_stream = stream
+        .try_clone()
+        .map_err(|error| format!("failed to clone daemon stream: {error}"))?;
+    let mut reader = BufReader::new(&mut read_stream);
+
+    write_json_line(
+        &mut stream,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{"roots":{"listChanged":false}},"clientInfo":{"name":"chrome-devtools-exec","version":"0.1.0"}}}"#,
+    )?;
+    write_json_line(
+        &mut stream,
+        r#"{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}"#,
+    )?;
+    read_response(&mut reader, &mut stream, 1)?;
+
+    let mut results: Vec<serde_json::Value> = Vec::new();
+    let mut next_id: u64 = 2;
+
+    for step in steps {
+        let step_type = step
+            .get("type")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| "step missing 'type'".to_string())?;
+        let label = step.get("label").cloned();
+        match step_type {
+            "sleep_ms" => {
+                let ms = step
+                    .get("ms")
+                    .and_then(|value| value.as_u64())
+                    .ok_or_else(|| "sleep_ms requires 'ms' (non-negative integer)".to_string())?;
+                thread::sleep(Duration::from_millis(ms));
+                results.push(serde_json::json!({
+                    "type": "sleep_ms",
+                    "label": label,
+                    "ms": ms,
+                }));
+            }
+            "tool" => {
+                let name = step
+                    .get("name")
+                    .and_then(|value| value.as_str())
+                    .ok_or_else(|| "tool requires 'name'".to_string())?;
+                let arguments = step
+                    .get("args")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({}));
+                let id = next_id;
+                next_id += 1;
+                let request = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "method": "tools/call",
+                    "params": {
+                        "name": name,
+                        "arguments": arguments,
+                    }
+                });
+                write_json_line(&mut stream, &request.to_string())?;
+                let response_line = read_response(&mut reader, &mut stream, id)?;
+                let response_value: serde_json::Value =
+                    serde_json::from_str(&response_line).unwrap_or(serde_json::Value::Null);
+                results.push(serde_json::json!({
+                    "type": "tool",
+                    "name": name,
+                    "label": label,
+                    "result": response_value.get("result").cloned(),
+                    "error": response_value.get("error").cloned(),
+                }));
+            }
+            other => return Err(format!("unknown step type: {other}")),
+        }
+    }
+
+    let _ = stream.shutdown(Shutdown::Write);
+    let output = serde_json::to_string_pretty(&serde_json::Value::Array(results))
+        .map_err(|error| format!("failed to serialize results: {error}"))?;
+    println!("{output}");
+    Ok(())
+}
+
+fn parse_exec_args(args: &[String]) -> Result<(String, String), String> {
+    let mut profile_name = None;
+    let mut script_path = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--profile" => {
+                let Some(value) = args.get(index + 1) else {
+                    return Err("--profile requires a value".to_string());
+                };
+                profile_name = Some(value.clone());
+                index += 2;
+            }
+            "--script" => {
+                let Some(value) = args.get(index + 1) else {
+                    return Err("--script requires a value".to_string());
+                };
+                script_path = Some(value.clone());
+                index += 2;
+            }
+            unknown => return Err(format!("unknown argument: {unknown}")),
+        }
+    }
+    let profile_name = profile_name.ok_or_else(|| "--profile is required".to_string())?;
+    let script_path = script_path.ok_or_else(|| "--script is required".to_string())?;
+    Ok((profile_name, script_path))
+}
+
+fn find_profile(config: &Config, name: &str) -> Result<Profile, String> {
+    config
+        .profiles
+        .iter()
+        .find(|profile| profile.name == name)
+        .cloned()
+        .ok_or_else(|| format!("unknown profile: {name}"))
+}
+
 fn list_mcp_tools_via_daemon(profile: &Profile) -> Result<(), String> {
     ensure_daemon(profile)?;
     let request = concat!(
@@ -1190,7 +1329,7 @@ fn print_version() {
 
 fn print_mcp_help() {
     println!(
-        "chrome-devtools mcp\n\nUsage:\n  chrome-devtools mcp list --profile <profile>\n  chrome-devtools mcp call --profile <profile>\n  chrome-devtools mcp direct-list --profile <profile>\n  chrome-devtools mcp direct-call --profile <profile>\n  chrome-devtools mcp help\n\nCommands:\n  list         Start the selected profile daemon if needed, query tools/list through it, and print the raw MCP JSON response.\n\n  call         Start the selected profile daemon if needed, then forward stdin MCP JSON-RPC lines through its long-lived MCP process.\n\n  direct-list  Bypass the daemon, run chrome-devtools-mcp directly, query tools/list, and print the raw MCP JSON response.\n\n  direct-call  Bypass the daemon, run chrome-devtools-mcp directly over stdio. Use only for fallback/manual debugging.\n\n  help         Show this help.\n\nOptions:\n  -h, --help   Show this help and exit.\n\nExamples:\n  chrome-devtools daemon start --profile default\n  chrome-devtools mcp list --profile default\n  chrome-devtools mcp call --profile default\n  printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{{}},\"clientInfo\":{{\"name\":\"probe\",\"version\":\"0.0.0\"}}}}}}' | chrome-devtools mcp call --profile default\n\nConfig:\n  Profiles are read from ~/.config/chrome-devtools/config.toml.\n  If the config file is missing, chrome-devtools creates a default profile using ~/.config/chrome-devtools/profiles/default.\n  user_data_dir is optional; when omitted, it defaults to ~/.config/chrome-devtools/profiles/<profile-name>.\n  Prefer user_data_dir values under ~/.config/chrome-devtools/profiles/<profile-name>.\n\nDaemon:\n  mcp call and mcp list route through one long-lived per-profile daemon by default.\n  Daemon sockets and pid files live under ~/.cache/chrome-devtools/daemons.\n  direct-call and direct-list bypass the daemon and take a per-profile lock under ~/.cache/chrome-devtools/locks.\n  Set CHROME_DEVTOOLS_LOCK_TIMEOUT_SECS to override the direct-mode/default daemon lock wait.\n\nNotes:\n  Profiles define the Chrome user data directory and DevTools port.\n  The call command does not reimplement MCP tools; it delegates to a daemon-owned chrome-devtools-mcp process.\n  Snapshot uid values are only valid inside the MCP process that produced them.\n  Daemon-routed calls preserve that MCP process across invocations until the daemon stops."
+        "chrome-devtools mcp\n\nUsage:\n  chrome-devtools mcp list --profile <profile>\n  chrome-devtools mcp call --profile <profile>\n  chrome-devtools mcp exec --profile <profile> --script <path>\n  chrome-devtools mcp direct-list --profile <profile>\n  chrome-devtools mcp direct-call --profile <profile>\n  chrome-devtools mcp help\n\nCommands:\n  list         Start the selected profile daemon if needed, query tools/list through it, and print the raw MCP JSON response.\n\n  call         Start the selected profile daemon if needed, then forward stdin MCP JSON-RPC lines through its long-lived MCP process.\n\n  exec         Run a JSON scenario file of tool/sleep steps through the profile daemon and print a JSON array of results.\n\n  direct-list  Bypass the daemon, run chrome-devtools-mcp directly, query tools/list, and print the raw MCP JSON response.\n\n  direct-call  Bypass the daemon, run chrome-devtools-mcp directly over stdio. Use only for fallback/manual debugging.\n\n  help         Show this help.\n\nOptions:\n  -h, --help   Show this help and exit.\n\nExamples:\n  chrome-devtools daemon start --profile default\n  chrome-devtools mcp list --profile default\n  chrome-devtools mcp call --profile default\n  chrome-devtools mcp exec --profile default --script /tmp/scenario.json\n  printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{{}},\"clientInfo\":{{\"name\":\"probe\",\"version\":\"0.0.0\"}}}}}}' | chrome-devtools mcp call --profile default\n\nConfig:\n  Profiles are read from ~/.config/chrome-devtools/config.toml.\n  If the config file is missing, chrome-devtools creates a default profile using ~/.config/chrome-devtools/profiles/default.\n  user_data_dir is optional; when omitted, it defaults to ~/.config/chrome-devtools/profiles/<profile-name>.\n  Prefer user_data_dir values under ~/.config/chrome-devtools/profiles/<profile-name>.\n\nDaemon:\n  mcp call, mcp list and mcp exec route through one long-lived per-profile daemon by default.\n  Daemon sockets and pid files live under ~/.cache/chrome-devtools/daemons.\n  direct-call and direct-list bypass the daemon and take a per-profile lock under ~/.cache/chrome-devtools/locks.\n  Set CHROME_DEVTOOLS_LOCK_TIMEOUT_SECS to override the direct-mode/default daemon lock wait.\n\nNotes:\n  Profiles define the Chrome user data directory and DevTools port.\n  The call/exec commands do not reimplement MCP tools; they delegate to a daemon-owned chrome-devtools-mcp process.\n  Snapshot uid values are only valid inside the MCP process that produced them.\n  Daemon-routed calls preserve that MCP process across invocations until the daemon stops."
     );
 }
 
@@ -1209,6 +1348,12 @@ fn print_daemon_help() {
 fn print_mcp_call_help() {
     println!(
         "chrome-devtools mcp call\n\nUsage:\n  chrome-devtools mcp call --profile <profile>\n\nDescription:\n  Start the selected profile daemon if needed, then forward stdin MCP JSON-RPC\n  lines through its long-lived chrome-devtools-mcp process and print responses.\n\nOptions:\n  --profile <name>  Required. Profile name from ~/.config/chrome-devtools/config.toml.\n  -h, --help        Show this help and exit.\n\nExamples:\n  printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{{}}}}' \\\n    | chrome-devtools mcp call --profile default"
+    );
+}
+
+fn print_mcp_exec_help() {
+    println!(
+        "chrome-devtools mcp exec\n\nUsage:\n  chrome-devtools mcp exec --profile <profile> --script <path>\n\nDescription:\n  Read a JSON array of steps from the script file, execute each step in order\n  through the profile daemon (one initialize handshake, then a tools/call per\n  tool step), and print a JSON array of results to stdout.\n\nStep shapes:\n  {{\"type\":\"tool\",\"name\":\"<mcp-tool>\",\"args\":{{...}},\"label\":\"<optional>\"}}\n  {{\"type\":\"sleep_ms\",\"ms\":<u64>,\"label\":\"<optional>\"}}\n\nResult shape (per step):\n  {{\"type\":\"tool\",\"name\":\"...\",\"label\":\"...\",\"result\":<mcp tools/call result>,\"error\":<mcp error or null>}}\n  {{\"type\":\"sleep_ms\",\"ms\":<u64>,\"label\":\"...\"}}\n\nOptions:\n  --profile <name>  Required. Profile name from ~/.config/chrome-devtools/config.toml.\n  --script <path>   Required. Path to a JSON file containing the step array.\n  -h, --help        Show this help and exit.\n\nExample:\n  cat > /tmp/scenario.json <<'EOF'\n  [\n    {{\"type\":\"tool\",\"name\":\"navigate_page\",\"args\":{{\"type\":\"reload\",\"timeout\":15000}}}},\n    {{\"type\":\"sleep_ms\",\"ms\":5000}},\n    {{\"type\":\"tool\",\"name\":\"evaluate_script\",\"label\":\"title\",\"args\":{{\"function\":\"() => document.title\"}}}}\n  ]\n  EOF\n  chrome-devtools mcp exec --profile default --script /tmp/scenario.json"
     );
 }
 
