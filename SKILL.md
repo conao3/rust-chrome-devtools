@@ -9,14 +9,13 @@ Use `chrome-devtools` when you need browser automation through Chrome DevTools M
 
 ## Core Rules
 
-- Always choose an explicit profile. Do not rely on an implicit browser instance.
-- Prefer `chrome-devtools mcp call --profile <name>` for real browser operations.
-- `mcp call` routes through a long-lived per-profile daemon by default.
-- `take_snapshot` result `uid` values are only valid inside the MCP process/session that produced them.
-- The daemon keeps the MCP process alive across daemon-routed invocations, so snapshot uids may be reused while the daemon is alive.
-- Do not use `mcp direct-call` for a split `take_snapshot` then `click`/`fill` workflow; direct mode starts a separate MCP process.
-- Take a fresh snapshot before using `click`, `fill`, or other uid-based actions.
-- Use uids only within the same MCP session that produced the snapshot.
+- Always choose an explicit profile with `--profile <name>`. Do not rely on an implicit browser instance.
+- **For multi-step automation, prefer `chrome-devtools mcp exec --profile <name> --script <path>`.** It executes a JSON scenario through the daemon and returns a JSON array of results, which is far easier to parse than line-delimited JSON-RPC.
+- For ad-hoc/interactive flows (especially `take_snapshot` → inspect uids → follow-up tool call in the same shell session), use `chrome-devtools mcp call --profile <name>` with stdin JSON-RPC.
+- Both `mcp exec` and `mcp call` route through one long-lived per-profile daemon, so `take_snapshot` uids returned in step N can be reused in step N+1 within the same scenario or the same `mcp call` invocation.
+- `take_snapshot` result `uid` values are MCP-session-local. They stay valid only while the same daemon-owned MCP process is alive.
+- Do not use `mcp direct-call` for a split `take_snapshot` then `click`/`fill` workflow; direct mode starts a separate MCP process and the snapshot cache is lost.
+- Take a fresh snapshot before using `click`, `fill`, or other uid-based actions if the page may have changed.
 - Do not start or kill the user's regular Chrome unless explicitly asked.
 - If a browser login is required, open the page and ask the user to complete the login manually.
 
@@ -47,52 +46,23 @@ chrome-devtools profile list
 chrome-devtools profile status --profile conao3
 ```
 
-## MCP Session Workflow
+## Scenario Execution (Preferred for Multi-Step Workflows)
 
-`take_snapshot` and subsequent uid-based `click` / `fill` calls must stay in the same MCP process. A common failure mode is taking a snapshot in one MCP process and clicking in another, which can produce `No snapshot found for page 1` because the snapshot cache is MCP-session-local. The CLI now routes `mcp call` / `mcp list` through a per-profile daemon that owns one long-lived `chrome-devtools-mcp` process.
+`mcp exec` reads a JSON array of steps from `--script`, executes them in order through one daemon session, and prints a JSON array of per-step results. Use it whenever the steps are known up front.
 
-Start or ensure the profile daemon:
+### Step shapes
 
-```sh
-chrome-devtools daemon start --profile conao3
-chrome-devtools daemon status --profile conao3
-```
+- Tool call: `{ "type": "tool", "name": "<mcp-tool>", "args": { ... }, "label": "<optional>" }`
+- Sleep: `{ "type": "sleep_ms", "ms": <u64>, "label": "<optional>" }`
 
-Send MCP JSON-RPC through the daemon:
+`label` is preserved verbatim in the output, which makes it easy to grep / jq for specific step results.
 
-```sh
-chrome-devtools mcp call --profile conao3
-```
+### Result shape (per step)
 
-Initialize the MCP connection:
+- Tool: `{ "type": "tool", "name": "...", "label": "...", "result": <mcp tools/call result>, "error": <mcp error or null> }`
+- Sleep: `{ "type": "sleep_ms", "ms": <u64>, "label": "..." }`
 
-```json
-{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"agent","version":"0.0.0"}}}
-{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}
-```
-
-Navigate to a page:
-
-```json
-{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"navigate_page","arguments":{"type":"url","url":"https://www.google.com/","timeout":20000}}}
-```
-
-Inspect the current page:
-
-```json
-{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"take_snapshot","arguments":{}}}
-```
-
-Use snapshot uids while the same profile daemon is alive:
-
-```json
-{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"fill","arguments":{"uid":"1_5","value":"example text"}}}
-{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"click","arguments":{"uid":"1_8"}}}
-```
-
-## Scenario Execution
-
-For batched/automated workflows, `mcp exec` runs a JSON scenario file through the same per-profile daemon and returns a JSON array of results. Prefer this over hand-assembling JSON-RPC with `mcp call` when you have a fixed sequence of tool calls plus sleeps:
+### Example: navigate → wait → evaluate
 
 ```sh
 cat > /tmp/scenario.json <<'JSON'
@@ -106,11 +76,52 @@ JSON
 chrome-devtools mcp exec --profile conao3 --script /tmp/scenario.json
 ```
 
-Step shapes:
-- `{ "type": "tool", "name": "<mcp-tool>", "args": {...}, "label": "<optional>" }`
-- `{ "type": "sleep_ms", "ms": <u64>, "label": "<optional>" }`
+### Example: snapshot → click reusing the uid
 
-The output is a JSON array; each element carries the step type, optional label, and the `result` / `error` returned by the MCP tool. Snapshot uids reused inside one scenario stay valid because every step runs through the same daemon-owned MCP session.
+Because all steps share the same daemon-owned MCP session, a `take_snapshot` step's uid can be referenced by a later `click` step in the same scenario.
+
+```sh
+cat > /tmp/click-scenario.json <<'JSON'
+[
+  { "type": "tool", "name": "take_snapshot", "args": {} },
+  { "type": "tool", "name": "click", "args": { "uid": "1_8" } }
+]
+JSON
+```
+
+When the target uid is not known in advance, split the work: run the `take_snapshot` scenario first, parse the response, then build a second scenario that references the resolved uid.
+
+### Reading results with jq
+
+```sh
+chrome-devtools mcp exec --profile conao3 --script /tmp/scenario.json \
+  | jq '.[] | select(.label == "title") | .result.content[0].text'
+```
+
+## Interactive Workflow with `mcp call`
+
+For exploratory or hand-driven JSON-RPC, `mcp call` forwards stdin lines to the daemon's MCP process and prints responses on stdout. The daemon keeps the MCP process alive across invocations.
+
+```sh
+chrome-devtools daemon start --profile conao3
+chrome-devtools mcp call --profile conao3
+```
+
+Initialize the MCP connection:
+
+```json
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"agent","version":"0.0.0"}}}
+{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}
+```
+
+Navigate / inspect / interact:
+
+```json
+{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"navigate_page","arguments":{"type":"url","url":"https://www.google.com/","timeout":20000}}}
+{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"take_snapshot","arguments":{}}}
+{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"fill","arguments":{"uid":"1_5","value":"example text"}}}
+{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"click","arguments":{"uid":"1_8"}}}
+```
 
 ## Common Commands
 
@@ -124,6 +135,7 @@ Show MCP help:
 
 ```sh
 chrome-devtools mcp help
+chrome-devtools mcp exec --help
 ```
 
 Stop the profile daemon:
@@ -132,13 +144,13 @@ Stop the profile daemon:
 chrome-devtools daemon stop --profile conao3
 ```
 
-Bypass the daemon only for manual fallback debugging:
+Bypass the daemon only for manual fallback debugging (cannot preserve snapshot uids across separate invocations):
 
 ```sh
 chrome-devtools mcp direct-call --profile conao3
 ```
 
-Stop a managed profile:
+Stop the Chrome instance owned by a profile:
 
 ```sh
 chrome-devtools profile stop --profile conao3
@@ -146,8 +158,9 @@ chrome-devtools profile stop --profile conao3
 
 ## Troubleshooting
 
-- If `fill` or `click` fails with a missing snapshot, check whether the daemon restarted; take a new snapshot through the current daemon and retry.
-- If the page is not the expected page, call `take_snapshot` and read the selected page URL before acting.
-- If the profile is not running, `mcp call` and `mcp list` should start or reuse Chrome for the profile.
+- If `fill` or `click` fails with a missing snapshot, check whether the daemon restarted between the snapshot and the action. Re-snapshot inside the same `mcp exec` scenario, or inside one `mcp call` invocation.
+- If the page is not the expected page, run an `evaluate_script` step that returns `window.location.href` and verify before acting.
+- If the profile's Chrome is not running, `mcp call` / `mcp exec` / `mcp list` will start it on first use.
 - If login state is missing, verify the profile name and `user_data_dir`; login cookies are profile-specific.
 - If a DevTools port conflicts, assign a different `port` in `config.toml`.
+- If `mcp exec` reports `unknown step type`, check the `type` field; only `tool` and `sleep_ms` are supported.
