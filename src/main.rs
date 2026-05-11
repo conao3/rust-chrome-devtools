@@ -739,13 +739,20 @@ fn call_daemon(profile: &Profile) -> Result<(), String> {
     Ok(())
 }
 
+struct ExecOptions {
+    profile_name: String,
+    script_path: String,
+    output_path: Option<String>,
+    fail_fast: bool,
+}
+
 fn exec_scenario(config: &Config, args: &[String]) -> Result<(), String> {
-    let (profile_name, script_path) = parse_exec_args(args)?;
-    let profile = find_profile(config, &profile_name)?;
-    let script_content = fs::read_to_string(&script_path)
-        .map_err(|error| format!("failed to read {script_path}: {error}"))?;
-    let steps_value: serde_json::Value = serde_json::from_str(&script_content)
-        .map_err(|error| format!("failed to parse {script_path}: {error}"))?;
+    let options = parse_exec_args(args)?;
+    let profile = find_profile(config, &options.profile_name)?;
+    let script_content = read_script_source(&options.script_path)?;
+    let steps_value: serde_json::Value = serde_json::from_str(&script_content).map_err(|error| {
+        format!("failed to parse {}: {error}", options.script_path)
+    })?;
     let steps = steps_value
         .as_array()
         .ok_or_else(|| "script must be a JSON array of steps".to_string())?;
@@ -771,6 +778,7 @@ fn exec_scenario(config: &Config, args: &[String]) -> Result<(), String> {
 
     let mut results: Vec<serde_json::Value> = Vec::new();
     let mut next_id: u64 = 2;
+    let mut stopped_on_error: Option<String> = None;
 
     for step in steps {
         let step_type = step
@@ -778,6 +786,17 @@ fn exec_scenario(config: &Config, args: &[String]) -> Result<(), String> {
             .and_then(|value| value.as_str())
             .ok_or_else(|| "step missing 'type'".to_string())?;
         let label = step.get("label").cloned();
+        let on_error = step
+            .get("on_error")
+            .and_then(|value| value.as_str())
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| {
+                if options.fail_fast {
+                    "stop".to_string()
+                } else {
+                    "continue".to_string()
+                }
+            });
         match step_type {
             "sleep_ms" => {
                 let ms = step
@@ -796,10 +815,11 @@ fn exec_scenario(config: &Config, args: &[String]) -> Result<(), String> {
                     .get("name")
                     .and_then(|value| value.as_str())
                     .ok_or_else(|| "tool requires 'name'".to_string())?;
-                let arguments = step
+                let raw_arguments = step
                     .get("args")
                     .cloned()
                     .unwrap_or_else(|| serde_json::json!({}));
+                let arguments = resolve_refs(raw_arguments, &results)?;
                 let id = next_id;
                 next_id += 1;
                 let request = serde_json::json!({
@@ -815,28 +835,70 @@ fn exec_scenario(config: &Config, args: &[String]) -> Result<(), String> {
                 let response_line = read_response(&mut reader, &mut stream, id)?;
                 let response_value: serde_json::Value =
                     serde_json::from_str(&response_line).unwrap_or(serde_json::Value::Null);
+                let result_value = response_value.get("result").cloned();
+                let error_value = response_value.get("error").cloned();
+                let is_error_result = matches!(
+                    result_value.as_ref().and_then(|value| value.get("isError")),
+                    Some(serde_json::Value::Bool(true))
+                );
+                let has_error =
+                    error_value.as_ref().is_some_and(|value| !value.is_null()) || is_error_result;
                 results.push(serde_json::json!({
                     "type": "tool",
                     "name": name,
                     "label": label,
-                    "result": response_value.get("result").cloned(),
-                    "error": response_value.get("error").cloned(),
+                    "result": result_value,
+                    "error": error_value,
                 }));
+                if has_error && on_error == "stop" {
+                    stopped_on_error = Some(
+                        label
+                            .as_ref()
+                            .and_then(|value| value.as_str())
+                            .map(|value| value.to_string())
+                            .unwrap_or_else(|| name.to_string()),
+                    );
+                    break;
+                }
             }
             other => return Err(format!("unknown step type: {other}")),
         }
     }
 
     let _ = stream.shutdown(Shutdown::Write);
+
     let output = serde_json::to_string_pretty(&serde_json::Value::Array(results))
         .map_err(|error| format!("failed to serialize results: {error}"))?;
-    println!("{output}");
+    if let Some(path) = &options.output_path {
+        fs::write(path, &output)
+            .map_err(|error| format!("failed to write {path}: {error}"))?;
+    } else {
+        println!("{output}");
+    }
+
+    if let Some(label) = stopped_on_error {
+        return Err(format!("scenario stopped on error at step: {label}"));
+    }
     Ok(())
 }
 
-fn parse_exec_args(args: &[String]) -> Result<(String, String), String> {
+fn read_script_source(path: &str) -> Result<String, String> {
+    if path == "-" {
+        let mut content = String::new();
+        std::io::stdin()
+            .read_to_string(&mut content)
+            .map_err(|error| format!("failed to read script from stdin: {error}"))?;
+        Ok(content)
+    } else {
+        fs::read_to_string(path).map_err(|error| format!("failed to read {path}: {error}"))
+    }
+}
+
+fn parse_exec_args(args: &[String]) -> Result<ExecOptions, String> {
     let mut profile_name = None;
     let mut script_path = None;
+    let mut output_path = None;
+    let mut fail_fast = false;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -854,12 +916,88 @@ fn parse_exec_args(args: &[String]) -> Result<(String, String), String> {
                 script_path = Some(value.clone());
                 index += 2;
             }
+            "--output" => {
+                let Some(value) = args.get(index + 1) else {
+                    return Err("--output requires a value".to_string());
+                };
+                output_path = Some(value.clone());
+                index += 2;
+            }
+            "--fail-fast" => {
+                fail_fast = true;
+                index += 1;
+            }
             unknown => return Err(format!("unknown argument: {unknown}")),
         }
     }
     let profile_name = profile_name.ok_or_else(|| "--profile is required".to_string())?;
     let script_path = script_path.ok_or_else(|| "--script is required".to_string())?;
-    Ok((profile_name, script_path))
+    Ok(ExecOptions {
+        profile_name,
+        script_path,
+        output_path,
+        fail_fast,
+    })
+}
+
+/// Recursively resolve `{ "$ref": "<label>.<path>..." }` markers using `results`.
+/// `path` segments are dot-separated; numeric segments index into arrays.
+fn resolve_refs(
+    value: serde_json::Value,
+    results: &[serde_json::Value],
+) -> Result<serde_json::Value, String> {
+    match value {
+        serde_json::Value::Object(map) if map.len() == 1 && map.contains_key("$ref") => {
+            let path = map
+                .get("$ref")
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| "$ref must be a string".to_string())?;
+            Ok(resolve_path(path, results))
+        }
+        serde_json::Value::Object(map) => {
+            let mut resolved = serde_json::Map::with_capacity(map.len());
+            for (key, sub) in map {
+                resolved.insert(key, resolve_refs(sub, results)?);
+            }
+            Ok(serde_json::Value::Object(resolved))
+        }
+        serde_json::Value::Array(items) => {
+            let mut resolved = Vec::with_capacity(items.len());
+            for item in items {
+                resolved.push(resolve_refs(item, results)?);
+            }
+            Ok(serde_json::Value::Array(resolved))
+        }
+        other => Ok(other),
+    }
+}
+
+fn resolve_path(path: &str, results: &[serde_json::Value]) -> serde_json::Value {
+    let mut parts = path.split('.');
+    let Some(label) = parts.next() else {
+        return serde_json::Value::Null;
+    };
+    let Some(entry) = results
+        .iter()
+        .find(|entry| entry.get("label").and_then(|value| value.as_str()) == Some(label))
+    else {
+        return serde_json::Value::Null;
+    };
+    let mut current = entry.clone();
+    for part in parts {
+        current = if let Ok(index) = part.parse::<usize>() {
+            current
+                .get(index)
+                .cloned()
+                .unwrap_or(serde_json::Value::Null)
+        } else {
+            current
+                .get(part)
+                .cloned()
+                .unwrap_or(serde_json::Value::Null)
+        };
+    }
+    current
 }
 
 fn find_profile(config: &Config, name: &str) -> Result<Profile, String> {
@@ -1353,7 +1491,7 @@ fn print_mcp_call_help() {
 
 fn print_mcp_exec_help() {
     println!(
-        "chrome-devtools mcp exec\n\nUsage:\n  chrome-devtools mcp exec --profile <profile> --script <path>\n\nDescription:\n  Read a JSON array of steps from the script file, execute each step in order\n  through the profile daemon (one initialize handshake, then a tools/call per\n  tool step), and print a JSON array of results to stdout.\n\nStep shapes:\n  {{\"type\":\"tool\",\"name\":\"<mcp-tool>\",\"args\":{{...}},\"label\":\"<optional>\"}}\n  {{\"type\":\"sleep_ms\",\"ms\":<u64>,\"label\":\"<optional>\"}}\n\nResult shape (per step):\n  {{\"type\":\"tool\",\"name\":\"...\",\"label\":\"...\",\"result\":<mcp tools/call result>,\"error\":<mcp error or null>}}\n  {{\"type\":\"sleep_ms\",\"ms\":<u64>,\"label\":\"...\"}}\n\nOptions:\n  --profile <name>  Required. Profile name from ~/.config/chrome-devtools/config.toml.\n  --script <path>   Required. Path to a JSON file containing the step array.\n  -h, --help        Show this help and exit.\n\nExample:\n  cat > /tmp/scenario.json <<'EOF'\n  [\n    {{\"type\":\"tool\",\"name\":\"navigate_page\",\"args\":{{\"type\":\"reload\",\"timeout\":15000}}}},\n    {{\"type\":\"sleep_ms\",\"ms\":5000}},\n    {{\"type\":\"tool\",\"name\":\"evaluate_script\",\"label\":\"title\",\"args\":{{\"function\":\"() => document.title\"}}}}\n  ]\n  EOF\n  chrome-devtools mcp exec --profile default --script /tmp/scenario.json"
+        "chrome-devtools mcp exec\n\nUsage:\n  chrome-devtools mcp exec --profile <profile> --script <path> [--output <path>] [--fail-fast]\n\nDescription:\n  Read a JSON array of steps from --script, execute each step in order through\n  the profile daemon (one initialize handshake, then a tools/call per tool\n  step), and print a JSON array of results to stdout.\n\nStep shapes:\n  {{\"type\":\"tool\",\"name\":\"<mcp-tool>\",\"args\":{{...}},\"label\":\"<optional>\",\"on_error\":\"continue|stop\"}}\n  {{\"type\":\"sleep_ms\",\"ms\":<u64>,\"label\":\"<optional>\"}}\n\nValue references inside args:\n  Replace any value in args with {{\"$ref\":\"<label>.<path>\"}} to substitute it\n  with a previous result. <path> is dot-separated; numeric segments index\n  arrays. Example: {{\"$ref\":\"snap.result.content.0.text\"}} resolves to the\n  text of the first content entry returned by the step labelled 'snap'.\n\nResult shape (per step):\n  {{\"type\":\"tool\",\"name\":\"...\",\"label\":\"...\",\"result\":<mcp tools/call result>,\"error\":<mcp error or null>}}\n  {{\"type\":\"sleep_ms\",\"ms\":<u64>,\"label\":\"...\"}}\n\nError handling:\n  A tool step is considered to have errored if the MCP response carries a\n  non-null 'error' field or the result has isError=true. By default the\n  scenario continues; pass --fail-fast or set on_error=stop on a step to\n  stop execution after that error. When stopped, exec writes the partial\n  results to stdout/--output and exits non-zero.\n\nOptions:\n  --profile <name>  Required. Profile name from ~/.config/chrome-devtools/config.toml.\n  --script <path>   Required. Path to a JSON file with the step array, or `-` for stdin.\n  --output <path>   Optional. Write the JSON results to <path> instead of stdout.\n  --fail-fast       Optional. Stop on the first errored tool step.\n  -h, --help        Show this help and exit.\n\nExamples:\n  cat > /tmp/scenario.json <<'EOF'\n  [\n    {{\"type\":\"tool\",\"name\":\"navigate_page\",\"args\":{{\"type\":\"reload\",\"timeout\":15000}}}},\n    {{\"type\":\"sleep_ms\",\"ms\":5000}},\n    {{\"type\":\"tool\",\"name\":\"evaluate_script\",\"label\":\"title\",\"args\":{{\"function\":\"() => document.title\"}}}}\n  ]\n  EOF\n  chrome-devtools mcp exec --profile default --script /tmp/scenario.json\n\n  printf '%s' '[{{\"type\":\"tool\",\"name\":\"list_pages\"}}]' \\\n    | chrome-devtools mcp exec --profile default --script -"
     );
 }
 

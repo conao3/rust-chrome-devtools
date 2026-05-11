@@ -52,10 +52,23 @@ chrome-devtools profile status --profile conao3
 
 ### Step shapes
 
-- Tool call: `{ "type": "tool", "name": "<mcp-tool>", "args": { ... }, "label": "<optional>" }`
+- Tool call: `{ "type": "tool", "name": "<mcp-tool>", "args": { ... }, "label": "<optional>", "on_error": "continue|stop" }`
 - Sleep: `{ "type": "sleep_ms", "ms": <u64>, "label": "<optional>" }`
 
 `label` is preserved verbatim in the output, which makes it easy to grep / jq for specific step results.
+
+### Value references inside args
+
+Replace any `args` value with `{ "$ref": "<label>.<path>" }` to substitute it with a previous step's result. `<path>` is dot-separated; numeric segments index arrays. Example: `{ "$ref": "page.result.content.0.text" }` resolves to the first content text returned by the step labelled `page`.
+
+### Error handling
+
+A tool step is considered to have errored if the MCP response carries a non-null `error` field or the result has `isError: true`. By default, the scenario records the error and continues; pass `--fail-fast` (or `"on_error": "stop"` on a step) to abort. The runner still emits the partial results array and exits non-zero on aborts.
+
+### Other flags
+
+- `--script -` reads the scenario from stdin (useful with heredocs).
+- `--output <path>` writes the JSON results to a file instead of stdout.
 
 ### Result shape (per step)
 
