@@ -25,63 +25,70 @@ The daemon owns:
 - one Chrome process/profile/DevTools port;
 - one long-lived `chrome-devtools-mcp` child process;
 - per-profile concurrency control;
-- future task/session metadata such as tab target ownership.
+- in-memory session metadata (id, created/last-used timestamps, owned flag);
+- a background reaper that drops sessions idle for more than 30 minutes.
 
-## Implemented MVP behavior
-
-The first safe version should prefer correctness over parallelism:
+## Implemented behavior
 
 1. Start one daemon per profile with `chrome-devtools daemon start --profile <name>`.
 2. Keep one `chrome-devtools-mcp` process alive inside the daemon.
-3. Route `chrome-devtools mcp call --profile <name>` and `mcp list` through the daemon by default.
+3. Route `chrome-devtools mcp call --profile <name> --session <id>`, `mcp batch --profile <name> --session <id> --script <path>`, and `mcp list --profile <name>` through the daemon by default.
 4. Serialize client requests per profile so `take_snapshot -> click` stays inside the same MCP process and is not interleaved with another writer.
 5. Keep `mcp direct-call` and `mcp direct-list` as fallbacks for simple/manual debugging.
 
-This means the MVP is effectively:
-
-```text
-one profile -> one daemon -> one MCP process -> one active client stream at a time
-```
-
-That is intentionally conservative. It avoids active-tab and snapshot-cache races before adding background tab parallelism.
-
 The daemon uses a Unix domain socket under `~/.cache/chrome-devtools/daemons/<profile>.sock` and a pid file next to it. The profile-level lock under `~/.cache/chrome-devtools/locks` is held for the daemon lifetime, so direct fallback MCP commands do not run concurrently with the profile daemon.
 
-The current daemon protocol is line-oriented JSON-RPC forwarding: each client invocation sends one or more JSON-RPC lines, the daemon forwards them to the long-lived MCP child, then returns matching responses for numeric request ids. This preserves MCP process-local state across separate CLI invocations while keeping request handling serialized.
+## Session ownership
 
-## Later behavior
-
-After the MVP is stable, add explicit session ownership:
+Sessions are minted, listed, and dropped over the daemon control protocol:
 
 ```text
-chrome-devtools session create --profile conao3 --url https://example.com
-chrome-devtools session call --session <id>
-chrome-devtools session close --session <id>
+chrome-devtools session create --profile <name>
+chrome-devtools session list   --profile <name>
+chrome-devtools session close  --profile <name> --session <id>
 ```
 
-A session should record:
+`mcp call` and `mcp batch` require `--session <id>`. The CLI sends `__chrome_devtools_daemon__:bind session=<id>` as the first line on its daemon connection. The daemon validates the session, marks it owned for the lifetime of that connection, and refuses concurrent binds against the same id. JSON-RPC tool calls on a bound connection refresh the session's `last_used_at` timestamp; on disconnect, the daemon releases ownership and updates `last_used_at` one more time.
 
-- profile name;
-- MCP/browser target id;
+A session records:
+
+- session id (`sess-<16 hex chars>`);
 - created timestamp;
-- optional owner/task id;
-- current URL;
-- lock mode (`read`, `write`, or `exclusive`).
+- last-used timestamp;
+- `owned` flag (whether a client connection currently holds it).
 
-Future concurrency policy:
+Sessions live in-memory on the daemon. A reaper thread wakes up every 60 seconds and drops sessions whose `last_used_at` is more than 30 minutes old and that are not currently owned. Sessions are also dropped when the daemon stops (`daemon stop` or process exit).
 
-- Browser/profile global operations stay exclusive.
-- Mutating operations are locked by origin/site.
-- Read-only operations may run in parallel only when they target explicit session-owned tabs.
+## Daemon control protocol
+
+Each client connection sends a line beginning with `__chrome_devtools_daemon__:` and receives one or more newline-terminated response lines:
+
+| Command                              | Response (per session)                                  |
+|--------------------------------------|---------------------------------------------------------|
+| `status`                             | `daemon=ready`                                          |
+| `stop`                               | `daemon=stopping`, then daemon exits                    |
+| `session_create`                     | `session=<id> created=<ts> last_used=<ts> owned=false`  |
+| `session_list`                       | one line per session in the same format                 |
+| `session_close session=<id>`         | `closed=<id>` or `error=<message>`                      |
+| `bind session=<id>`                  | `bound=<id>` or `error=<message>`                       |
+
+After a successful `bind`, the daemon stays in JSON-RPC forwarding mode on that connection: each JSON-RPC line is forwarded to the long-lived `chrome-devtools-mcp` child, and matching responses are streamed back.
+
+## Future direction
+
+- Background tab parallelism: bind multiple sessions to background browser tabs and run independent agents in parallel without sharing the active tab.
+- Per-tab snapshot cache: route snapshot uids through session-scoped maps so concurrent agents do not invalidate each other's uids.
+- Lock modes (`read`, `write`, `exclusive`) and origin-scoped locking for mutating operations.
 - Commands must not rely on Chrome's active tab.
 
-## Non-goals for the MVP
+## Non-goals (still)
 
 - No Chrome extension yet.
 - No attempt to bypass website access controls, CAPTCHA, or login prompts.
+- No BrowserContext-level isolation between sessions. Sessions today gate the daemon-level mutex and `last_used_at` timer; they do not yet partition cookies, snapshot uids, or active tab.
 - No parallel writes to the same website/account.
 - No implicit active-tab operations for automation flows.
 
 ## Operational rule for agents
 
-For any action sequence that uses snapshot `uid` values, keep all related MCP calls in the same `chrome-devtools mcp call` stream or use the profile daemon once available. Do not take a snapshot in one command invocation and click/fill in another independent MCP process.
+For any action sequence that uses snapshot `uid` values, keep all related MCP calls in the same `chrome-devtools mcp call` invocation, or chain them inside one `mcp batch` script. Both bind a single session for their lifetime, so the daemon prevents another client from interleaving. Do not take a snapshot in one command invocation and click/fill in another independent MCP process.

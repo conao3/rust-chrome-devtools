@@ -10,9 +10,12 @@ Use `chrome-devtools` when you need browser automation through Chrome DevTools M
 ## Core Rules
 
 - Always choose an explicit profile with `--profile <name>`. Do not rely on an implicit browser instance.
-- **For multi-step automation, prefer `chrome-devtools mcp batch --profile <name> --script <path>`.** It executes a JSON scenario through the daemon and returns a JSON array of results, which is far easier to parse than line-delimited JSON-RPC.
-- For ad-hoc/interactive flows (especially `take_snapshot` → inspect uids → follow-up tool call in the same shell session), use `chrome-devtools mcp call --profile <name>` with stdin JSON-RPC.
+- **Mint a session before running `mcp call` or `mcp batch`.** Both subcommands require `--session <id>` and refuse to start without it. Use `chrome-devtools session create --profile <name>` to get an id, then reuse the same id for every related invocation.
+- **For multi-step automation, prefer `chrome-devtools mcp batch --profile <name> --session <id> --script <path>`.** It executes a JSON scenario through the daemon and returns a JSON array of results, which is far easier to parse than line-delimited JSON-RPC.
+- For ad-hoc/interactive flows (especially `take_snapshot` → inspect uids → follow-up tool call in the same shell session), use `chrome-devtools mcp call --profile <name> --session <id>` with stdin JSON-RPC.
 - Both `mcp batch` and `mcp call` route through one long-lived per-profile daemon, so `take_snapshot` uids returned in step N can be reused in step N+1 within the same scenario or the same `mcp call` invocation.
+- Sessions expire after 30 minutes of inactivity. Activity (any tool call) refreshes the timer. After expiry, mint a new id.
+- A session is held exclusively while bound by a `mcp call` / `mcp batch` invocation. A second concurrent invocation on the same session id is rejected by the daemon. Each parallel agent should own its own session id.
 - `take_snapshot` result `uid` values are MCP-session-local. They stay valid only while the same daemon-owned MCP process is alive.
 - Do not use `mcp direct-call` for a split `take_snapshot` then `click`/`fill` workflow; direct mode starts a separate MCP process and the snapshot cache is lost.
 - Take a fresh snapshot before using `click`, `fill`, or other uid-based actions if the page may have changed.
@@ -45,6 +48,26 @@ Check profiles before operating:
 chrome-devtools profile list
 chrome-devtools profile status --profile conao3
 ```
+
+## Session Lifecycle
+
+Mint, reuse, and tear down sessions explicitly. Every `mcp call` and `mcp batch` invocation must carry `--session <id>`.
+
+```sh
+# Mint a session. Output: session=sess-xxxxxxxxxxxxxxxx created=<ts> last_used=<ts> owned=false
+chrome-devtools session create --profile conao3
+
+# Capture the id for later use
+SESSION=$(chrome-devtools session create --profile conao3 | awk -F= '{print $2}' | awk '{print $1}')
+
+# Inspect active sessions
+chrome-devtools session list --profile conao3
+
+# Drop a session when finished
+chrome-devtools session close --profile conao3 --session "$SESSION"
+```
+
+Sessions are in-memory on the daemon. They are dropped after 30 minutes of inactivity or when the daemon stops (`chrome-devtools daemon stop --profile <name>`). After expiry, mint a new id.
 
 ## Batch Execution (Preferred for Multi-Step Workflows)
 
@@ -86,7 +109,7 @@ cat > /tmp/scenario.json <<'JSON'
 ]
 JSON
 
-chrome-devtools mcp batch --profile conao3 --script /tmp/scenario.json
+chrome-devtools mcp batch --profile conao3 --session "$SESSION" --script /tmp/scenario.json
 ```
 
 ### Example: snapshot → click reusing the uid
@@ -107,7 +130,7 @@ When the target uid is not known in advance, split the work: run the `take_snaps
 ### Reading results with jq
 
 ```sh
-chrome-devtools mcp batch --profile conao3 --script /tmp/scenario.json \
+chrome-devtools mcp batch --profile conao3 --session "$SESSION" --script /tmp/scenario.json \
   | jq '.[] | select(.label == "title") | .result.content[0].text'
 ```
 
@@ -117,7 +140,8 @@ For exploratory or hand-driven JSON-RPC, `mcp call` forwards stdin lines to the 
 
 ```sh
 chrome-devtools daemon start --profile conao3
-chrome-devtools mcp call --profile conao3
+SESSION=$(chrome-devtools session create --profile conao3 | awk -F= '{print $2}' | awk '{print $1}')
+chrome-devtools mcp call --profile conao3 --session "$SESSION"
 ```
 
 Initialize the MCP connection:
@@ -157,7 +181,7 @@ Stop the profile daemon:
 chrome-devtools daemon stop --profile conao3
 ```
 
-Bypass the daemon only for manual fallback debugging (cannot preserve snapshot uids across separate invocations):
+Bypass the daemon only for manual fallback debugging (cannot preserve snapshot uids across separate invocations, ignores sessions):
 
 ```sh
 chrome-devtools mcp direct-call --profile conao3
@@ -171,6 +195,8 @@ chrome-devtools profile stop --profile conao3
 
 ## Troubleshooting
 
+- If `mcp call` or `mcp batch` exits with `unknown session`, the session expired (30 min idle) or the daemon restarted. Mint a new id via `session create` and retry.
+- If `mcp call` or `mcp batch` exits with `session in use`, another invocation is currently bound to that id. Wait for it to finish or mint a separate session for the new agent.
 - If `fill` or `click` fails with a missing snapshot, check whether the daemon restarted between the snapshot and the action. Re-snapshot inside the same `mcp batch` scenario, or inside one `mcp call` invocation.
 - If the page is not the expected page, run an `evaluate_script` step that returns `window.location.href` and verify before acting.
 - If the profile's Chrome is not running, `mcp call` / `mcp batch` / `mcp list` will start it on first use.
