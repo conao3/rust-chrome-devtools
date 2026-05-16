@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -6,8 +7,10 @@ use std::net::{SocketAddr, TcpStream};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[derive(Clone, Debug)]
 struct Config {
@@ -35,6 +38,110 @@ const DEFAULT_PROFILE_PORT: u16 = 9222;
 const DEFAULT_PROFILE_USER_DATA_DIR: &str = "~/.config/chrome-devtools/profiles/default";
 const PROFILE_USER_DATA_DIR_PREFIX: &str = "~/.config/chrome-devtools/profiles";
 const DAEMON_READY_TIMEOUT: Duration = Duration::from_secs(30);
+const SESSION_IDLE_TTL: Duration = Duration::from_secs(30 * 60);
+const SESSION_REAPER_INTERVAL: Duration = Duration::from_secs(60);
+
+#[derive(Clone, Debug)]
+struct SessionState {
+    id: String,
+    created_at: SystemTime,
+    last_used_at: SystemTime,
+    owned: bool,
+}
+
+#[derive(Default)]
+struct SessionRegistry {
+    sessions: HashMap<String, SessionState>,
+}
+
+impl SessionRegistry {
+    fn create(&mut self) -> SessionState {
+        let now = SystemTime::now();
+        let id = generate_session_id();
+        let state = SessionState {
+            id: id.clone(),
+            created_at: now,
+            last_used_at: now,
+            owned: false,
+        };
+        self.sessions.insert(id.clone(), state.clone());
+        state
+    }
+
+    fn list(&self) -> Vec<SessionState> {
+        let mut sessions = self.sessions.values().cloned().collect::<Vec<_>>();
+        sessions.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+        sessions
+    }
+
+    fn close(&mut self, id: &str) -> Result<(), String> {
+        if self.sessions.remove(id).is_some() {
+            Ok(())
+        } else {
+            Err(format!("unknown session: {id}"))
+        }
+    }
+
+    fn bind(&mut self, id: &str) -> Result<(), String> {
+        let session = self
+            .sessions
+            .get_mut(id)
+            .ok_or_else(|| format!("unknown session: {id}"))?;
+        if session.owned {
+            return Err(format!("session in use: {id}"));
+        }
+        session.owned = true;
+        session.last_used_at = SystemTime::now();
+        Ok(())
+    }
+
+    fn unbind(&mut self, id: &str) {
+        if let Some(session) = self.sessions.get_mut(id) {
+            session.owned = false;
+            session.last_used_at = SystemTime::now();
+        }
+    }
+
+    fn touch(&mut self, id: &str) {
+        if let Some(session) = self.sessions.get_mut(id) {
+            session.last_used_at = SystemTime::now();
+        }
+    }
+
+    fn reap_expired(&mut self) {
+        let now = SystemTime::now();
+        self.sessions.retain(|_, session| {
+            if session.owned {
+                return true;
+            }
+            match now.duration_since(session.last_used_at) {
+                Ok(elapsed) => elapsed < SESSION_IDLE_TTL,
+                Err(_) => true,
+            }
+        });
+    }
+}
+
+fn generate_session_id() -> String {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos() as u64)
+        .unwrap_or(0);
+    let pid = std::process::id() as u64;
+    let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let mix = nanos
+        .wrapping_mul(0x9E3779B97F4A7C15)
+        .wrapping_add(pid.wrapping_mul(0xBF58476D1CE4E5B9))
+        .wrapping_add(counter.wrapping_mul(0x94D049BB133111EB));
+    format!("sess-{mix:016x}")
+}
+
+fn unix_secs(time: SystemTime) -> u64 {
+    time.duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
 
 fn main() {
     if let Err(error) = run() {
@@ -79,6 +186,34 @@ fn run() -> Result<(), String> {
         ("daemon", "help" | "--help" | "-h") => {
             print_daemon_help();
             Ok(())
+        }
+        ("session", "help" | "--help" | "-h") => {
+            print_session_help();
+            Ok(())
+        }
+        ("session", "create") => {
+            if wants_help(&rest) {
+                print_session_create_help();
+                return Ok(());
+            }
+            let profile = require_profile(&config, &rest)?;
+            create_session(&profile)
+        }
+        ("session", "list") => {
+            if wants_help(&rest) {
+                print_session_list_help();
+                return Ok(());
+            }
+            let profile = require_profile(&config, &rest)?;
+            list_sessions(&profile)
+        }
+        ("session", "close") => {
+            if wants_help(&rest) {
+                print_session_close_help();
+                return Ok(());
+            }
+            let (profile, session_id) = require_profile_and_session(&config, &rest)?;
+            close_session(&profile, &session_id)
         }
         ("mcp", "call") => {
             if wants_help(&rest) {
@@ -566,10 +701,20 @@ fn run_daemon(profile: &Profile) -> Result<(), String> {
     let listener = UnixListener::bind(&socket_path)
         .map_err(|error| format!("failed to bind {}: {error}", socket_path.display()))?;
 
+    let sessions: Arc<Mutex<SessionRegistry>> = Arc::new(Mutex::new(SessionRegistry::default()));
+    let sessions_for_reaper = Arc::clone(&sessions);
+    thread::spawn(move || loop {
+        thread::sleep(SESSION_REAPER_INTERVAL);
+        if let Ok(mut registry) = sessions_for_reaper.lock() {
+            registry.reap_expired();
+        }
+    });
+
     for stream in listener.incoming() {
         let mut stream =
             stream.map_err(|error| format!("failed to accept daemon client: {error}"))?;
-        let should_stop = handle_daemon_client(&mut stream, &mut mcp_stdin, &mut mcp_reader)?;
+        let should_stop =
+            handle_daemon_client(&mut stream, &mut mcp_stdin, &mut mcp_reader, &sessions)?;
         if should_stop {
             break;
         }
@@ -602,10 +747,35 @@ fn initialize_daemon_mcp(
     )
 }
 
+struct BoundSessionGuard<'a> {
+    sessions: &'a Arc<Mutex<SessionRegistry>>,
+    id: Option<String>,
+}
+
+impl<'a> BoundSessionGuard<'a> {
+    fn new(sessions: &'a Arc<Mutex<SessionRegistry>>) -> Self {
+        Self {
+            sessions,
+            id: None,
+        }
+    }
+}
+
+impl Drop for BoundSessionGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(id) = self.id.take() {
+            if let Ok(mut registry) = self.sessions.lock() {
+                registry.unbind(&id);
+            }
+        }
+    }
+}
+
 fn handle_daemon_client(
     stream: &mut UnixStream,
     mcp_stdin: &mut impl Write,
     mcp_reader: &mut impl BufRead,
+    sessions: &Arc<Mutex<SessionRegistry>>,
 ) -> Result<bool, String> {
     let mut client_reader = BufReader::new(
         stream
@@ -613,6 +783,7 @@ fn handle_daemon_client(
             .map_err(|error| format!("failed to clone daemon client stream: {error}"))?,
     );
     let mut line = String::new();
+    let mut bound = BoundSessionGuard::new(sessions);
 
     loop {
         line.clear();
@@ -627,19 +798,13 @@ fn handle_daemon_client(
         if line.is_empty() {
             continue;
         }
-        if line == "__chrome_devtools_daemon__:status" {
-            stream
-                .write_all(b"daemon=ready\n")
-                .and_then(|_| stream.flush())
-                .map_err(|error| format!("failed to write daemon status response: {error}"))?;
-            return Ok(false);
-        }
-        if line == "__chrome_devtools_daemon__:stop" {
-            stream
-                .write_all(b"daemon=stopping\n")
-                .and_then(|_| stream.flush())
-                .map_err(|error| format!("failed to write daemon stop response: {error}"))?;
-            return Ok(true);
+
+        if let Some(command) = line.strip_prefix("__chrome_devtools_daemon__:") {
+            match handle_control_command(stream, sessions, &mut bound, command)? {
+                ControlOutcome::Continue => continue,
+                ControlOutcome::CloseConnection => return Ok(false),
+                ControlOutcome::StopDaemon => return Ok(true),
+            }
         }
 
         if json_has_method(line, "initialize") {
@@ -691,10 +856,164 @@ fn handle_daemon_client(
                 .map_err(|error| format!("failed to write daemon client response: {error}"))?;
 
             if extract_jsonrpc_id(&response_line) == Some(pending_id) {
+                if let Some(id) = bound.id.as_ref() {
+                    if let Ok(mut registry) = sessions.lock() {
+                        registry.touch(id);
+                    }
+                }
                 break;
             }
         }
     }
+}
+
+enum ControlOutcome {
+    Continue,
+    CloseConnection,
+    StopDaemon,
+}
+
+fn handle_control_command(
+    stream: &mut UnixStream,
+    sessions: &Arc<Mutex<SessionRegistry>>,
+    bound: &mut BoundSessionGuard,
+    command: &str,
+) -> Result<ControlOutcome, String> {
+    let (head, rest) = match command.split_once(' ') {
+        Some((head, rest)) => (head, rest.trim()),
+        None => (command, ""),
+    };
+    match head {
+        "status" => {
+            write_control_line(stream, "daemon=ready")?;
+            Ok(ControlOutcome::CloseConnection)
+        }
+        "stop" => {
+            write_control_line(stream, "daemon=stopping")?;
+            Ok(ControlOutcome::StopDaemon)
+        }
+        "session_create" => {
+            let state = sessions
+                .lock()
+                .map_err(|_| "session registry poisoned".to_string())?
+                .create();
+            write_control_line(stream, &format_session_line(&state))?;
+            Ok(ControlOutcome::CloseConnection)
+        }
+        "session_list" => {
+            let snapshot = sessions
+                .lock()
+                .map_err(|_| "session registry poisoned".to_string())?
+                .list();
+            for state in &snapshot {
+                write_control_line(stream, &format_session_line(state))?;
+            }
+            Ok(ControlOutcome::CloseConnection)
+        }
+        "session_close" => {
+            let id = parse_session_arg(rest)?;
+            let result = sessions
+                .lock()
+                .map_err(|_| "session registry poisoned".to_string())?
+                .close(&id);
+            match result {
+                Ok(()) => write_control_line(stream, &format!("closed={id}"))?,
+                Err(message) => write_control_line(stream, &format!("error={message}"))?,
+            }
+            Ok(ControlOutcome::CloseConnection)
+        }
+        "bind" => {
+            let id = parse_session_arg(rest)?;
+            let result = sessions
+                .lock()
+                .map_err(|_| "session registry poisoned".to_string())?
+                .bind(&id);
+            match result {
+                Ok(()) => {
+                    bound.id = Some(id.clone());
+                    write_control_line(stream, &format!("bound={id}"))?;
+                    Ok(ControlOutcome::Continue)
+                }
+                Err(message) => {
+                    write_control_line(stream, &format!("error={message}"))?;
+                    Ok(ControlOutcome::CloseConnection)
+                }
+            }
+        }
+        other => {
+            write_control_line(stream, &format!("error=unknown command: {other}"))?;
+            Ok(ControlOutcome::CloseConnection)
+        }
+    }
+}
+
+fn write_control_line(stream: &mut UnixStream, body: &str) -> Result<(), String> {
+    stream
+        .write_all(body.as_bytes())
+        .and_then(|_| stream.write_all(b"\n"))
+        .and_then(|_| stream.flush())
+        .map_err(|error| format!("failed to write daemon response: {error}"))
+}
+
+fn format_session_line(state: &SessionState) -> String {
+    format!(
+        "session={} created={} last_used={} owned={}",
+        state.id,
+        unix_secs(state.created_at),
+        unix_secs(state.last_used_at),
+        state.owned
+    )
+}
+
+fn parse_session_arg(args: &str) -> Result<String, String> {
+    for part in args.split_whitespace() {
+        if let Some(value) = part.strip_prefix("session=") {
+            if value.is_empty() {
+                return Err("session id must not be empty".to_string());
+            }
+            return Ok(value.to_string());
+        }
+    }
+    Err("missing session=<id> argument".to_string())
+}
+
+fn create_session(profile: &Profile) -> Result<(), String> {
+    ensure_daemon(profile)?;
+    let response = send_daemon_control(profile, "session_create")?;
+    let line = response
+        .lines()
+        .next()
+        .ok_or_else(|| "daemon returned empty response".to_string())?;
+    if let Some(message) = line.strip_prefix("error=") {
+        return Err(message.to_string());
+    }
+    println!("{line}");
+    Ok(())
+}
+
+fn list_sessions(profile: &Profile) -> Result<(), String> {
+    if !is_daemon_ready(profile)? {
+        return Ok(());
+    }
+    let response = send_daemon_control(profile, "session_list")?;
+    print!("{response}");
+    Ok(())
+}
+
+fn close_session(profile: &Profile, session_id: &str) -> Result<(), String> {
+    if !is_daemon_ready(profile)? {
+        return Err(format!("unknown session: {session_id}"));
+    }
+    let response = send_daemon_control(profile, &format!("session_close session={session_id}"))?;
+    let line = response
+        .lines()
+        .next()
+        .ok_or_else(|| "daemon returned empty response".to_string())?;
+    if let Some(message) = line.strip_prefix("error=") {
+        return Err(message.to_string());
+    }
+    println!("{line}");
+    Ok(())
 }
 
 fn call_daemon(profile: &Profile) -> Result<(), String> {
@@ -1191,6 +1510,45 @@ fn require_profile(config: &Config, args: &[String]) -> Result<Profile, String> 
         .ok_or_else(|| format!("unknown profile: {profile_name}"))
 }
 
+fn require_profile_and_session(
+    config: &Config,
+    args: &[String],
+) -> Result<(Profile, String), String> {
+    let mut profile_name = None;
+    let mut session_id = None;
+    let mut index = 0;
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "--profile" => {
+                let Some(value) = args.get(index + 1) else {
+                    return Err("--profile requires a value".to_string());
+                };
+                profile_name = Some(value.clone());
+                index += 2;
+            }
+            "--session" => {
+                let Some(value) = args.get(index + 1) else {
+                    return Err("--session requires a value".to_string());
+                };
+                session_id = Some(value.clone());
+                index += 2;
+            }
+            unknown => return Err(format!("unknown argument: {unknown}")),
+        }
+    }
+
+    let profile_name = profile_name.ok_or_else(|| "--profile is required".to_string())?;
+    let session_id = session_id.ok_or_else(|| "--session is required".to_string())?;
+    let profile = config
+        .profiles
+        .iter()
+        .find(|profile| profile.name == profile_name)
+        .cloned()
+        .ok_or_else(|| format!("unknown profile: {profile_name}"))?;
+    Ok((profile, session_id))
+}
+
 fn list_profiles(config: &Config) {
     for profile in &config.profiles {
         println!(
@@ -1457,7 +1815,7 @@ fn expand_home(path: &str) -> Result<PathBuf, String> {
 
 fn print_usage() {
     eprintln!(
-        "Usage:\n  chrome-devtools --version\n  chrome-devtools mcp list --profile <profile>\n  chrome-devtools mcp call --profile <profile>\n  chrome-devtools mcp direct-list --profile <profile>\n  chrome-devtools mcp direct-call --profile <profile>\n  chrome-devtools mcp help\n  chrome-devtools daemon start --profile <profile>\n  chrome-devtools daemon status --profile <profile>\n  chrome-devtools daemon stop --profile <profile>\n  chrome-devtools profile status --profile <profile>\n  chrome-devtools profile stop --profile <profile>\n  chrome-devtools profile list\n\nConfig:\n  ~/.config/chrome-devtools/config.toml is created on startup if missing.\n\nConcurrency:\n  MCP commands take a per-profile lock under ~/.cache/chrome-devtools/locks.\n  Set CHROME_DEVTOOLS_LOCK_TIMEOUT_SECS to override the default 300 second wait."
+        "Usage:\n  chrome-devtools --version\n  chrome-devtools mcp list --profile <profile>\n  chrome-devtools mcp call --profile <profile> --session <id>\n  chrome-devtools mcp batch --profile <profile> --session <id> --script <path>\n  chrome-devtools mcp direct-list --profile <profile>\n  chrome-devtools mcp direct-call --profile <profile>\n  chrome-devtools mcp help\n  chrome-devtools session create --profile <profile>\n  chrome-devtools session list --profile <profile>\n  chrome-devtools session close --profile <profile> --session <id>\n  chrome-devtools daemon start --profile <profile>\n  chrome-devtools daemon status --profile <profile>\n  chrome-devtools daemon stop --profile <profile>\n  chrome-devtools profile status --profile <profile>\n  chrome-devtools profile stop --profile <profile>\n  chrome-devtools profile list\n\nConfig:\n  ~/.config/chrome-devtools/config.toml is created on startup if missing.\n\nConcurrency:\n  MCP commands take a per-profile lock under ~/.cache/chrome-devtools/locks.\n  Set CHROME_DEVTOOLS_LOCK_TIMEOUT_SECS to override the default 300 second wait."
     );
 }
 
@@ -1552,5 +1910,29 @@ fn print_daemon_status_help() {
 fn print_daemon_stop_help() {
     println!(
         "chrome-devtools daemon stop\n\nUsage:\n  chrome-devtools daemon stop --profile <profile>\n\nDescription:\n  Ask the per-profile daemon to stop and clean up its socket and pid files.\n  If the daemon is unreachable but a pid file exists, fall back to sending it\n  a TERM signal via kill.\n\nOptions:\n  --profile <name>  Required. Profile name from ~/.config/chrome-devtools/config.toml.\n  -h, --help        Show this help and exit."
+    );
+}
+
+fn print_session_help() {
+    println!(
+        "chrome-devtools session\n\nUsage:\n  chrome-devtools session create --profile <profile>\n  chrome-devtools session list --profile <profile>\n  chrome-devtools session close --profile <profile> --session <id>\n\nCommands:\n  create  Mint a new session id on the profile daemon.\n  list    List active sessions held by the profile daemon.\n  close   Close (drop) the named session.\n\nOptions:\n  -h, --help  Show this help and exit.\n\nNotes:\n  Sessions live in-memory on the profile daemon. They are dropped after\n  30 minutes of inactivity or when the daemon stops.\n  mcp call and mcp batch require --session <id>; use session create to mint it."
+    );
+}
+
+fn print_session_create_help() {
+    println!(
+        "chrome-devtools session create\n\nUsage:\n  chrome-devtools session create --profile <profile>\n\nDescription:\n  Start the profile daemon if needed, then ask it to mint a new in-memory\n  session id. The session is dropped after 30 minutes of inactivity or when\n  the daemon stops. Prints one line to stdout:\n\n    session=<id> created=<unix-ts> last_used=<unix-ts> owned=false\n\nOptions:\n  --profile <name>  Required. Profile name from ~/.config/chrome-devtools/config.toml.\n  -h, --help        Show this help and exit."
+    );
+}
+
+fn print_session_list_help() {
+    println!(
+        "chrome-devtools session list\n\nUsage:\n  chrome-devtools session list --profile <profile>\n\nDescription:\n  List active sessions held by the profile daemon. Each session is printed\n  on one line as:\n\n    session=<id> created=<unix-ts> last_used=<unix-ts> owned=<true|false>\n\n  Prints nothing when the daemon is not running.\n\nOptions:\n  --profile <name>  Required. Profile name from ~/.config/chrome-devtools/config.toml.\n  -h, --help        Show this help and exit."
+    );
+}
+
+fn print_session_close_help() {
+    println!(
+        "chrome-devtools session close\n\nUsage:\n  chrome-devtools session close --profile <profile> --session <id>\n\nDescription:\n  Ask the profile daemon to drop the named session. Fails if the session is\n  unknown or the daemon is not running.\n\nOptions:\n  --profile <name>  Required. Profile name from ~/.config/chrome-devtools/config.toml.\n  --session <id>    Required. Session id minted by `session create`.\n  -h, --help        Show this help and exit."
     );
 }
