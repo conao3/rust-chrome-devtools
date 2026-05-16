@@ -220,8 +220,8 @@ fn run() -> Result<(), String> {
                 print_mcp_call_help();
                 return Ok(());
             }
-            let profile = require_profile(&config, &rest)?;
-            call_daemon(&profile)
+            let (profile, session_id) = require_profile_and_session(&config, &rest)?;
+            call_daemon(&profile, &session_id)
         }
         ("mcp", "batch") => {
             if wants_help(&rest) {
@@ -1016,7 +1016,7 @@ fn close_session(profile: &Profile, session_id: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn call_daemon(profile: &Profile) -> Result<(), String> {
+fn call_daemon(profile: &Profile, session_id: &str) -> Result<(), String> {
     ensure_daemon(profile)?;
     let socket_path = daemon_socket_path(profile)?;
     let mut stream = UnixStream::connect(&socket_path)
@@ -1024,6 +1024,9 @@ fn call_daemon(profile: &Profile) -> Result<(), String> {
     let mut read_stream = stream
         .try_clone()
         .map_err(|error| format!("failed to clone daemon stream: {error}"))?;
+    let mut daemon_reader = BufReader::new(&mut read_stream);
+
+    bind_session(&mut stream, &mut daemon_reader, session_id)?;
 
     let stdin_to_daemon = thread::spawn(move || -> Result<(), String> {
         let mut stdin = std::io::stdin().lock();
@@ -1035,7 +1038,6 @@ fn call_daemon(profile: &Profile) -> Result<(), String> {
         Ok(())
     });
 
-    let mut daemon_reader = BufReader::new(&mut read_stream);
     let mut stdout = std::io::stdout().lock();
     let mut line = String::new();
     loop {
@@ -1058,8 +1060,36 @@ fn call_daemon(profile: &Profile) -> Result<(), String> {
     Ok(())
 }
 
+fn bind_session(
+    stream: &mut UnixStream,
+    reader: &mut impl BufRead,
+    session_id: &str,
+) -> Result<(), String> {
+    let request = format!("__chrome_devtools_daemon__:bind session={session_id}\n");
+    stream
+        .write_all(request.as_bytes())
+        .and_then(|_| stream.flush())
+        .map_err(|error| format!("failed to send bind request: {error}"))?;
+    let mut response = String::new();
+    let bytes = reader
+        .read_line(&mut response)
+        .map_err(|error| format!("failed to read bind response: {error}"))?;
+    if bytes == 0 {
+        return Err("daemon closed connection before bind response".to_string());
+    }
+    let response = response.trim_end();
+    if let Some(message) = response.strip_prefix("error=") {
+        return Err(message.to_string());
+    }
+    if !response.starts_with("bound=") {
+        return Err(format!("unexpected bind response: {response}"));
+    }
+    Ok(())
+}
+
 struct BatchOptions {
     profile_name: String,
+    session_id: String,
     script_path: String,
     output_path: Option<String>,
     fail_fast: bool,
@@ -1084,6 +1114,8 @@ fn run_batch(config: &Config, args: &[String]) -> Result<(), String> {
         .try_clone()
         .map_err(|error| format!("failed to clone daemon stream: {error}"))?;
     let mut reader = BufReader::new(&mut read_stream);
+
+    bind_session(&mut stream, &mut reader, &options.session_id)?;
 
     write_json_line(
         &mut stream,
@@ -1215,6 +1247,7 @@ fn read_script_source(path: &str) -> Result<String, String> {
 
 fn parse_batch_args(args: &[String]) -> Result<BatchOptions, String> {
     let mut profile_name = None;
+    let mut session_id = None;
     let mut script_path = None;
     let mut output_path = None;
     let mut fail_fast = false;
@@ -1226,6 +1259,13 @@ fn parse_batch_args(args: &[String]) -> Result<BatchOptions, String> {
                     return Err("--profile requires a value".to_string());
                 };
                 profile_name = Some(value.clone());
+                index += 2;
+            }
+            "--session" => {
+                let Some(value) = args.get(index + 1) else {
+                    return Err("--session requires a value".to_string());
+                };
+                session_id = Some(value.clone());
                 index += 2;
             }
             "--script" => {
@@ -1250,9 +1290,11 @@ fn parse_batch_args(args: &[String]) -> Result<BatchOptions, String> {
         }
     }
     let profile_name = profile_name.ok_or_else(|| "--profile is required".to_string())?;
+    let session_id = session_id.ok_or_else(|| "--session is required".to_string())?;
     let script_path = script_path.ok_or_else(|| "--script is required".to_string())?;
     Ok(BatchOptions {
         profile_name,
+        session_id,
         script_path,
         output_path,
         fail_fast,
@@ -1825,7 +1867,7 @@ fn print_version() {
 
 fn print_mcp_help() {
     println!(
-        "chrome-devtools mcp\n\nUsage:\n  chrome-devtools mcp list --profile <profile>\n  chrome-devtools mcp call --profile <profile>\n  chrome-devtools mcp batch --profile <profile> --script <path>\n  chrome-devtools mcp direct-list --profile <profile>\n  chrome-devtools mcp direct-call --profile <profile>\n  chrome-devtools mcp help\n\nCommands:\n  list         Start the selected profile daemon if needed, query tools/list through it, and print the raw MCP JSON response.\n\n  call         Start the selected profile daemon if needed, then forward stdin MCP JSON-RPC lines through its long-lived MCP process.\n\n  batch        Run a JSON batch file of tool/sleep steps through the profile daemon and print a JSON array of results.\n\n  direct-list  Bypass the daemon, run chrome-devtools-mcp directly, query tools/list, and print the raw MCP JSON response.\n\n  direct-call  Bypass the daemon, run chrome-devtools-mcp directly over stdio. Use only for fallback/manual debugging.\n\n  help         Show this help.\n\nOptions:\n  -h, --help   Show this help and exit.\n\nExamples:\n  chrome-devtools daemon start --profile default\n  chrome-devtools mcp list --profile default\n  chrome-devtools mcp call --profile default\n  chrome-devtools mcp batch --profile default --script /tmp/batch.json\n  printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{{}},\"clientInfo\":{{\"name\":\"probe\",\"version\":\"0.0.0\"}}}}}}' | chrome-devtools mcp call --profile default\n\nConfig:\n  Profiles are read from ~/.config/chrome-devtools/config.toml.\n  If the config file is missing, chrome-devtools creates a default profile using ~/.config/chrome-devtools/profiles/default.\n  user_data_dir is optional; when omitted, it defaults to ~/.config/chrome-devtools/profiles/<profile-name>.\n  Prefer user_data_dir values under ~/.config/chrome-devtools/profiles/<profile-name>.\n\nDaemon:\n  mcp call, mcp list and mcp batch route through one long-lived per-profile daemon by default.\n  Daemon sockets and pid files live under ~/.cache/chrome-devtools/daemons.\n  direct-call and direct-list bypass the daemon and take a per-profile lock under ~/.cache/chrome-devtools/locks.\n  Set CHROME_DEVTOOLS_LOCK_TIMEOUT_SECS to override the direct-mode/default daemon lock wait.\n\nNotes:\n  Profiles define the Chrome user data directory and DevTools port.\n  The call/batch commands do not reimplement MCP tools; they delegate to a daemon-owned chrome-devtools-mcp process.\n  Snapshot uid values are only valid inside the MCP process that produced them.\n  Daemon-routed calls preserve that MCP process across invocations until the daemon stops."
+        "chrome-devtools mcp\n\nUsage:\n  chrome-devtools mcp list --profile <profile>\n  chrome-devtools mcp call --profile <profile> --session <id>\n  chrome-devtools mcp batch --profile <profile> --session <id> --script <path>\n  chrome-devtools mcp direct-list --profile <profile>\n  chrome-devtools mcp direct-call --profile <profile>\n  chrome-devtools mcp help\n\nCommands:\n  list         Start the selected profile daemon if needed, query tools/list through it, and print the raw MCP JSON response.\n\n  call         Start the selected profile daemon if needed, bind the named session, and forward stdin MCP JSON-RPC lines through its long-lived MCP process.\n\n  batch        Bind the named session and run a JSON batch file of tool/sleep steps through the profile daemon. Prints a JSON array of results.\n\n  direct-list  Bypass the daemon, run chrome-devtools-mcp directly, query tools/list, and print the raw MCP JSON response.\n\n  direct-call  Bypass the daemon, run chrome-devtools-mcp directly over stdio. Use only for fallback/manual debugging.\n\n  help         Show this help.\n\nOptions:\n  -h, --help   Show this help and exit.\n\nExamples:\n  chrome-devtools daemon start --profile default\n  chrome-devtools mcp list --profile default\n  ID=$(chrome-devtools session create --profile default | awk -F= '{{print $2}}' | awk '{{print $1}}')\n  chrome-devtools mcp call --profile default --session \"$ID\"\n  chrome-devtools mcp batch --profile default --session \"$ID\" --script /tmp/batch.json\n\nConfig:\n  Profiles are read from ~/.config/chrome-devtools/config.toml.\n  If the config file is missing, chrome-devtools creates a default profile using ~/.config/chrome-devtools/profiles/default.\n  user_data_dir is optional; when omitted, it defaults to ~/.config/chrome-devtools/profiles/<profile-name>.\n  Prefer user_data_dir values under ~/.config/chrome-devtools/profiles/<profile-name>.\n\nSessions:\n  mcp call and mcp batch require --session <id>. Mint one with `session create`.\n  Sessions live in-memory on the daemon and expire after 30 minutes of inactivity.\n\nDaemon:\n  mcp call, mcp list and mcp batch route through one long-lived per-profile daemon by default.\n  Daemon sockets and pid files live under ~/.cache/chrome-devtools/daemons.\n  direct-call and direct-list bypass the daemon and take a per-profile lock under ~/.cache/chrome-devtools/locks.\n  Set CHROME_DEVTOOLS_LOCK_TIMEOUT_SECS to override the direct-mode/default daemon lock wait.\n\nNotes:\n  Profiles define the Chrome user data directory and DevTools port.\n  The call/batch commands do not reimplement MCP tools; they delegate to a daemon-owned chrome-devtools-mcp process.\n  Snapshot uid values are only valid inside the MCP process that produced them.\n  Daemon-routed calls preserve that MCP process across invocations until the daemon stops."
     );
 }
 
@@ -1843,13 +1885,13 @@ fn print_daemon_help() {
 
 fn print_mcp_call_help() {
     println!(
-        "chrome-devtools mcp call\n\nUsage:\n  chrome-devtools mcp call --profile <profile>\n\nDescription:\n  Start the selected profile daemon if needed, then forward stdin MCP JSON-RPC\n  lines through its long-lived chrome-devtools-mcp process and print responses.\n\nOptions:\n  --profile <name>  Required. Profile name from ~/.config/chrome-devtools/config.toml.\n  -h, --help        Show this help and exit.\n\nExamples:\n  printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{{}}}}' \\\n    | chrome-devtools mcp call --profile default"
+        "chrome-devtools mcp call\n\nUsage:\n  chrome-devtools mcp call --profile <profile> --session <id>\n\nDescription:\n  Start the selected profile daemon if needed, bind the named session, then\n  forward stdin MCP JSON-RPC lines through its long-lived chrome-devtools-mcp\n  process and print responses. The session is held for the lifetime of this\n  invocation; activity refreshes its 30 minute idle timer.\n\nOptions:\n  --profile <name>  Required. Profile name from ~/.config/chrome-devtools/config.toml.\n  --session <id>    Required. Session id minted by `session create`.\n  -h, --help        Show this help and exit.\n\nExamples:\n  ID=$(chrome-devtools session create --profile default | awk -F= '{{print $2}}' | awk '{{print $1}}')\n  printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{{}}}}' \\\n    | chrome-devtools mcp call --profile default --session \"$ID\""
     );
 }
 
 fn print_mcp_batch_help() {
     println!(
-        "chrome-devtools mcp batch\n\nUsage:\n  chrome-devtools mcp batch --profile <profile> --script <path> [--output <path>] [--fail-fast]\n\nDescription:\n  Read a JSON array of steps from --script, execute each step in order through\n  the profile daemon (one initialize handshake, then a tools/call per tool\n  step), and print a JSON array of results to stdout.\n\nStep shapes:\n  {{\"type\":\"tool\",\"name\":\"<mcp-tool>\",\"args\":{{...}},\"label\":\"<optional>\",\"on_error\":\"continue|stop\"}}\n  {{\"type\":\"sleep_ms\",\"ms\":<u64>,\"label\":\"<optional>\"}}\n\nValue references inside args:\n  Replace any value in args with {{\"$ref\":\"<label>.<path>\"}} to substitute it\n  with a previous result. <path> is dot-separated; numeric segments index\n  arrays. Example: {{\"$ref\":\"snap.result.content.0.text\"}} resolves to the\n  text of the first content entry returned by the step labelled 'snap'.\n\nResult shape (per step):\n  {{\"type\":\"tool\",\"name\":\"...\",\"label\":\"...\",\"result\":<mcp tools/call result>,\"error\":<mcp error or null>}}\n  {{\"type\":\"sleep_ms\",\"ms\":<u64>,\"label\":\"...\"}}\n\nError handling:\n  A tool step is considered to have errored if the MCP response carries a\n  non-null 'error' field or the result has isError=true. By default the\n  batch continues; pass --fail-fast or set on_error=stop on a step to\n  stop execution after that error. When stopped, batch writes the partial\n  results to stdout/--output and exits non-zero.\n\nOptions:\n  --profile <name>  Required. Profile name from ~/.config/chrome-devtools/config.toml.\n  --script <path>   Required. Path to a JSON file with the step array, or `-` for stdin.\n  --output <path>   Optional. Write the JSON results to <path> instead of stdout.\n  --fail-fast       Optional. Stop on the first errored tool step.\n  -h, --help        Show this help and exit.\n\nExamples:\n  cat > /tmp/batch.json <<'EOF'\n  [\n    {{\"type\":\"tool\",\"name\":\"navigate_page\",\"args\":{{\"type\":\"reload\",\"timeout\":15000}}}},\n    {{\"type\":\"sleep_ms\",\"ms\":5000}},\n    {{\"type\":\"tool\",\"name\":\"evaluate_script\",\"label\":\"title\",\"args\":{{\"function\":\"() => document.title\"}}}}\n  ]\n  EOF\n  chrome-devtools mcp batch --profile default --script /tmp/batch.json\n\n  printf '%s' '[{{\"type\":\"tool\",\"name\":\"list_pages\"}}]' \\\n    | chrome-devtools mcp batch --profile default --script -"
+        "chrome-devtools mcp batch\n\nUsage:\n  chrome-devtools mcp batch --profile <profile> --session <id> --script <path> [--output <path>] [--fail-fast]\n\nDescription:\n  Read a JSON array of steps from --script, bind the named session, and\n  execute each step in order through the profile daemon (one initialize\n  handshake, then a tools/call per tool step). Prints a JSON array of\n  results to stdout. Activity refreshes the session's 30 minute idle timer.\n\nStep shapes:\n  {{\"type\":\"tool\",\"name\":\"<mcp-tool>\",\"args\":{{...}},\"label\":\"<optional>\",\"on_error\":\"continue|stop\"}}\n  {{\"type\":\"sleep_ms\",\"ms\":<u64>,\"label\":\"<optional>\"}}\n\nValue references inside args:\n  Replace any value in args with {{\"$ref\":\"<label>.<path>\"}} to substitute it\n  with a previous result. <path> is dot-separated; numeric segments index\n  arrays. Example: {{\"$ref\":\"snap.result.content.0.text\"}} resolves to the\n  text of the first content entry returned by the step labelled 'snap'.\n\nResult shape (per step):\n  {{\"type\":\"tool\",\"name\":\"...\",\"label\":\"...\",\"result\":<mcp tools/call result>,\"error\":<mcp error or null>}}\n  {{\"type\":\"sleep_ms\",\"ms\":<u64>,\"label\":\"...\"}}\n\nError handling:\n  A tool step is considered to have errored if the MCP response carries a\n  non-null 'error' field or the result has isError=true. By default the\n  batch continues; pass --fail-fast or set on_error=stop on a step to\n  stop execution after that error. When stopped, batch writes the partial\n  results to stdout/--output and exits non-zero.\n\nOptions:\n  --profile <name>  Required. Profile name from ~/.config/chrome-devtools/config.toml.\n  --session <id>    Required. Session id minted by `session create`.\n  --script <path>   Required. Path to a JSON file with the step array, or `-` for stdin.\n  --output <path>   Optional. Write the JSON results to <path> instead of stdout.\n  --fail-fast       Optional. Stop on the first errored tool step.\n  -h, --help        Show this help and exit.\n\nExamples:\n  cat > /tmp/batch.json <<'EOF'\n  [\n    {{\"type\":\"tool\",\"name\":\"navigate_page\",\"args\":{{\"type\":\"reload\",\"timeout\":15000}}}},\n    {{\"type\":\"sleep_ms\",\"ms\":5000}},\n    {{\"type\":\"tool\",\"name\":\"evaluate_script\",\"label\":\"title\",\"args\":{{\"function\":\"() => document.title\"}}}}\n  ]\n  EOF\n  ID=$(chrome-devtools session create --profile default | awk -F= '{{print $2}}' | awk '{{print $1}}')\n  chrome-devtools mcp batch --profile default --session \"$ID\" --script /tmp/batch.json"
     );
 }
 
