@@ -58,7 +58,7 @@ port = 9222
 ```sh
 chrome-devtools mcp list --profile default
 chrome-devtools mcp call --profile default
-chrome-devtools mcp exec --profile default --script scenario.json
+chrome-devtools mcp batch --profile default --script batch.json
 chrome-devtools mcp help
 chrome-devtools daemon start --profile default
 chrome-devtools daemon status --profile default
@@ -72,7 +72,7 @@ chrome-devtools profile stop --profile default
 
 `mcp call` starts the profile daemon when needed, forwards stdin JSON-RPC lines to the daemon-owned `chrome-devtools-mcp` process, waits for the matching JSON-RPC responses, and prints them to stdout. Each CLI invocation is serialized by the daemon, but the MCP process stays alive across invocations.
 
-`mcp exec` reads a JSON array of steps from `--script` and runs each step in order through the profile daemon. One `initialize` handshake is performed; then each `tool` step is issued as a `tools/call` and each `sleep_ms` step pauses the runner. Results are printed as a JSON array to stdout (or to `--output <path>`), so callers can inspect them programmatically without parsing line-delimited JSON-RPC. Step shapes:
+`mcp batch` reads a JSON array of steps from `--script` and runs each step in order through the profile daemon. One `initialize` handshake is performed; then each `tool` step is issued as a `tools/call` and each `sleep_ms` step pauses the runner. Results are printed as a JSON array to stdout (or to `--output <path>`), so callers can inspect them programmatically without parsing line-delimited JSON-RPC. Step shapes:
 
 ```json
 [
@@ -84,9 +84,9 @@ chrome-devtools profile stop --profile default
 
 Inside `args`, replace any value with `{"$ref":"<label>.<path>"}` to substitute it with a previous step's result. `<path>` is dot-separated; numeric segments index arrays. For example, `{"$ref":"snap.result.content.0.text"}` resolves to the text of the first content entry of the result whose `label` was `snap`.
 
-By default a tool step that returns an error (non-null `error` field or `isError: true`) is recorded and the scenario continues. Pass `--fail-fast` (or `"on_error": "stop"` on a step) to abort on the first error; partial results are still written and `chrome-devtools` exits non-zero.
+By default a tool step that returns an error (non-null `error` field or `isError: true`) is recorded and the batch continues. Pass `--fail-fast` (or `"on_error": "stop"` on a step) to abort on the first error; partial results are still written and `chrome-devtools` exits non-zero.
 
-Use `--script -` to read the scenario from stdin instead of a file, and `--output <path>` to write the JSON results to a file instead of stdout.
+Use `--script -` to read the batch from stdin instead of a file, and `--output <path>` to write the JSON results to a file instead of stdout.
 
 Important: `take_snapshot` result `uid` values are local to the running MCP process. The daemon keeps that MCP process alive for the selected profile, so a later `click`/`fill` can use snapshot state from an earlier daemon-routed invocation as long as the daemon has not restarted.
 

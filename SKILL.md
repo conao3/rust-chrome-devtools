@@ -10,9 +10,9 @@ Use `chrome-devtools` when you need browser automation through Chrome DevTools M
 ## Core Rules
 
 - Always choose an explicit profile with `--profile <name>`. Do not rely on an implicit browser instance.
-- **For multi-step automation, prefer `chrome-devtools mcp exec --profile <name> --script <path>`.** It executes a JSON scenario through the daemon and returns a JSON array of results, which is far easier to parse than line-delimited JSON-RPC.
+- **For multi-step automation, prefer `chrome-devtools mcp batch --profile <name> --script <path>`.** It executes a JSON scenario through the daemon and returns a JSON array of results, which is far easier to parse than line-delimited JSON-RPC.
 - For ad-hoc/interactive flows (especially `take_snapshot` → inspect uids → follow-up tool call in the same shell session), use `chrome-devtools mcp call --profile <name>` with stdin JSON-RPC.
-- Both `mcp exec` and `mcp call` route through one long-lived per-profile daemon, so `take_snapshot` uids returned in step N can be reused in step N+1 within the same scenario or the same `mcp call` invocation.
+- Both `mcp batch` and `mcp call` route through one long-lived per-profile daemon, so `take_snapshot` uids returned in step N can be reused in step N+1 within the same scenario or the same `mcp call` invocation.
 - `take_snapshot` result `uid` values are MCP-session-local. They stay valid only while the same daemon-owned MCP process is alive.
 - Do not use `mcp direct-call` for a split `take_snapshot` then `click`/`fill` workflow; direct mode starts a separate MCP process and the snapshot cache is lost.
 - Take a fresh snapshot before using `click`, `fill`, or other uid-based actions if the page may have changed.
@@ -46,9 +46,9 @@ chrome-devtools profile list
 chrome-devtools profile status --profile conao3
 ```
 
-## Scenario Execution (Preferred for Multi-Step Workflows)
+## Batch Execution (Preferred for Multi-Step Workflows)
 
-`mcp exec` reads a JSON array of steps from `--script`, executes them in order through one daemon session, and prints a JSON array of per-step results. Use it whenever the steps are known up front.
+`mcp batch` reads a JSON array of steps from `--script`, executes them in order through one daemon session, and prints a JSON array of per-step results. Use it whenever the steps are known up front.
 
 ### Step shapes
 
@@ -86,7 +86,7 @@ cat > /tmp/scenario.json <<'JSON'
 ]
 JSON
 
-chrome-devtools mcp exec --profile conao3 --script /tmp/scenario.json
+chrome-devtools mcp batch --profile conao3 --script /tmp/scenario.json
 ```
 
 ### Example: snapshot → click reusing the uid
@@ -107,7 +107,7 @@ When the target uid is not known in advance, split the work: run the `take_snaps
 ### Reading results with jq
 
 ```sh
-chrome-devtools mcp exec --profile conao3 --script /tmp/scenario.json \
+chrome-devtools mcp batch --profile conao3 --script /tmp/scenario.json \
   | jq '.[] | select(.label == "title") | .result.content[0].text'
 ```
 
@@ -148,7 +148,7 @@ Show MCP help:
 
 ```sh
 chrome-devtools mcp help
-chrome-devtools mcp exec --help
+chrome-devtools mcp batch --help
 ```
 
 Stop the profile daemon:
@@ -171,9 +171,9 @@ chrome-devtools profile stop --profile conao3
 
 ## Troubleshooting
 
-- If `fill` or `click` fails with a missing snapshot, check whether the daemon restarted between the snapshot and the action. Re-snapshot inside the same `mcp exec` scenario, or inside one `mcp call` invocation.
+- If `fill` or `click` fails with a missing snapshot, check whether the daemon restarted between the snapshot and the action. Re-snapshot inside the same `mcp batch` scenario, or inside one `mcp call` invocation.
 - If the page is not the expected page, run an `evaluate_script` step that returns `window.location.href` and verify before acting.
-- If the profile's Chrome is not running, `mcp call` / `mcp exec` / `mcp list` will start it on first use.
+- If the profile's Chrome is not running, `mcp call` / `mcp batch` / `mcp list` will start it on first use.
 - If login state is missing, verify the profile name and `user_data_dir`; login cookies are profile-specific.
 - If a DevTools port conflicts, assign a different `port` in `config.toml`.
-- If `mcp exec` reports `unknown step type`, check the `type` field; only `tool` and `sleep_ms` are supported.
+- If `mcp batch` reports `unknown step type`, check the `type` field; only `tool` and `sleep_ms` are supported.
