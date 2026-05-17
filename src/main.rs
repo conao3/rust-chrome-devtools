@@ -70,7 +70,7 @@ impl SessionRegistry {
 
     fn list(&self) -> Vec<SessionState> {
         let mut sessions = self.sessions.values().cloned().collect::<Vec<_>>();
-        sessions.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+        sessions.sort_by_key(|session| session.created_at);
         sessions
     }
 
