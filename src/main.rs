@@ -1608,12 +1608,29 @@ fn print_status(profile: &Profile) {
     );
 }
 
+fn default_chrome_binary() -> String {
+    #[cfg(target_os = "macos")]
+    {
+        for candidate in [
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            "/Applications/Google Chrome Beta.app/Contents/MacOS/Google Chrome Beta",
+            "/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary",
+            "/Applications/Chromium.app/Contents/MacOS/Chromium",
+        ] {
+            if std::path::Path::new(candidate).exists() {
+                return candidate.to_string();
+            }
+        }
+    }
+    "google-chrome-stable".to_string()
+}
+
 fn ensure_chrome(profile: &Profile) -> Result<(), String> {
     if is_devtools_ready(profile.port) {
         return Ok(());
     }
 
-    let chrome = env::var("CHROME").unwrap_or_else(|_| "google-chrome-stable".to_string());
+    let chrome = env::var("CHROME").unwrap_or_else(|_| default_chrome_binary());
     let user_data_dir = expand_home(&profile.user_data_dir)?;
 
     Command::new(chrome)
