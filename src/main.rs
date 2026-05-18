@@ -3,7 +3,7 @@ use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::Shutdown;
-use std::net::{SocketAddr, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -598,6 +598,38 @@ fn daemon_pid_path(profile: &Profile) -> Result<PathBuf, String> {
 
 fn daemon_log_path(profile: &Profile) -> Result<PathBuf, String> {
     Ok(daemon_dir()?.join(format!("{}.log", safe_lock_name(&profile.name))))
+}
+
+fn daemon_port_path(profile: &Profile) -> Result<PathBuf, String> {
+    Ok(daemon_dir()?.join(format!("{}.port", safe_lock_name(&profile.name))))
+}
+
+fn read_runtime_port(profile: &Profile) -> Option<u16> {
+    let path = daemon_port_path(profile).ok()?;
+    let raw = fs::read_to_string(path).ok()?;
+    raw.trim().parse().ok()
+}
+
+fn write_runtime_port(profile: &Profile, port: u16) -> Result<(), String> {
+    let path = daemon_port_path(profile)?;
+    fs::write(&path, port.to_string())
+        .map_err(|error| format!("failed to write {}: {error}", path.display()))
+}
+
+fn current_port(profile: &Profile) -> u16 {
+    read_runtime_port(profile).unwrap_or(profile.port)
+}
+
+fn pick_free_port(hint: u16) -> u16 {
+    if hint != 0 && TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], hint))).is_ok() {
+        return hint;
+    }
+    if let Ok(listener) = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))) {
+        if let Ok(addr) = listener.local_addr() {
+            return addr.port();
+        }
+    }
+    hint
 }
 
 fn start_daemon(profile: &Profile, quiet: bool) -> Result<(), String> {
@@ -1505,8 +1537,10 @@ fn cleanup_stale_daemon_files(profile: &Profile) -> Result<(), String> {
         }
     }
     let socket_path = daemon_socket_path(profile)?;
+    let port_path = daemon_port_path(profile)?;
     let _ = fs::remove_file(socket_path);
     let _ = fs::remove_file(pid_path);
+    let _ = fs::remove_file(port_path);
     Ok(())
 }
 
@@ -1596,15 +1630,12 @@ fn list_profiles(config: &Config) {
 }
 
 fn print_status(profile: &Profile) {
-    let state = if is_devtools_ready(profile.port) {
-        "ready"
-    } else {
-        "stopped"
-    };
+    let port = current_port(profile);
+    let state = if is_devtools_ready(port) { "ready" } else { "stopped" };
 
     println!(
         "profile={} status={} port={} user_data_dir={}",
-        profile.name, state, profile.port, profile.user_data_dir
+        profile.name, state, port, profile.user_data_dir
     );
 }
 
@@ -1626,16 +1657,22 @@ fn default_chrome_binary() -> String {
 }
 
 fn ensure_chrome(profile: &Profile) -> Result<(), String> {
+    if let Some(port) = read_runtime_port(profile) {
+        if is_devtools_ready(port) {
+            return Ok(());
+        }
+    }
     if is_devtools_ready(profile.port) {
-        return Ok(());
+        return write_runtime_port(profile, profile.port);
     }
 
+    let port = pick_free_port(profile.port);
     let chrome = env::var("CHROME").unwrap_or_else(|_| default_chrome_binary());
     let user_data_dir = expand_home(&profile.user_data_dir)?;
 
     Command::new(chrome)
         .arg("--remote-debugging-address=127.0.0.1")
-        .arg(format!("--remote-debugging-port={}", profile.port))
+        .arg(format!("--remote-debugging-port={port}"))
         .arg(format!("--user-data-dir={}", user_data_dir.display()))
         .arg("--no-first-run")
         .arg("--no-default-browser-check")
@@ -1646,7 +1683,8 @@ fn ensure_chrome(profile: &Profile) -> Result<(), String> {
         .spawn()
         .map_err(|error| format!("failed to start Chrome: {error}"))?;
 
-    wait_for_devtools(profile.port, Duration::from_secs(15))
+    wait_for_devtools(port, Duration::from_secs(15))?;
+    write_runtime_port(profile, port)
 }
 
 fn exec_mcp(profile: &Profile) -> Result<(), String> {
@@ -1714,7 +1752,7 @@ fn mcp_command(profile: &Profile) -> Command {
     };
     command
         .arg("--browser-url")
-        .arg(format!("http://127.0.0.1:{}", profile.port))
+        .arg(format!("http://127.0.0.1:{}", current_port(profile)))
         .arg("--no-usage-statistics")
         .arg("--no-performance-crux");
     command
