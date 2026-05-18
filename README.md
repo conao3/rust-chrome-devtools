@@ -33,7 +33,7 @@ npx skills add ./rust-chrome-devtools
 ## Design
 
 - Profiles are explicit: every operation that targets a browser profile requires `--profile <name>`.
-- Profiles own their Chrome user data directory and DevTools port.
+- Profiles own their Chrome user data directory. The daemon picks a free DevTools port at start time and records it under `~/.cache/chrome-devtools/daemons/<profile>.port`.
 - Profiles are read from `~/.config/chrome-devtools/config.toml`.
 - If the config file is missing on startup, the CLI creates a `default` profile using `~/.config/chrome-devtools/profiles/default`.
 - `user_data_dir` is optional; when omitted, it defaults to `~/.config/chrome-devtools/profiles/<profile-name>`.
@@ -51,7 +51,6 @@ npx skills add ./rust-chrome-devtools
 ```toml
 [[profiles]]
 name = "default"
-port = 9222
 ```
 
 ## Commands

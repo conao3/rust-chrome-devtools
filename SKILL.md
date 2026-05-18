@@ -29,11 +29,9 @@ Profiles are configured in `~/.config/chrome-devtools/config.toml`.
 ```toml
 [[profiles]]
 name = "default"
-port = 9222
 
 [[profiles]]
 name = "conao3"
-port = 9223
 ```
 
 `user_data_dir` is optional. When omitted, the CLI uses:
@@ -201,5 +199,4 @@ chrome-devtools profile stop --profile conao3
 - If the page is not the expected page, run an `evaluate_script` step that returns `window.location.href` and verify before acting.
 - If the profile's Chrome is not running, `mcp call` / `mcp batch` / `mcp list` will start it on first use.
 - If login state is missing, verify the profile name and `user_data_dir`; login cookies are profile-specific.
-- If a DevTools port conflicts, assign a different `port` in `config.toml`.
 - If `mcp batch` reports `unknown step type`, check the `type` field; only `tool` and `sleep_ms` are supported.

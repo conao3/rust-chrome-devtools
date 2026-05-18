@@ -20,21 +20,18 @@ struct Config {
 #[derive(Clone, Debug)]
 struct Profile {
     name: String,
-    port: u16,
     user_data_dir: String,
 }
 
 #[derive(Default)]
 struct ProfileBuilder {
     name: Option<String>,
-    port: Option<u16>,
     user_data_dir: Option<String>,
 }
 
 const CONFIG_RELATIVE_PATH: &str = ".config/chrome-devtools/config.toml";
 const CACHE_RELATIVE_PATH: &str = ".cache/chrome-devtools";
 const DEFAULT_PROFILE_NAME: &str = "default";
-const DEFAULT_PROFILE_PORT: u16 = 9222;
 const DEFAULT_PROFILE_USER_DATA_DIR: &str = "~/.config/chrome-devtools/profiles/default";
 const PROFILE_USER_DATA_DIR_PREFIX: &str = "~/.config/chrome-devtools/profiles";
 const DAEMON_READY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -350,7 +347,7 @@ fn create_default_config(path: &Path) -> Result<(), String> {
 }
 
 fn default_config_content() -> String {
-    format!("[[profiles]]\nname = \"{DEFAULT_PROFILE_NAME}\"\nport = {DEFAULT_PROFILE_PORT}\n")
+    format!("[[profiles]]\nname = \"{DEFAULT_PROFILE_NAME}\"\n")
 }
 
 fn parse_config(content: &str) -> Result<Config, String> {
@@ -384,10 +381,8 @@ fn parse_config(content: &str) -> Result<Config, String> {
         match key {
             "name" => profile.name = Some(parse_toml_string(value, line_number)?),
             "port" => {
-                profile.port = Some(
-                    value
-                        .parse::<u16>()
-                        .map_err(|error| format!("line {line_number}: invalid port: {error}"))?,
+                eprintln!(
+                    "warning: line {line_number}: 'port' is deprecated and ignored; the daemon now picks a free port automatically"
                 );
             }
             "user_data_dir" => profile.user_data_dir = Some(parse_toml_string(value, line_number)?),
@@ -420,9 +415,6 @@ fn push_profile(
     let name = builder
         .name
         .ok_or_else(|| format!("line {line_number}: profile is missing name"))?;
-    let port = builder
-        .port
-        .ok_or_else(|| format!("line {line_number}: profile {name} is missing port"))?;
     let user_data_dir = builder
         .user_data_dir
         .unwrap_or_else(|| default_user_data_dir_for_profile(&name));
@@ -433,7 +425,6 @@ fn push_profile(
 
     profiles.push(Profile {
         name,
-        port,
         user_data_dir,
     });
     Ok(())
@@ -616,20 +607,17 @@ fn write_runtime_port(profile: &Profile, port: u16) -> Result<(), String> {
         .map_err(|error| format!("failed to write {}: {error}", path.display()))
 }
 
-fn current_port(profile: &Profile) -> u16 {
-    read_runtime_port(profile).unwrap_or(profile.port)
+fn current_port(profile: &Profile) -> Option<u16> {
+    read_runtime_port(profile)
 }
 
-fn pick_free_port(hint: u16) -> u16 {
-    if hint != 0 && TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], hint))).is_ok() {
-        return hint;
-    }
-    if let Ok(listener) = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))) {
-        if let Ok(addr) = listener.local_addr() {
-            return addr.port();
-        }
-    }
-    hint
+fn pick_free_port() -> Result<u16, String> {
+    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .map_err(|error| format!("failed to acquire a free port: {error}"))?;
+    let addr = listener
+        .local_addr()
+        .map_err(|error| format!("failed to read local addr: {error}"))?;
+    Ok(addr.port())
 }
 
 fn start_daemon(profile: &Profile, quiet: bool) -> Result<(), String> {
@@ -1623,20 +1611,27 @@ fn require_profile_and_session(
 fn list_profiles(config: &Config) {
     for profile in &config.profiles {
         println!(
-            "{}\tport={}\tuser_data_dir={}",
-            profile.name, profile.port, profile.user_data_dir
+            "{}\tuser_data_dir={}",
+            profile.name, profile.user_data_dir
         );
     }
 }
 
 fn print_status(profile: &Profile) {
-    let port = current_port(profile);
-    let state = if is_devtools_ready(port) { "ready" } else { "stopped" };
-
-    println!(
-        "profile={} status={} port={} user_data_dir={}",
-        profile.name, state, port, profile.user_data_dir
-    );
+    match current_port(profile) {
+        Some(port) if is_devtools_ready(port) => {
+            println!(
+                "profile={} status=ready port={} user_data_dir={}",
+                profile.name, port, profile.user_data_dir
+            );
+        }
+        _ => {
+            println!(
+                "profile={} status=stopped user_data_dir={}",
+                profile.name, profile.user_data_dir
+            );
+        }
+    }
 }
 
 fn default_chrome_binary() -> String {
@@ -1662,11 +1657,8 @@ fn ensure_chrome(profile: &Profile) -> Result<(), String> {
             return Ok(());
         }
     }
-    if is_devtools_ready(profile.port) {
-        return write_runtime_port(profile, profile.port);
-    }
 
-    let port = pick_free_port(profile.port);
+    let port = pick_free_port()?;
     let chrome = env::var("CHROME").unwrap_or_else(|_| default_chrome_binary());
     let user_data_dir = expand_home(&profile.user_data_dir)?;
 
@@ -1750,9 +1742,11 @@ fn mcp_command(profile: &Profile) -> Command {
         command.arg("-y").arg("chrome-devtools-mcp@latest");
         command
     };
+    let port = current_port(profile)
+        .expect("ensure_chrome must run before mcp_command so the runtime port is recorded");
     command
         .arg("--browser-url")
-        .arg(format!("http://127.0.0.1:{}", current_port(profile)))
+        .arg(format!("http://127.0.0.1:{port}"))
         .arg("--no-usage-statistics")
         .arg("--no-performance-crux");
     command
@@ -1917,7 +1911,7 @@ fn print_version() {
 
 fn print_mcp_help() {
     println!(
-        "chrome-devtools mcp\n\nUsage:\n  chrome-devtools mcp list --profile <profile>\n  chrome-devtools mcp call --profile <profile> --session <id>\n  chrome-devtools mcp batch --profile <profile> --session <id> --script <path>\n  chrome-devtools mcp direct-list --profile <profile>\n  chrome-devtools mcp direct-call --profile <profile>\n  chrome-devtools mcp help\n\nCommands:\n  list         Start the selected profile daemon if needed, query tools/list through it, and print the raw MCP JSON response.\n\n  call         Start the selected profile daemon if needed, bind the named session, and forward stdin MCP JSON-RPC lines through its long-lived MCP process.\n\n  batch        Bind the named session and run a JSON batch file of tool/sleep steps through the profile daemon. Prints a JSON array of results.\n\n  direct-list  Bypass the daemon, run chrome-devtools-mcp directly, query tools/list, and print the raw MCP JSON response.\n\n  direct-call  Bypass the daemon, run chrome-devtools-mcp directly over stdio. Use only for fallback/manual debugging.\n\n  help         Show this help.\n\nOptions:\n  -h, --help   Show this help and exit.\n\nExamples:\n  chrome-devtools daemon start --profile default\n  chrome-devtools mcp list --profile default\n  ID=$(chrome-devtools session create --profile default | awk -F= '{{print $2}}' | awk '{{print $1}}')\n  chrome-devtools mcp call --profile default --session \"$ID\"\n  chrome-devtools mcp batch --profile default --session \"$ID\" --script /tmp/batch.json\n\nConfig:\n  Profiles are read from ~/.config/chrome-devtools/config.toml.\n  If the config file is missing, chrome-devtools creates a default profile using ~/.config/chrome-devtools/profiles/default.\n  user_data_dir is optional; when omitted, it defaults to ~/.config/chrome-devtools/profiles/<profile-name>.\n  Prefer user_data_dir values under ~/.config/chrome-devtools/profiles/<profile-name>.\n\nSessions:\n  mcp call and mcp batch require --session <id>. Mint one with `session create`.\n  Sessions live in-memory on the daemon and expire after 30 minutes of inactivity.\n\nDaemon:\n  mcp call, mcp list and mcp batch route through one long-lived per-profile daemon by default.\n  Daemon sockets and pid files live under ~/.cache/chrome-devtools/daemons.\n  direct-call and direct-list bypass the daemon and take a per-profile lock under ~/.cache/chrome-devtools/locks.\n  Set CHROME_DEVTOOLS_LOCK_TIMEOUT_SECS to override the direct-mode/default daemon lock wait.\n\nNotes:\n  Profiles define the Chrome user data directory and DevTools port.\n  The call/batch commands do not reimplement MCP tools; they delegate to a daemon-owned chrome-devtools-mcp process.\n  Snapshot uid values are only valid inside the MCP process that produced them.\n  Daemon-routed calls preserve that MCP process across invocations until the daemon stops."
+        "chrome-devtools mcp\n\nUsage:\n  chrome-devtools mcp list --profile <profile>\n  chrome-devtools mcp call --profile <profile> --session <id>\n  chrome-devtools mcp batch --profile <profile> --session <id> --script <path>\n  chrome-devtools mcp direct-list --profile <profile>\n  chrome-devtools mcp direct-call --profile <profile>\n  chrome-devtools mcp help\n\nCommands:\n  list         Start the selected profile daemon if needed, query tools/list through it, and print the raw MCP JSON response.\n\n  call         Start the selected profile daemon if needed, bind the named session, and forward stdin MCP JSON-RPC lines through its long-lived MCP process.\n\n  batch        Bind the named session and run a JSON batch file of tool/sleep steps through the profile daemon. Prints a JSON array of results.\n\n  direct-list  Bypass the daemon, run chrome-devtools-mcp directly, query tools/list, and print the raw MCP JSON response.\n\n  direct-call  Bypass the daemon, run chrome-devtools-mcp directly over stdio. Use only for fallback/manual debugging.\n\n  help         Show this help.\n\nOptions:\n  -h, --help   Show this help and exit.\n\nExamples:\n  chrome-devtools daemon start --profile default\n  chrome-devtools mcp list --profile default\n  ID=$(chrome-devtools session create --profile default | awk -F= '{{print $2}}' | awk '{{print $1}}')\n  chrome-devtools mcp call --profile default --session \"$ID\"\n  chrome-devtools mcp batch --profile default --session \"$ID\" --script /tmp/batch.json\n\nConfig:\n  Profiles are read from ~/.config/chrome-devtools/config.toml.\n  If the config file is missing, chrome-devtools creates a default profile using ~/.config/chrome-devtools/profiles/default.\n  user_data_dir is optional; when omitted, it defaults to ~/.config/chrome-devtools/profiles/<profile-name>.\n  Prefer user_data_dir values under ~/.config/chrome-devtools/profiles/<profile-name>.\n\nSessions:\n  mcp call and mcp batch require --session <id>. Mint one with `session create`.\n  Sessions live in-memory on the daemon and expire after 30 minutes of inactivity.\n\nDaemon:\n  mcp call, mcp list and mcp batch route through one long-lived per-profile daemon by default.\n  Daemon sockets and pid files live under ~/.cache/chrome-devtools/daemons.\n  direct-call and direct-list bypass the daemon and take a per-profile lock under ~/.cache/chrome-devtools/locks.\n  Set CHROME_DEVTOOLS_LOCK_TIMEOUT_SECS to override the direct-mode/default daemon lock wait.\n\nNotes:\n  Profiles define the Chrome user data directory. The daemon picks a free DevTools port automatically.\n  The call/batch commands do not reimplement MCP tools; they delegate to a daemon-owned chrome-devtools-mcp process.\n  Snapshot uid values are only valid inside the MCP process that produced them.\n  Daemon-routed calls preserve that MCP process across invocations until the daemon stops."
     );
 }
 
@@ -1965,7 +1959,7 @@ fn print_mcp_direct_list_help() {
 
 fn print_profile_status_help() {
     println!(
-        "chrome-devtools profile status\n\nUsage:\n  chrome-devtools profile status --profile <profile>\n\nDescription:\n  Show whether the Chrome DevTools endpoint for the given profile is reachable,\n  along with its port and user_data_dir.\n\nOptions:\n  --profile <name>  Required. Profile name from ~/.config/chrome-devtools/config.toml.\n  -h, --help        Show this help and exit."
+        "chrome-devtools profile status\n\nUsage:\n  chrome-devtools profile status --profile <profile>\n\nDescription:\n  Show whether the Chrome DevTools endpoint for the given profile is reachable,\n  along with its runtime port and user_data_dir.\n\nOptions:\n  --profile <name>  Required. Profile name from ~/.config/chrome-devtools/config.toml.\n  -h, --help        Show this help and exit."
     );
 }
 
@@ -1977,7 +1971,7 @@ fn print_profile_stop_help() {
 
 fn print_profile_list_help() {
     println!(
-        "chrome-devtools profile list\n\nUsage:\n  chrome-devtools profile list\n\nDescription:\n  Print all profiles defined in ~/.config/chrome-devtools/config.toml, one per\n  line, as: <name>\\tport=<port>\\tuser_data_dir=<path>.\n\nOptions:\n  -h, --help  Show this help and exit."
+        "chrome-devtools profile list\n\nUsage:\n  chrome-devtools profile list\n\nDescription:\n  Print all profiles defined in ~/.config/chrome-devtools/config.toml, one per\n  line, as: <name>\\tuser_data_dir=<path>.\n\nOptions:\n  -h, --help  Show this help and exit."
     );
 }
 
@@ -2039,11 +2033,10 @@ mod tests {
 
     #[test]
     fn parse_config_accepts_single_minimal_profile() {
-        let config = parse_config("[[profiles]]\nname = \"default\"\nport = 9222\n").unwrap();
+        let config = parse_config("[[profiles]]\nname = \"default\"\n").unwrap();
         assert_eq!(config.profiles.len(), 1);
         let profile = &config.profiles[0];
         assert_eq!(profile.name, "default");
-        assert_eq!(profile.port, 9222);
         assert_eq!(
             profile.user_data_dir,
             "~/.config/chrome-devtools/profiles/default"
@@ -2053,10 +2046,16 @@ mod tests {
     #[test]
     fn parse_config_accepts_explicit_user_data_dir() {
         let config = parse_config(
-            "[[profiles]]\nname = \"work\"\nport = 9300\nuser_data_dir = \"/tmp/work\"\n",
+            "[[profiles]]\nname = \"work\"\nuser_data_dir = \"/tmp/work\"\n",
         )
         .unwrap();
         assert_eq!(config.profiles[0].user_data_dir, "/tmp/work");
+    }
+
+    #[test]
+    fn parse_config_ignores_deprecated_port_field() {
+        let config = parse_config("[[profiles]]\nname = \"legacy\"\nport = 9222\n").unwrap();
+        assert_eq!(config.profiles[0].name, "legacy");
     }
 
     #[test]
@@ -2065,11 +2064,9 @@ mod tests {
             # leading comment
             [[profiles]]
             name = \"a\"
-            port = 1
 
             [[profiles]]
             name = \"b\"
-            port = 2
         ";
         let config = parse_config(toml).unwrap();
         let names: Vec<_> = config
@@ -2087,7 +2084,7 @@ mod tests {
 
     #[test]
     fn parse_config_rejects_duplicate_profile_names() {
-        let toml = "[[profiles]]\nname = \"a\"\nport = 1\n[[profiles]]\nname = \"a\"\nport = 2\n";
+        let toml = "[[profiles]]\nname = \"a\"\n[[profiles]]\nname = \"a\"\n";
         let error = parse_config(toml).unwrap_err();
         assert!(error.contains("duplicate profile name"));
     }
@@ -2099,7 +2096,7 @@ mod tests {
 
     #[test]
     fn parse_config_rejects_unknown_key() {
-        let toml = "[[profiles]]\nname = \"a\"\nport = 1\nweird = \"x\"\n";
+        let toml = "[[profiles]]\nname = \"a\"\nweird = \"x\"\n";
         assert!(parse_config(toml).is_err());
     }
 
@@ -2334,7 +2331,6 @@ mod tests {
         Config {
             profiles: vec![Profile {
                 name: "default".to_string(),
-                port: 9222,
                 user_data_dir: "/tmp/x".to_string(),
             }],
         }
