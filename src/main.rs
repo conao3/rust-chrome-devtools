@@ -1679,7 +1679,7 @@ fn ensure_chrome(profile: &Profile) -> Result<(), String> {
         .spawn()
         .map_err(|error| format!("failed to start Chrome: {error}"))?;
 
-    wait_for_devtools(port, Duration::from_secs(15))?;
+    wait_for_devtools(port, Duration::from_secs(30))?;
     write_runtime_port(profile, port)
 }
 
