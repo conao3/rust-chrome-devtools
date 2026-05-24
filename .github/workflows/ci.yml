@@ -29,6 +29,6 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-ci-
             ${{ runner.os }}-cargo-
-      - run: make fmt
+      - run: make fmt-check
       - run: make lint
       - run: make test
