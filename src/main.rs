@@ -841,12 +841,13 @@ fn handle_daemon_client(
             continue;
         }
 
-        let Some(pending_id) = extract_jsonrpc_id(line) else {
-            write_json_line(mcp_stdin, line)?;
+        let forwarded = sanitize_outgoing_request(line);
+        let Some(pending_id) = extract_jsonrpc_id(&forwarded) else {
+            write_json_line(mcp_stdin, &forwarded)?;
             continue;
         };
 
-        write_json_line(mcp_stdin, line)?;
+        write_json_line(mcp_stdin, &forwarded)?;
 
         loop {
             let mut response_line = String::new();
@@ -1799,6 +1800,44 @@ fn daemon_initialize_response(id: u64) -> String {
     )
 }
 
+fn sanitize_outgoing_request(line: &str) -> String {
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(line) else {
+        return line.to_string();
+    };
+    let Some(obj) = value.as_object_mut() else {
+        return line.to_string();
+    };
+    let method_is_tools_call = obj
+        .get("method")
+        .and_then(|m| m.as_str())
+        .map(|m| m == "tools/call")
+        .unwrap_or(false);
+    if !method_is_tools_call {
+        return line.to_string();
+    }
+    let Some(params) = obj.get_mut("params").and_then(|p| p.as_object_mut()) else {
+        return line.to_string();
+    };
+    let name_is_new_page = params
+        .get("name")
+        .and_then(|n| n.as_str())
+        .map(|n| n == "new_page")
+        .unwrap_or(false);
+    if !name_is_new_page {
+        return line.to_string();
+    }
+    let Some(args) = params.get_mut("arguments").and_then(|a| a.as_object_mut()) else {
+        return line.to_string();
+    };
+    if args.remove("isolatedContext").is_none() {
+        return line.to_string();
+    }
+    eprintln!(
+        "warning: stripped 'isolatedContext' from new_page; isolated browser contexts disable extensions"
+    );
+    serde_json::to_string(&value).unwrap_or_else(|_| line.to_string())
+}
+
 fn json_has_method(line: &str, method: &str) -> bool {
     compact_json_line(line).contains(&format!(r#""method":"{method}""#))
 }
@@ -2536,5 +2575,36 @@ mod tests {
     fn extract_remote_debugging_port_returns_none_for_invalid_value() {
         let cmd = "chrome --remote-debugging-port=abc --user-data-dir=/x";
         assert_eq!(extract_remote_debugging_port(cmd), None);
+    }
+
+    #[test]
+    fn sanitize_outgoing_request_strips_isolated_context_from_new_page() {
+        let input = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"new_page","arguments":{"url":"https://example.com","isolatedContext":"foo"}}}"#;
+        let output = sanitize_outgoing_request(input);
+        let value: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert!(value["params"]["arguments"]
+            .get("isolatedContext")
+            .is_none());
+        assert_eq!(value["params"]["arguments"]["url"], "https://example.com");
+    }
+
+    #[test]
+    fn sanitize_outgoing_request_keeps_other_tools_untouched() {
+        let input = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"navigate_page","arguments":{"isolatedContext":"foo"}}}"#;
+        let output = sanitize_outgoing_request(input);
+        assert_eq!(output, input);
+    }
+
+    #[test]
+    fn sanitize_outgoing_request_passes_through_non_tools_call() {
+        let input = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
+        let output = sanitize_outgoing_request(input);
+        assert_eq!(output, input);
+    }
+
+    #[test]
+    fn sanitize_outgoing_request_passes_through_invalid_json() {
+        let input = "not json";
+        assert_eq!(sanitize_outgoing_request(input), input);
     }
 }
