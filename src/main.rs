@@ -1610,10 +1610,7 @@ fn require_profile_and_session(
 
 fn list_profiles(config: &Config) {
     for profile in &config.profiles {
-        println!(
-            "{}\tuser_data_dir={}",
-            profile.name, profile.user_data_dir
-        );
+        println!("{}\tuser_data_dir={}", profile.name, profile.user_data_dir);
     }
 }
 
@@ -2045,10 +2042,8 @@ mod tests {
 
     #[test]
     fn parse_config_accepts_explicit_user_data_dir() {
-        let config = parse_config(
-            "[[profiles]]\nname = \"work\"\nuser_data_dir = \"/tmp/work\"\n",
-        )
-        .unwrap();
+        let config =
+            parse_config("[[profiles]]\nname = \"work\"\nuser_data_dir = \"/tmp/work\"\n").unwrap();
         assert_eq!(config.profiles[0].user_data_dir, "/tmp/work");
     }
 
