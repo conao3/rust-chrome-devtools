@@ -1655,6 +1655,13 @@ fn ensure_chrome(profile: &Profile) -> Result<(), String> {
         }
     }
 
+    if let Some(port) = find_running_chrome_port(profile) {
+        if is_devtools_ready(port) {
+            write_runtime_port(profile, port)?;
+            return Ok(());
+        }
+    }
+
     let port = pick_free_port()?;
     let chrome = env::var("CHROME").unwrap_or_else(|_| default_chrome_binary());
     let user_data_dir = expand_home(&profile.user_data_dir)?;
@@ -1821,6 +1828,73 @@ fn extract_jsonrpc_id(line: &str) -> Option<u64> {
 fn terminate_child(child: &mut Child) {
     let _ = child.kill();
     let _ = child.wait();
+}
+
+fn find_running_chrome_port(profile: &Profile) -> Option<u16> {
+    let user_data_dir = expand_home(&profile.user_data_dir).ok()?;
+    let needle = format!("--user-data-dir={}", user_data_dir.display());
+
+    for cmdline in list_browser_cmdlines() {
+        if cmdline.contains("--type=") {
+            continue;
+        }
+        if !cmdline.contains(&needle) {
+            continue;
+        }
+        if let Some(port) = extract_remote_debugging_port(&cmdline) {
+            return Some(port);
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn list_browser_cmdlines() -> Vec<String> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        if !name.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(entry.path().join("cmdline")) else {
+            continue;
+        };
+        let cmdline: String = bytes
+            .iter()
+            .map(|&b| if b == 0 { ' ' } else { b as char })
+            .collect();
+        out.push(cmdline);
+    }
+    out
+}
+
+#[cfg(target_os = "macos")]
+fn list_browser_cmdlines() -> Vec<String> {
+    let Ok(output) = Command::new("ps").args(["-ax", "-o", "command="]).output() else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(|s| s.to_string())
+        .collect()
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn list_browser_cmdlines() -> Vec<String> {
+    Vec::new()
+}
+
+fn extract_remote_debugging_port(cmdline: &str) -> Option<u16> {
+    let prefix = "--remote-debugging-port=";
+    let start = cmdline.find(prefix)? + prefix.len();
+    let rest = &cmdline[start..];
+    let end = rest.find(|c: char| c.is_whitespace()).unwrap_or(rest.len());
+    rest[..end].parse().ok()
 }
 
 fn stop_profile(profile: &Profile) -> Result<(), String> {
@@ -2439,5 +2513,28 @@ mod tests {
     #[test]
     fn unix_secs_returns_zero_for_unix_epoch() {
         assert_eq!(unix_secs(UNIX_EPOCH), 0);
+    }
+
+    #[test]
+    fn extract_remote_debugging_port_reads_port_number() {
+        let cmd = "/path/chrome --foo --remote-debugging-port=39277 --user-data-dir=/x";
+        assert_eq!(extract_remote_debugging_port(cmd), Some(39277));
+    }
+
+    #[test]
+    fn extract_remote_debugging_port_returns_none_when_missing() {
+        assert_eq!(extract_remote_debugging_port("/path/chrome --foo"), None);
+    }
+
+    #[test]
+    fn extract_remote_debugging_port_stops_at_next_flag() {
+        let cmd = "chrome --remote-debugging-port=8080 --type=renderer";
+        assert_eq!(extract_remote_debugging_port(cmd), Some(8080));
+    }
+
+    #[test]
+    fn extract_remote_debugging_port_returns_none_for_invalid_value() {
+        let cmd = "chrome --remote-debugging-port=abc --user-data-dir=/x";
+        assert_eq!(extract_remote_debugging_port(cmd), None);
     }
 }
