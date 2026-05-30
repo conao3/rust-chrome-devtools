@@ -1747,6 +1747,14 @@ fn mcp_command(profile: &Profile) -> Command {
         command.arg("-y").arg("chrome-devtools-mcp@latest");
         command
     };
+    let max_old_space_mb =
+        env::var("CHROME_DEVTOOLS_MCP_MAX_OLD_SPACE_MB").unwrap_or_else(|_| "1024".to_string());
+    let node_options = format!("--max-old-space-size={max_old_space_mb}");
+    let merged = match env::var("NODE_OPTIONS") {
+        Ok(existing) if !existing.is_empty() => format!("{existing} {node_options}"),
+        _ => node_options,
+    };
+    command.env("NODE_OPTIONS", merged);
     let port = current_port(profile)
         .expect("ensure_chrome must run before mcp_command so the runtime port is recorded");
     command
