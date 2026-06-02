@@ -5,6 +5,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::Shutdown;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -654,6 +655,7 @@ fn start_daemon(profile: &Profile, quiet: bool) -> Result<(), String> {
         .arg("run")
         .arg("--profile")
         .arg(&profile.name)
+        .process_group(0)
         .stdin(Stdio::null())
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(log_for_stderr))
