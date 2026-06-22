@@ -1675,7 +1675,6 @@ fn ensure_chrome(profile: &Profile) -> Result<(), String> {
         .arg(format!("--user-data-dir={}", user_data_dir.display()))
         .arg("--no-first-run")
         .arg("--no-default-browser-check")
-        .arg("--disable-gpu")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
