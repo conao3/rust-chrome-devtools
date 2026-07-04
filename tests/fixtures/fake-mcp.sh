@@ -22,6 +22,10 @@ field_bool() {
   printf '%s' "$1" | sed -n "s/.*\"$2\":\(true\|false\).*/\1/p"
 }
 
+field_array_string() {
+  printf '%s' "$1" | sed -n "s/.*\"$2\":[[:space:]]*\[\"\([^\"]*\)\".*/\1/p"
+}
+
 page_url() {
   local id="$1"
   local entry
@@ -76,7 +80,7 @@ pages_text() {
 
 tools_list() {
   cat <<JSON
-[{"name":"click","inputSchema":{"type":"object","properties":{"pageId":{"type":"number"},"uid":{"type":"string"}},"required":["pageId","uid"]}},{"name":"evaluate_script","inputSchema":{"type":"object","properties":{"pageId":{"type":"number"},"function":{"type":"string"}},"required":["pageId","function"]}},{"name":"list_pages","inputSchema":{"type":"object","properties":{},"required":[]}}, {"name":"new_page","inputSchema":{"type":"object","properties":{"url":{"type":"string"},"background":{"type":"boolean"}},"required":["url"]}},{"name":"select_page","inputSchema":{"type":"object","properties":{"pageId":{"type":"number"}},"required":["pageId"]}},{"name":"take_snapshot","inputSchema":{"type":"object","properties":{"pageId":{"type":"number"}},"required":["pageId"]}}]
+[{"name":"click","inputSchema":{"type":"object","properties":{"pageId":{"type":"number"},"uid":{"type":"string"},"includeSnapshot":{"type":"boolean"}},"required":["pageId","uid"]}},{"name":"drag","inputSchema":{"type":"object","properties":{"pageId":{"type":"number"},"from_uid":{"type":"string"},"to_uid":{"type":"string"}},"required":["pageId","from_uid","to_uid"]}},{"name":"evaluate_script","inputSchema":{"type":"object","properties":{"pageId":{"type":"number"},"function":{"type":"string"},"args":{"type":"array","items":{"type":"string"}}},"required":["pageId","function"]}},{"name":"fill_form","inputSchema":{"type":"object","properties":{"pageId":{"type":"number"},"elements":{"type":"array","items":{"type":"object","properties":{"uid":{"type":"string"}}}}},"required":["pageId","elements"]}},{"name":"list_pages","inputSchema":{"type":"object","properties":{},"required":[]}}, {"name":"new_page","inputSchema":{"type":"object","properties":{"url":{"type":"string"},"background":{"type":"boolean"}},"required":["url"]}},{"name":"select_page","inputSchema":{"type":"object","properties":{"pageId":{"type":"number"}},"required":["pageId"]}},{"name":"take_snapshot","inputSchema":{"type":"object","properties":{"pageId":{"type":"number"}},"required":["pageId"]}}]
 JSON
 }
 
@@ -124,21 +128,50 @@ while IFS= read -r line; do
         take_snapshot)
           page_id=$(field_number "$line" pageId)
           [ -z "$page_id" ] && page_id="$selected_page"
-          tool_response "$id" "snapshot page=$page_id uid=${page_id}_button" "{}" ;;
+          tool_response "$id" "snapshot page=$page_id uid=${page_id}_button uid=${page_id}_after" "{}" ;;
         click)
           page_id=$(field_number "$line" pageId)
           [ -z "$page_id" ] && page_id="$selected_page"
           uid=$(field_string "$line" uid)
           if [ "$uid" = "${page_id}_button" ]; then
             sleep 0.5
-            tool_response "$id" "clicked page=$page_id uid=$uid" "{}"
+            include_snapshot=$(field_bool "$line" includeSnapshot)
+            if [ "$include_snapshot" = "true" ]; then
+              tool_response "$id" "clicked page=$page_id raw=$uid\nsnapshot page=$page_id uid=${page_id}_after" "{}"
+            else
+              tool_response "$id" "clicked page=$page_id" "{}"
+            fi
           else
             error_response "$id" "wrong page: page=$page_id uid=$uid selected=$selected_page"
+          fi ;;
+        drag)
+          page_id=$(field_number "$line" pageId)
+          [ -z "$page_id" ] && page_id="$selected_page"
+          from_uid=$(field_string "$line" from_uid)
+          to_uid=$(field_string "$line" to_uid)
+          if [ "$from_uid" = "${page_id}_button" ] && [ "$to_uid" = "${page_id}_after" ]; then
+            tool_response "$id" "dragged page=$page_id from=$from_uid to=$to_uid" "{}"
+          else
+            error_response "$id" "wrong drag page=$page_id from=$from_uid to=$to_uid"
           fi ;;
         evaluate_script)
           page_id=$(field_number "$line" pageId)
           [ -z "$page_id" ] && page_id="$selected_page"
-          tool_response "$id" "evaluated page=$page_id" "{}" ;;
+          arg=$(field_array_string "$line" args)
+          if [ -n "$arg" ] && [ "$arg" != "${page_id}_button" ]; then
+            error_response "$id" "wrong eval arg page=$page_id arg=$arg"
+          else
+            tool_response "$id" "evaluated page=$page_id arg=$arg" "{}"
+          fi ;;
+        fill_form)
+          page_id=$(field_number "$line" pageId)
+          [ -z "$page_id" ] && page_id="$selected_page"
+          uid=$(field_string "$line" uid)
+          if [ "$uid" = "${page_id}_button" ]; then
+            tool_response "$id" "filled form page=$page_id raw=$uid" "{}"
+          else
+            error_response "$id" "wrong form page=$page_id uid=$uid"
+          fi ;;
         navigate_page)
           page_id=$(field_number "$line" pageId)
           [ -z "$page_id" ] && page_id="$selected_page"

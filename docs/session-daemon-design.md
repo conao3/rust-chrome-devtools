@@ -74,11 +74,10 @@ Each client connection sends a line beginning with `__chrome_devtools_daemon__:`
 
 After a successful `bind`, the daemon stays in JSON-RPC forwarding mode on that connection: each JSON-RPC line is forwarded to the long-lived `chrome-devtools-mcp` child, and matching responses are streamed back.
 
-Control commands use independent daemon client connections and only take the session registry mutex. They respond while clients are bound. MCP forwarding goes through a single router that owns the MCP stdin/stdout pair, rewrites each client JSON-RPC id to a daemon-local numeric id, restores the original id in the response, and injects the session page id for page-scoped tools.
+Control commands use independent daemon client connections and only take the session registry mutex. They respond while clients are bound. MCP forwarding goes through a single router that owns the MCP stdin/stdout pair, rewrites each client JSON-RPC id to a daemon-local numeric id, restores the original id in the response, injects the session page id for page-scoped tools, and rewrites snapshot uids to session uid tokens.
 
 ## Future direction
 
-- Per-tab snapshot cache: route snapshot uids through session-scoped maps so concurrent agents do not invalidate each other's uids.
 - Lock modes (`read`, `write`, `exclusive`) and origin-scoped locking for mutating operations.
 - Commands must not rely on Chrome's active tab.
 
@@ -92,4 +91,4 @@ Control commands use independent daemon client connections and only take the ses
 
 ## Operational rule for agents
 
-For any action sequence that uses snapshot `uid` values, keep all related MCP calls in the same session. The daemon assigns the session to a page and injects that page id for page-scoped tools. Use one `chrome-devtools mcp call` invocation, or chain the calls inside one `mcp batch` script.
+For any action sequence that uses snapshot `uid` values, keep all related MCP calls in the same session. The daemon assigns the session to a page, injects that page id for page-scoped tools, and returns session uid tokens. Use one `chrome-devtools mcp call` invocation, or chain the calls inside one `mcp batch` script.

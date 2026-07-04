@@ -16,7 +16,7 @@ Use `chrome-devtools` when you need browser automation through Chrome DevTools M
 - Both `mcp batch` and `mcp call` route through one long-lived per-profile daemon. The daemon assigns each session to a page and injects `pageId` for page-scoped tools.
 - Sessions expire after 30 minutes of inactivity. Activity (any tool call) refreshes the timer. After expiry, mint a new id.
 - A session is held exclusively while bound by a `mcp call` / `mcp batch` invocation. A second concurrent invocation on the same session id is rejected by the daemon. Different session ids may run concurrently.
-- `take_snapshot` result `uid` values are valid for the session's current page inside the daemon-owned MCP process.
+- `take_snapshot` result `uid` values are session uid tokens. Reuse them only in the same session and after the latest snapshot.
 - Do not use `mcp direct-call` for a split `take_snapshot` then `click`/`fill` workflow; direct mode starts a separate MCP process and the snapshot cache is lost.
 - Take a fresh snapshot before using `click`, `fill`, or other uid-based actions if the page may have changed.
 - Do not start or kill the user's regular Chrome unless explicitly asked.
@@ -126,18 +126,18 @@ chrome-devtools mcp batch --profile conao3 --session "$SESSION" --script /tmp/sc
 
 ### Example: snapshot → click reusing the uid
 
-Because all steps share the same daemon session page, a `take_snapshot` step's uid can be referenced by a later `click` step in the same scenario.
+Because all steps share the same daemon session page, a `take_snapshot` step's uid token can be referenced by a later `click` step in the same scenario.
 
 ```sh
 cat > /tmp/click-scenario.json <<'JSON'
 [
   { "type": "tool", "name": "take_snapshot", "args": {} },
-  { "type": "tool", "name": "click", "args": { "uid": "1_8" } }
+  { "type": "tool", "name": "click", "args": { "uid": "u:abc:2:1_8" } }
 ]
 JSON
 ```
 
-When the target uid is not known in advance, split the work: run the `take_snapshot` scenario first, parse the response, then build a second scenario that references the resolved uid.
+When the target uid token is not known in advance, split the work: run the `take_snapshot` scenario first, parse the response, then build a second scenario that references the resolved uid token.
 
 ### Reading results with jq
 
@@ -168,8 +168,8 @@ Navigate / inspect / interact:
 ```json
 {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"navigate_page","arguments":{"type":"url","url":"https://www.google.com/","timeout":20000}}}
 {"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"take_snapshot","arguments":{}}}
-{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"fill","arguments":{"uid":"1_5","value":"example text"}}}
-{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"click","arguments":{"uid":"1_8"}}}
+{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"fill","arguments":{"uid":"u:abc:2:1_5","value":"example text"}}}
+{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"click","arguments":{"uid":"u:abc:2:1_8"}}}
 ```
 
 ## Common Commands
@@ -222,7 +222,7 @@ chrome-devtools profile stop --profile conao3
 - If the CLI warns about a daemon version mismatch, the daemon predates the installed CLI. Behavior fixes in the daemon only apply after it restarts; `daemon stop` (without `--force`) is safe once `sessions=0`.
 - If `daemon status` shows `chrome=unreachable`, restart the daemon; it is attached to a Chrome endpoint that no longer answers.
 - The daemon runs `chrome-devtools-mcp` pinned to a fixed version; set `CHROME_DEVTOOLS_MCP_VERSION` (e.g. `latest`) before `daemon start` to override.
-- If `fill` or `click` fails with a missing snapshot, check whether the daemon restarted between the snapshot and the action. Re-snapshot inside the same `mcp batch` scenario, or inside one `mcp call` invocation.
+- If `fill` or `click` fails with a stale or foreign uid token, take a fresh snapshot in the same session and use the new token.
 - If the page is not the expected page, run an `evaluate_script` step that returns `window.location.href` and verify before acting.
 - If the profile's Chrome is not running, `mcp call` / `mcp batch` / `mcp list` will start it on first use.
 - If login state is missing, verify the profile name and `user_data_dir`; login cookies are profile-specific.

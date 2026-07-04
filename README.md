@@ -41,7 +41,7 @@ npx skills add ./rust-chrome-devtools
 - The CLI may execute `chrome-devtools-mcp` internally for a selected profile.
 - MCP JSON-RPC input and output are routed through one long-lived per-profile daemon by default.
 - Hermes-side Chrome DevTools MCP registration is not required for this workflow.
-- Snapshot `uid` values are MCP-process-local. Keep `take_snapshot -> click/fill` on the same profile daemon, or in one direct MCP process when bypassing the daemon.
+- Daemon-routed snapshot `uid` values are session uid tokens. Keep `take_snapshot -> click/fill` on the same daemon session.
 - The daemon owns one `chrome-devtools-mcp` process per profile, so multiple CLI invocations do not create competing MCP processes for the same Chrome profile.
 - The daemon accepts control commands independently of MCP forwarding, so `session create`, `session list`, `session close`, `daemon status`, and `daemon stop` respond while clients are bound.
 - The daemon rewrites client JSON-RPC ids internally and restores the original id in responses, including string ids.
@@ -97,7 +97,7 @@ By default a tool step that returns an error (non-null `error` field or `isError
 
 Use `--script -` to read the batch from stdin instead of a file, and `--output <path>` to write the JSON results to a file instead of stdout.
 
-Important: `take_snapshot` result `uid` values are local to the running MCP process. The daemon keeps that MCP process alive for the selected profile, so a later `click`/`fill` can use snapshot state from an earlier daemon-routed invocation as long as the daemon has not restarted.
+Important: daemon-routed `take_snapshot` result `uid` values use the form `u:<session>:<epoch>:<raw-uid>`. Pass those tokens back to later `click`/`fill` calls in the same session. Tokens from another session or an older snapshot are rejected before the request reaches MCP.
 
 `daemon start` starts one background broker for the profile. Daemon metadata lives under `~/.cache/chrome-devtools/daemons`. `daemon stop` asks the broker to stop and cleans up its socket/pid files.
 

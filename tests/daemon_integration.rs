@@ -177,6 +177,24 @@ fn content_text(response: &serde_json::Value) -> &str {
     response["result"]["content"][0]["text"].as_str().unwrap()
 }
 
+fn uid_token(response: &serde_json::Value) -> String {
+    uid_tokens(response).remove(0)
+}
+
+fn uid_tokens(response: &serde_json::Value) -> Vec<String> {
+    let text = content_text(response);
+    let mut tokens = Vec::new();
+    let mut rest = text;
+    while let Some(index) = rest.find("uid=u:") {
+        let after = &rest[index + 4..];
+        let end = after.find(char::is_whitespace).unwrap_or(after.len());
+        tokens.push(after[..end].to_string());
+        rest = &after[end..];
+    }
+    assert!(!tokens.is_empty(), "uid token in response: {text}");
+    tokens
+}
+
 fn selected_page_id(response: &serde_json::Value) -> u64 {
     response["result"]["structuredContent"]["pages"]
         .as_array()
@@ -469,26 +487,28 @@ fn session_tabs_keep_snapshot_state_independent() {
     );
     assert!(content_text(&first_snapshot).contains(&format!("page={first_page}")));
     assert!(content_text(&second_snapshot).contains(&format!("page={second_page}")));
+    let first_token = uid_token(&first_snapshot);
+    let second_token = uid_token(&second_snapshot);
 
     let first_click = tool_call(
         &mut first_stream,
         24,
         "click",
-        serde_json::json!({"uid": format!("{first_page}_button")}),
+        serde_json::json!({"uid": first_token}),
     );
     let second_click = tool_call(
         &mut second_stream,
         25,
         "click",
-        serde_json::json!({"uid": format!("{second_page}_button")}),
+        serde_json::json!({"uid": second_token}),
     );
     assert_eq!(
         content_text(&first_click),
-        format!("clicked page={first_page} uid={first_page}_button")
+        format!("clicked page={first_page}")
     );
     assert_eq!(
         content_text(&second_click),
-        format!("clicked page={second_page} uid={second_page}_button")
+        format!("clicked page={second_page}")
     );
 }
 
@@ -585,6 +605,159 @@ fn session_attach_sets_page_target() {
     bind_stream(&mut stream, &session);
     let snapshot = tool_call(&mut stream, 50, "take_snapshot", serde_json::json!({}));
     assert!(content_text(&snapshot).contains("page=1 "));
+}
+
+#[test]
+fn uid_token_from_another_session_is_rejected_before_mcp_forward() {
+    let mut env = TestEnv::new("foreignuid");
+    env.start_daemon();
+    let first = env.create_session();
+    let second = env.create_session();
+    let mut first_stream = env.connect();
+    let mut second_stream = env.connect();
+    bind_stream(&mut first_stream, &first);
+    bind_stream(&mut second_stream, &second);
+
+    tool_call(
+        &mut first_stream,
+        60,
+        "new_page",
+        serde_json::json!({"url": "https://a.test/"}),
+    );
+    tool_call(
+        &mut second_stream,
+        61,
+        "new_page",
+        serde_json::json!({"url": "https://b.test/"}),
+    );
+    let token = uid_token(&tool_call(
+        &mut first_stream,
+        62,
+        "take_snapshot",
+        serde_json::json!({}),
+    ));
+    let response = tool_call(
+        &mut second_stream,
+        63,
+        "click",
+        serde_json::json!({"uid": token}),
+    );
+    assert_eq!(
+        response["error"]["message"],
+        "uid token belongs to another session"
+    );
+}
+
+#[test]
+fn stale_uid_token_is_rejected_before_mcp_forward() {
+    let mut env = TestEnv::new("staleuid");
+    env.start_daemon();
+    let session = env.create_session();
+    let mut stream = env.connect();
+    bind_stream(&mut stream, &session);
+    tool_call(
+        &mut stream,
+        70,
+        "new_page",
+        serde_json::json!({"url": "https://a.test/"}),
+    );
+    let old_token = uid_token(&tool_call(
+        &mut stream,
+        71,
+        "take_snapshot",
+        serde_json::json!({}),
+    ));
+    let new_snapshot = tool_call(&mut stream, 72, "take_snapshot", serde_json::json!({}));
+    assert_ne!(old_token, uid_token(&new_snapshot));
+    let response = tool_call(
+        &mut stream,
+        73,
+        "click",
+        serde_json::json!({"uid": old_token}),
+    );
+    assert_eq!(response["error"]["message"], "stale uid token");
+}
+
+#[test]
+fn evaluate_script_and_nested_uid_fields_translate_tokens() {
+    let mut env = TestEnv::new("uidfields");
+    env.start_daemon();
+    let session = env.create_session();
+    let mut stream = env.connect();
+    bind_stream(&mut stream, &session);
+    let page = selected_page_id(&tool_call(
+        &mut stream,
+        80,
+        "new_page",
+        serde_json::json!({"url": "https://a.test/"}),
+    ));
+    let tokens = uid_tokens(&tool_call(
+        &mut stream,
+        81,
+        "take_snapshot",
+        serde_json::json!({}),
+    ));
+    let token = tokens[0].clone();
+    let eval = tool_call(
+        &mut stream,
+        82,
+        "evaluate_script",
+        serde_json::json!({"function": "(el) => el.id", "args": [token.clone()]}),
+    );
+    assert_eq!(
+        content_text(&eval),
+        format!("evaluated page={page} arg={page}_button")
+    );
+    let form = tool_call(
+        &mut stream,
+        83,
+        "fill_form",
+        serde_json::json!({"elements": [{"uid": token.clone(), "value": "x"}]}),
+    );
+    assert_eq!(
+        content_text(&form),
+        format!("filled form page={page} raw={page}_button")
+    );
+    let drag = tool_call(
+        &mut stream,
+        84,
+        "drag",
+        serde_json::json!({"from_uid": token, "to_uid": tokens[1]}),
+    );
+    assert_eq!(
+        content_text(&drag),
+        format!("dragged page={page} from={page}_button to={page}_after")
+    );
+}
+
+#[test]
+fn include_snapshot_response_rewrites_returned_uids() {
+    let mut env = TestEnv::new("includesnapshot");
+    env.start_daemon();
+    let session = env.create_session();
+    let mut stream = env.connect();
+    bind_stream(&mut stream, &session);
+    let page = selected_page_id(&tool_call(
+        &mut stream,
+        90,
+        "new_page",
+        serde_json::json!({"url": "https://a.test/"}),
+    ));
+    let token = uid_token(&tool_call(
+        &mut stream,
+        91,
+        "take_snapshot",
+        serde_json::json!({}),
+    ));
+    let click = tool_call(
+        &mut stream,
+        92,
+        "click",
+        serde_json::json!({"uid": token, "includeSnapshot": true}),
+    );
+    let text = content_text(&click);
+    assert!(text.contains(&format!("clicked page={page} raw={page}_button")));
+    assert!(text.contains(&format!("snapshot page={page} uid=u:")));
 }
 
 #[test]

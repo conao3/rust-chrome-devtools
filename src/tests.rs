@@ -216,6 +216,7 @@ fn format_session_line_renders_all_fields() {
         page_created_by_daemon: true,
         page_url: Some("about:blank".to_string()),
         snapshot_epoch: 0,
+        uid_bindings: std::collections::HashMap::new(),
     };
     let line = format_session_line(&state);
     assert!(line.starts_with("session=sess-test "));

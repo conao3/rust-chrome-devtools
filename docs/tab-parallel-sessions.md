@@ -179,7 +179,7 @@ Acceptance checks:
 
 ### Phase 2: UID token rewriting
 
-Rewrite snapshot uids to session uid tokens and translate uid-bearing request fields before forwarding.
+Implemented. Snapshot uids are rewritten to session uid tokens, and uid-bearing request fields are translated before forwarding.
 
 Acceptance checks:
 

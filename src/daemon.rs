@@ -266,8 +266,8 @@ pub(crate) fn run_daemon(profile: &Profile) -> Result<(), String> {
         let sessions = Arc::clone(&sessions);
         let stop_tx = stop_tx.clone();
         let stopping = Arc::clone(&stopping);
-        thread::spawn(move || {
-            match handle_daemon_client(stream, router, &sessions, mcp_port, bind_timeout()) {
+        thread::spawn(
+            move || match handle_daemon_client(stream, router, &sessions, mcp_port) {
                 Ok(false) => {}
                 Ok(true) => {
                     stopping.store(true, Ordering::SeqCst);
@@ -281,8 +281,8 @@ pub(crate) fn run_daemon(profile: &Profile) -> Result<(), String> {
                     stopping.store(true, Ordering::SeqCst);
                     let _ = stop_tx.send(());
                 }
-            }
-        });
+            },
+        );
     }
 
     drop(runtime);

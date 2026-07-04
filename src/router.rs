@@ -21,6 +21,13 @@ pub(crate) const SESSION_IDLE_TTL: Duration = Duration::from_secs(30 * 60);
 pub(crate) const SESSION_REAPER_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Debug)]
+pub(crate) struct UidBinding {
+    pub(crate) page_id: u64,
+    pub(crate) snapshot_epoch: u64,
+    pub(crate) raw_uid: String,
+}
+
+#[derive(Clone, Debug)]
 pub(crate) struct SessionState {
     pub(crate) id: String,
     pub(crate) created_at: SystemTime,
@@ -30,6 +37,7 @@ pub(crate) struct SessionState {
     pub(crate) page_created_by_daemon: bool,
     pub(crate) page_url: Option<String>,
     pub(crate) snapshot_epoch: u64,
+    pub(crate) uid_bindings: HashMap<String, UidBinding>,
 }
 
 #[derive(Default)]
@@ -50,6 +58,7 @@ impl SessionRegistry {
             page_created_by_daemon: false,
             page_url: None,
             snapshot_epoch: 0,
+            uid_bindings: HashMap::new(),
         };
         self.sessions.insert(id.clone(), state.clone());
         state
@@ -126,6 +135,10 @@ impl SessionRegistry {
             .sessions
             .get_mut(id)
             .ok_or_else(|| format!("unknown session: {id}"))?;
+        if session.page_id != Some(page_id) {
+            session.snapshot_epoch = session.snapshot_epoch.wrapping_add(1);
+            session.uid_bindings.clear();
+        }
         session.page_id = Some(page_id);
         session.page_created_by_daemon = page_created_by_daemon;
         session.page_url = page_url;
@@ -138,8 +151,83 @@ impl SessionRegistry {
             session.page_id = None;
             session.page_created_by_daemon = false;
             session.page_url = None;
+            session.snapshot_epoch = session.snapshot_epoch.wrapping_add(1);
+            session.uid_bindings.clear();
             session.last_used_at = SystemTime::now();
         }
+    }
+
+    pub(crate) fn record_snapshot_uids(
+        &mut self,
+        id: &str,
+        page_id: u64,
+        raw_uids: &[String],
+    ) -> Result<HashMap<String, String>, String> {
+        let session = self
+            .sessions
+            .get_mut(id)
+            .ok_or_else(|| format!("unknown session: {id}"))?;
+        session.snapshot_epoch = session.snapshot_epoch.wrapping_add(1);
+        session.uid_bindings.clear();
+        let mut replacements = HashMap::new();
+        for raw_uid in raw_uids {
+            let token = format!(
+                "u:{}:{}:{}",
+                session_short_id(id),
+                session.snapshot_epoch,
+                raw_uid
+            );
+            replacements.insert(raw_uid.clone(), token.clone());
+            session.uid_bindings.insert(
+                token,
+                UidBinding {
+                    page_id,
+                    snapshot_epoch: session.snapshot_epoch,
+                    raw_uid: raw_uid.clone(),
+                },
+            );
+        }
+        session.last_used_at = SystemTime::now();
+        Ok(replacements)
+    }
+
+    pub(crate) fn translate_uid_token(
+        &self,
+        id: &str,
+        page_id: u64,
+        token: &str,
+    ) -> Result<String, String> {
+        let session = self
+            .sessions
+            .get(id)
+            .ok_or_else(|| format!("unknown session: {id}"))?;
+        let Some(rest) = token.strip_prefix("u:") else {
+            return Err("session uid token is required".to_string());
+        };
+        let parts = rest.splitn(3, ':').collect::<Vec<_>>();
+        if parts.len() != 3 {
+            return Err("invalid session uid token".to_string());
+        }
+        if parts[0] != session_short_id(id) {
+            return Err("uid token belongs to another session".to_string());
+        }
+        let epoch = parts[1]
+            .parse::<u64>()
+            .map_err(|_| "invalid session uid token epoch".to_string())?;
+        if epoch != session.snapshot_epoch {
+            return Err("stale uid token".to_string());
+        }
+        let binding = session
+            .uid_bindings
+            .get(token)
+            .ok_or_else(|| "unknown uid token".to_string())?;
+        if binding.page_id != page_id {
+            return Err("uid token belongs to another page".to_string());
+        }
+        if binding.snapshot_epoch != session.snapshot_epoch {
+            return Err("stale uid token".to_string());
+        }
+        Ok(binding.raw_uid.clone())
     }
 }
 
@@ -162,6 +250,10 @@ pub(crate) fn unix_secs(time: SystemTime) -> u64 {
     time.duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or(0)
+}
+
+pub(crate) fn session_short_id(id: &str) -> &str {
+    id.strip_prefix("sess-").unwrap_or(id)
 }
 
 #[derive(Debug)]
@@ -449,6 +541,203 @@ fn rewrite_selected_page(line: &str, page_id: u64) -> String {
     value.to_string()
 }
 
+fn collect_raw_uids(value: &serde_json::Value, out: &mut Vec<String>) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, value) in map {
+                if key == "uid" {
+                    if let Some(raw_uid) = value.as_str() {
+                        push_unique(out, raw_uid);
+                    }
+                } else {
+                    collect_raw_uids(value, out);
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_raw_uids(item, out);
+            }
+        }
+        serde_json::Value::String(text) => {
+            collect_text_uids(text, out);
+        }
+        _ => {}
+    }
+}
+
+fn push_unique(out: &mut Vec<String>, value: &str) {
+    if !out.iter().any(|item| item == value) {
+        out.push(value.to_string());
+    }
+}
+
+fn collect_text_uids(text: &str, out: &mut Vec<String>) {
+    let mut rest = text;
+    while let Some(index) = rest.find("uid=") {
+        let after = &rest[index + 4..];
+        let end = after
+            .find(|character: char| {
+                character.is_whitespace()
+                    || matches!(character, ')' | ']' | '}' | ',' | ';' | '"' | '\'')
+            })
+            .unwrap_or(after.len());
+        if end > 0 {
+            push_unique(out, &after[..end]);
+        }
+        rest = &after[end..];
+    }
+}
+
+fn replace_raw_uids(value: &mut serde_json::Value, replacements: &HashMap<String, String>) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, value) in map {
+                if key == "uid" {
+                    if let Some(raw_uid) = value.as_str() {
+                        if let Some(token) = replacements.get(raw_uid) {
+                            *value = serde_json::Value::String(token.clone());
+                        }
+                    }
+                } else {
+                    replace_raw_uids(value, replacements);
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                replace_raw_uids(item, replacements);
+            }
+        }
+        serde_json::Value::String(text) => {
+            *text = replace_text_uids(text, replacements);
+        }
+        _ => {}
+    }
+}
+
+fn replace_text_uids(text: &str, replacements: &HashMap<String, String>) -> String {
+    let mut output = String::new();
+    let mut rest = text;
+    while let Some(index) = rest.find("uid=") {
+        output.push_str(&rest[..index + 4]);
+        let after = &rest[index + 4..];
+        let end = after
+            .find(|character: char| {
+                character.is_whitespace()
+                    || matches!(character, ')' | ']' | '}' | ',' | ';' | '"' | '\'')
+            })
+            .unwrap_or(after.len());
+        let raw_uid = &after[..end];
+        if let Some(token) = replacements.get(raw_uid) {
+            output.push_str(token);
+        } else {
+            output.push_str(raw_uid);
+        }
+        rest = &after[end..];
+    }
+    output.push_str(rest);
+    output
+}
+
+fn rewrite_uid_response(
+    line: &str,
+    sessions: &SharedSessions,
+    session_id: &str,
+    page_id: u64,
+) -> Result<String, String> {
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(line) else {
+        return Ok(line.to_string());
+    };
+    let mut raw_uids = Vec::new();
+    collect_raw_uids(&value, &mut raw_uids);
+    if raw_uids.is_empty() {
+        return Ok(line.to_string());
+    }
+    let replacements = {
+        let (lock, _) = &**sessions;
+        let mut registry = lock
+            .lock()
+            .map_err(|_| "session registry poisoned".to_string())?;
+        registry.record_snapshot_uids(session_id, page_id, &raw_uids)?
+    };
+    replace_raw_uids(&mut value, &replacements);
+    Ok(value.to_string())
+}
+
+fn rewrite_uid_responses(
+    lines: Vec<String>,
+    sessions: &SharedSessions,
+    session_id: &str,
+    page_id: u64,
+) -> Result<Vec<String>, String> {
+    lines
+        .into_iter()
+        .map(|line| rewrite_uid_response(&line, sessions, session_id, page_id))
+        .collect()
+}
+
+fn translate_uid_fields(
+    arguments: &mut serde_json::Value,
+    sessions: &SharedSessions,
+    session_id: &str,
+    page_id: u64,
+) -> Result<(), String> {
+    let (lock, _) = &**sessions;
+    let registry = lock
+        .lock()
+        .map_err(|_| "session registry poisoned".to_string())?;
+    translate_uid_key(arguments, "uid", &registry, session_id, page_id)?;
+    translate_uid_key(arguments, "from_uid", &registry, session_id, page_id)?;
+    translate_uid_key(arguments, "to_uid", &registry, session_id, page_id)?;
+    if let Some(elements) = arguments
+        .get_mut("elements")
+        .and_then(|elements| elements.as_array_mut())
+    {
+        for element in elements {
+            translate_uid_key(element, "uid", &registry, session_id, page_id)?;
+        }
+    }
+    if let Some(args) = arguments
+        .get_mut("args")
+        .and_then(|args| args.as_array_mut())
+    {
+        for arg in args {
+            if let Some(token) = arg.as_str() {
+                *arg = serde_json::Value::String(
+                    registry.translate_uid_token(session_id, page_id, token)?,
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn translate_uid_key(
+    arguments: &mut serde_json::Value,
+    key: &str,
+    registry: &SessionRegistry,
+    session_id: &str,
+    page_id: u64,
+) -> Result<(), String> {
+    if let Some(value) = arguments.get_mut(key) {
+        if let Some(token) = value.as_str() {
+            *value = serde_json::Value::String(
+                registry.translate_uid_token(session_id, page_id, token)?,
+            );
+        }
+    }
+    Ok(())
+}
+
+fn request_error_line(value: &serde_json::Value, message: &str) -> Vec<String> {
+    value
+        .get("id")
+        .cloned()
+        .map(|id| vec![jsonrpc_error_response(id, -32000, message)])
+        .unwrap_or_default()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn route_request(
     mcp_stdin: &mut impl Write,
@@ -501,7 +790,17 @@ fn route_request(
                 ensure_session_page(mcp_stdin, mcp_reader, sessions, session_id, next_id)?;
             let mut forwarded = value;
             inject_page_id(&mut forwarded, page_id);
-            forward_line(mcp_stdin, mcp_reader, &forwarded.to_string(), next_id)
+            if let Some(arguments) = forwarded
+                .get_mut("params")
+                .and_then(|params| params.get_mut("arguments"))
+            {
+                if let Err(message) = translate_uid_fields(arguments, sessions, session_id, page_id)
+                {
+                    return Ok(request_error_line(&forwarded, &message));
+                }
+            }
+            let lines = forward_line(mcp_stdin, mcp_reader, &forwarded.to_string(), next_id)?;
+            rewrite_uid_responses(lines, sessions, session_id, page_id)
         }
         _ => forward_line(mcp_stdin, mcp_reader, line, next_id),
     }
@@ -660,7 +959,6 @@ pub(crate) fn handle_daemon_client(
     router: RouterHandle,
     sessions: &SharedSessions,
     mcp_port: u16,
-    bind_timeout: Duration,
 ) -> Result<bool, DaemonError> {
     let mut client_reader = BufReader::new(stream.try_clone().map_err(|error| {
         DaemonError::Client(format!("failed to clone daemon client stream: {error}"))
@@ -683,14 +981,7 @@ pub(crate) fn handle_daemon_client(
         }
 
         if let Some(command) = line.strip_prefix("__chrome_devtools_daemon__:") {
-            match handle_control_command(
-                &mut stream,
-                sessions,
-                &mut bound,
-                command,
-                mcp_port,
-                bind_timeout,
-            )? {
+            match handle_control_command(&mut stream, sessions, &mut bound, command, mcp_port)? {
                 ControlOutcome::Continue => continue,
                 ControlOutcome::CloseConnection => return Ok(false),
                 ControlOutcome::StopDaemon => return Ok(true),
@@ -806,7 +1097,6 @@ pub(crate) fn handle_control_command(
     bound: &mut BoundSessionGuard,
     command: &str,
     mcp_port: u16,
-    bind_timeout: Duration,
 ) -> Result<ControlOutcome, DaemonError> {
     let (head, rest) = match command.split_once(' ') {
         Some((head, rest)) => (head, rest.trim()),
@@ -886,7 +1176,7 @@ pub(crate) fn handle_control_command(
         }
         "bind" => {
             let id = parse_session_arg(rest).map_err(DaemonError::Client)?;
-            let result = bind_session_in_registry(sessions, &id, bind_timeout);
+            let result = bind_session_in_registry(sessions, &id);
             match result {
                 Ok(()) => {
                     bound.mark_bound(id.clone());
@@ -914,11 +1204,7 @@ pub(crate) fn lock_sessions<'a>(
         .map_err(|_| DaemonError::Fatal("session registry poisoned".to_string()))
 }
 
-pub(crate) fn bind_session_in_registry(
-    sessions: &SharedSessions,
-    id: &str,
-    _timeout: Duration,
-) -> Result<(), String> {
+pub(crate) fn bind_session_in_registry(sessions: &SharedSessions, id: &str) -> Result<(), String> {
     let (lock, _) = &**sessions;
     let mut registry = lock
         .lock()
