@@ -24,8 +24,11 @@ impl TestEnv {
         session_ttl_secs: Option<u64>,
         reaper_interval_ms: Option<u64>,
     ) -> Self {
-        let home =
-            std::env::temp_dir().join(format!("chrome-devtools-it-{tag}-{}", std::process::id()));
+        let home = std::env::temp_dir().join(format!(
+            "cdt-{}-{}",
+            tag.chars().take(6).collect::<String>(),
+            std::process::id()
+        ));
         let _ = fs::remove_dir_all(&home);
         fs::create_dir_all(home.join(".config/chrome-devtools")).unwrap();
         fs::create_dir_all(home.join(".cache/chrome-devtools/daemons")).unwrap();
@@ -69,22 +72,33 @@ impl TestEnv {
     }
 
     fn start_daemon(&mut self) {
+        let stderr_path = self.home.join("daemon.stderr");
+        let stderr = fs::File::create(&stderr_path).unwrap();
         let child = self
             .cli()
             .args(["daemon", "run", "--profile", "default"])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::from(stderr))
             .spawn()
             .unwrap();
         self.daemon = Some(child);
         let socket = self.socket_path();
         let started = Instant::now();
         while !socket.exists() {
-            assert!(
-                started.elapsed() < Duration::from_secs(10),
-                "daemon socket did not appear within 10s"
-            );
+            if started.elapsed() >= Duration::from_secs(10) {
+                let stderr = fs::read_to_string(&stderr_path).unwrap_or_default();
+                let status = self
+                    .daemon
+                    .as_mut()
+                    .and_then(|child| child.try_wait().ok().flatten())
+                    .map(|status| status.to_string())
+                    .unwrap_or_else(|| "running".to_string());
+                panic!(
+                    "daemon socket did not appear within 10s: socket={} status={status} stderr={stderr}",
+                    socket.display()
+                );
+            }
             thread::sleep(Duration::from_millis(100));
         }
     }
