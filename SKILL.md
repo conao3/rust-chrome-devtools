@@ -86,6 +86,10 @@ Replace any `args` value with `{ "$ref": "<label>.<path>" }` to substitute it wi
 
 A tool step is considered to have errored if the MCP response carries a non-null `error` field or the result has `isError: true`. By default, the scenario records the error and continues; pass `--fail-fast` (or `"on_error": "stop"` on a step) to abort. The runner still emits the partial results array and exits non-zero on aborts.
 
+When the batch fails before any step runs (e.g. `unknown session`), stdout still receives a JSON array of the shape `[{"type":"error","error":"..."}]`, so piping into `jq` keeps working; check the exit code to detect failure.
+
+Common tool argument mistake: `navigate_page` requires a `type` discriminator, e.g. `{"type":"url","url":"...","timeout":30000}` — a bare `{"url":"..."}` fails with "Either URL or a type is required".
+
 ### Other flags
 
 - `--script -` reads the scenario from stdin (useful with heredocs).
@@ -195,6 +199,8 @@ chrome-devtools profile stop --profile conao3
 
 - If `mcp call` or `mcp batch` exits with `unknown session`, the session expired (30 min idle) or the daemon restarted. Mint a new id via `session create` and retry.
 - If `mcp call` or `mcp batch` exits with `session in use`, another invocation is currently bound to that id. Wait for it to finish or mint a separate session for the new agent.
+- If a command exits with `daemon busy`, another client is holding the daemon. Retry shortly; the wait is bounded by `CHROME_DEVTOOLS_BIND_TIMEOUT_SECS` (default 120, for `mcp call` / `mcp batch` binds) and `CHROME_DEVTOOLS_CONTROL_TIMEOUT_SECS` (default 10, for `session` / `daemon status` / `mcp list`). Do not stop the daemon to recover; that destroys other agents' sessions.
+- File-writing tool arguments (`take_screenshot` `filePath` etc.) accept paths under your home directory and the OS tempdir.
 - If `fill` or `click` fails with a missing snapshot, check whether the daemon restarted between the snapshot and the action. Re-snapshot inside the same `mcp batch` scenario, or inside one `mcp call` invocation.
 - If the page is not the expected page, run an `evaluate_script` step that returns `window.location.href` and verify before acting.
 - If the profile's Chrome is not running, `mcp call` / `mcp batch` / `mcp list` will start it on first use.

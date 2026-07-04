@@ -149,8 +149,8 @@ fn main() {
 }
 
 fn run() -> Result<(), String> {
-    let mut args = env::args().skip(1);
-    let Some(object) = args.next() else {
+    let (positional, rest) = split_command_args(env::args().skip(1).collect());
+    let Some(object) = positional.first() else {
         print_usage();
         return Err("missing object".to_string());
     };
@@ -165,12 +165,10 @@ fn run() -> Result<(), String> {
     }
 
     let config = load_or_create_config()?;
-    let Some(action) = args.next() else {
+    let Some(action) = positional.get(1) else {
         print_usage();
         return Err(format!("missing action for object: {object}"));
     };
-
-    let rest = args.collect::<Vec<_>>();
 
     match (object.as_str(), action.as_str()) {
         ("mcp", "help" | "--help" | "-h") => {
@@ -316,6 +314,27 @@ fn run() -> Result<(), String> {
         }
         _ => Err(format!("unknown command: {object} {action}")),
     }
+}
+
+fn split_command_args(args: Vec<String>) -> (Vec<String>, Vec<String>) {
+    let mut positional = Vec::new();
+    let mut rest = Vec::new();
+    let mut iter = args.into_iter();
+    while let Some(arg) = iter.next() {
+        if positional.len() >= 2 {
+            rest.push(arg);
+            continue;
+        }
+        if matches!(arg.as_str(), "--profile" | "--session") {
+            rest.push(arg);
+            if let Some(value) = iter.next() {
+                rest.push(value);
+            }
+            continue;
+        }
+        positional.push(arg);
+    }
+    (positional, rest)
 }
 
 fn wants_help(args: &[String]) -> bool {
@@ -732,26 +751,43 @@ fn run_daemon(profile: &Profile) -> Result<(), String> {
         }
     });
 
+    let mut daemon_result = Ok(());
     for stream in listener.incoming() {
-        let mut stream =
-            stream.map_err(|error| format!("failed to accept daemon client: {error}"))?;
-        let should_stop =
-            handle_daemon_client(&mut stream, &mut mcp_stdin, &mut mcp_reader, &sessions)?;
-        if should_stop {
-            break;
+        let mut stream = match stream {
+            Ok(stream) => stream,
+            Err(error) => {
+                eprintln!("warning: failed to accept daemon client: {error}");
+                continue;
+            }
+        };
+        match handle_daemon_client(&mut stream, &mut mcp_stdin, &mut mcp_reader, &sessions) {
+            Ok(false) => {}
+            Ok(true) => break,
+            Err(DaemonError::Client(message)) => {
+                eprintln!("warning: daemon client connection failed: {message}");
+            }
+            Err(DaemonError::Fatal(message)) => {
+                daemon_result = Err(message);
+                break;
+            }
         }
-        if let Some(status) = mcp
-            .try_wait()
-            .map_err(|error| format!("failed to poll chrome-devtools-mcp: {error}"))?
-        {
-            return Err(format!("chrome-devtools-mcp exited with {status}"));
+        match mcp.try_wait() {
+            Ok(None) => {}
+            Ok(Some(status)) => {
+                daemon_result = Err(format!("chrome-devtools-mcp exited with {status}"));
+                break;
+            }
+            Err(error) => {
+                daemon_result = Err(format!("failed to poll chrome-devtools-mcp: {error}"));
+                break;
+            }
         }
     }
 
     terminate_child(&mut mcp);
     let _ = fs::remove_file(&socket_path);
     let _ = fs::remove_file(&pid_path);
-    Ok(())
+    daemon_result
 }
 
 fn initialize_daemon_mcp(
@@ -767,6 +803,12 @@ fn initialize_daemon_mcp(
         mcp_stdin,
         r#"{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}"#,
     )
+}
+
+#[derive(Debug)]
+enum DaemonError {
+    Client(String),
+    Fatal(String),
 }
 
 struct BoundSessionGuard<'a> {
@@ -795,20 +837,18 @@ fn handle_daemon_client(
     mcp_stdin: &mut impl Write,
     mcp_reader: &mut impl BufRead,
     sessions: &Arc<Mutex<SessionRegistry>>,
-) -> Result<bool, String> {
-    let mut client_reader = BufReader::new(
-        stream
-            .try_clone()
-            .map_err(|error| format!("failed to clone daemon client stream: {error}"))?,
-    );
+) -> Result<bool, DaemonError> {
+    let mut client_reader = BufReader::new(stream.try_clone().map_err(|error| {
+        DaemonError::Client(format!("failed to clone daemon client stream: {error}"))
+    })?);
     let mut line = String::new();
     let mut bound = BoundSessionGuard::new(sessions);
 
     loop {
         line.clear();
-        let bytes = client_reader
-            .read_line(&mut line)
-            .map_err(|error| format!("failed to read daemon client request: {error}"))?;
+        let bytes = client_reader.read_line(&mut line).map_err(|error| {
+            DaemonError::Client(format!("failed to read daemon client request: {error}"))
+        })?;
         if bytes == 0 {
             return Ok(false);
         }
@@ -834,7 +874,9 @@ fn handle_daemon_client(
                     .and_then(|_| stream.write_all(b"\n"))
                     .and_then(|_| stream.flush())
                     .map_err(|error| {
-                        format!("failed to write daemon initialize response: {error}")
+                        DaemonError::Client(format!(
+                            "failed to write daemon initialize response: {error}"
+                        ))
                     })?;
             }
             continue;
@@ -845,35 +887,25 @@ fn handle_daemon_client(
 
         let forwarded = sanitize_outgoing_request(line);
         let Some(pending_id) = extract_jsonrpc_id(&forwarded) else {
-            write_json_line(mcp_stdin, &forwarded)?;
+            write_json_line(mcp_stdin, &forwarded).map_err(DaemonError::Fatal)?;
             continue;
         };
 
-        write_json_line(mcp_stdin, &forwarded)?;
+        write_json_line(mcp_stdin, &forwarded).map_err(DaemonError::Fatal)?;
 
         loop {
-            let mut response_line = String::new();
-            let bytes = mcp_reader
-                .read_line(&mut response_line)
-                .map_err(|error| format!("failed to read MCP response: {error}"))?;
-            if bytes == 0 {
-                return Err("chrome-devtools-mcp closed stdout before responding".to_string());
-            }
-            let response_line = response_line.trim_end().to_string();
-            if json_has_method(&response_line, "roots/list") {
-                if let Some(id) = extract_jsonrpc_id(&response_line) {
-                    let response =
-                        format!(r#"{{"jsonrpc":"2.0","id":{id},"result":{{"roots":[]}}}}"#);
-                    write_json_line(mcp_stdin, &response)?;
-                }
-                continue;
-            }
+            let response_line = read_mcp_response_line(mcp_stdin, mcp_reader)?;
 
-            stream
+            let write_result = stream
                 .write_all(response_line.as_bytes())
                 .and_then(|_| stream.write_all(b"\n"))
-                .and_then(|_| stream.flush())
-                .map_err(|error| format!("failed to write daemon client response: {error}"))?;
+                .and_then(|_| stream.flush());
+            if let Err(error) = write_result {
+                drain_pending_mcp_response(mcp_stdin, mcp_reader, pending_id, &response_line)?;
+                return Err(DaemonError::Client(format!(
+                    "failed to write daemon client response: {error}"
+                )));
+            }
 
             if extract_jsonrpc_id(&response_line) == Some(pending_id) {
                 if let Some(id) = bound.id.as_ref() {
@@ -883,6 +915,48 @@ fn handle_daemon_client(
                 }
                 break;
             }
+        }
+    }
+}
+
+fn read_mcp_response_line(
+    mcp_stdin: &mut impl Write,
+    mcp_reader: &mut impl BufRead,
+) -> Result<String, DaemonError> {
+    loop {
+        let mut response_line = String::new();
+        let bytes = mcp_reader
+            .read_line(&mut response_line)
+            .map_err(|error| DaemonError::Fatal(format!("failed to read MCP response: {error}")))?;
+        if bytes == 0 {
+            return Err(DaemonError::Fatal(
+                "chrome-devtools-mcp closed stdout before responding".to_string(),
+            ));
+        }
+        let response_line = response_line.trim_end().to_string();
+        if json_has_method(&response_line, "roots/list") {
+            if let Some(id) = extract_jsonrpc_id(&response_line) {
+                write_json_line(mcp_stdin, &roots_list_response(id)).map_err(DaemonError::Fatal)?;
+            }
+            continue;
+        }
+        return Ok(response_line);
+    }
+}
+
+fn drain_pending_mcp_response(
+    mcp_stdin: &mut impl Write,
+    mcp_reader: &mut impl BufRead,
+    pending_id: u64,
+    already_read_line: &str,
+) -> Result<(), DaemonError> {
+    if extract_jsonrpc_id(already_read_line) == Some(pending_id) {
+        return Ok(());
+    }
+    loop {
+        let response_line = read_mcp_response_line(mcp_stdin, mcp_reader)?;
+        if extract_jsonrpc_id(&response_line) == Some(pending_id) {
+            return Ok(());
         }
     }
 }
@@ -898,7 +972,7 @@ fn handle_control_command(
     sessions: &Arc<Mutex<SessionRegistry>>,
     bound: &mut BoundSessionGuard,
     command: &str,
-) -> Result<ControlOutcome, String> {
+) -> Result<ControlOutcome, DaemonError> {
     let (head, rest) = match command.split_once(' ') {
         Some((head, rest)) => (head, rest.trim()),
         None => (command, ""),
@@ -913,29 +987,20 @@ fn handle_control_command(
             Ok(ControlOutcome::StopDaemon)
         }
         "session_create" => {
-            let state = sessions
-                .lock()
-                .map_err(|_| "session registry poisoned".to_string())?
-                .create();
+            let state = lock_sessions(sessions)?.create();
             write_control_line(stream, &format_session_line(&state))?;
             Ok(ControlOutcome::CloseConnection)
         }
         "session_list" => {
-            let snapshot = sessions
-                .lock()
-                .map_err(|_| "session registry poisoned".to_string())?
-                .list();
+            let snapshot = lock_sessions(sessions)?.list();
             for state in &snapshot {
                 write_control_line(stream, &format_session_line(state))?;
             }
             Ok(ControlOutcome::CloseConnection)
         }
         "session_close" => {
-            let id = parse_session_arg(rest)?;
-            let result = sessions
-                .lock()
-                .map_err(|_| "session registry poisoned".to_string())?
-                .close(&id);
+            let id = parse_session_arg(rest).map_err(DaemonError::Client)?;
+            let result = lock_sessions(sessions)?.close(&id);
             match result {
                 Ok(()) => write_control_line(stream, &format!("closed={id}"))?,
                 Err(message) => write_control_line(stream, &format!("error={message}"))?,
@@ -943,11 +1008,8 @@ fn handle_control_command(
             Ok(ControlOutcome::CloseConnection)
         }
         "bind" => {
-            let id = parse_session_arg(rest)?;
-            let result = sessions
-                .lock()
-                .map_err(|_| "session registry poisoned".to_string())?
-                .bind(&id);
+            let id = parse_session_arg(rest).map_err(DaemonError::Client)?;
+            let result = lock_sessions(sessions)?.bind(&id);
             match result {
                 Ok(()) => {
                     bound.id = Some(id.clone());
@@ -967,12 +1029,20 @@ fn handle_control_command(
     }
 }
 
-fn write_control_line(stream: &mut UnixStream, body: &str) -> Result<(), String> {
+fn lock_sessions<'a>(
+    sessions: &'a Arc<Mutex<SessionRegistry>>,
+) -> Result<std::sync::MutexGuard<'a, SessionRegistry>, DaemonError> {
+    sessions
+        .lock()
+        .map_err(|_| DaemonError::Fatal("session registry poisoned".to_string()))
+}
+
+fn write_control_line(stream: &mut UnixStream, body: &str) -> Result<(), DaemonError> {
     stream
         .write_all(body.as_bytes())
         .and_then(|_| stream.write_all(b"\n"))
         .and_then(|_| stream.flush())
-        .map_err(|error| format!("failed to write daemon response: {error}"))
+        .map_err(|error| DaemonError::Client(format!("failed to write daemon response: {error}")))
 }
 
 fn format_session_line(state: &SessionState) -> String {
@@ -1046,7 +1116,7 @@ fn call_daemon(profile: &Profile, session_id: &str) -> Result<(), String> {
         .map_err(|error| format!("failed to clone daemon stream: {error}"))?;
     let mut daemon_reader = BufReader::new(&mut read_stream);
 
-    bind_session(&mut stream, &mut daemon_reader, session_id)?;
+    bind_session(&mut stream, &mut daemon_reader, session_id, &profile.name)?;
 
     let stdin_to_daemon = thread::spawn(move || -> Result<(), String> {
         let mut stdin = std::io::stdin().lock();
@@ -1084,26 +1154,47 @@ fn bind_session(
     stream: &mut UnixStream,
     reader: &mut impl BufRead,
     session_id: &str,
+    profile_name: &str,
 ) -> Result<(), String> {
+    let timeout = bind_timeout();
+    let _ = stream.set_read_timeout(Some(timeout));
     let request = format!("__chrome_devtools_daemon__:bind session={session_id}\n");
     stream
         .write_all(request.as_bytes())
         .and_then(|_| stream.flush())
         .map_err(|error| format!("failed to send bind request: {error}"))?;
     let mut response = String::new();
-    let bytes = reader
-        .read_line(&mut response)
-        .map_err(|error| format!("failed to read bind response: {error}"))?;
+    let bytes = reader.read_line(&mut response).map_err(|error| {
+        if is_timeout_error(&error) {
+            format!(
+                "{DAEMON_BUSY_PREFIX}: bind not acknowledged within {}s; another client is bound to the daemon, retry shortly (raise CHROME_DEVTOOLS_BIND_TIMEOUT_SECS to wait longer)",
+                timeout.as_secs()
+            )
+        } else {
+            format!("failed to read bind response: {error}")
+        }
+    })?;
     if bytes == 0 {
         return Err("daemon closed connection before bind response".to_string());
     }
     let response = response.trim_end();
     if let Some(message) = response.strip_prefix("error=") {
+        if message.starts_with("unknown session") {
+            return Err(format!(
+                "{message}; sessions are dropped after 30 minutes idle or when the daemon restarts, mint a new one: chrome-devtools session create --profile {profile_name}"
+            ));
+        }
+        if message.starts_with("session in use") {
+            return Err(format!(
+                "{message}; another invocation is bound to this session, wait for it or mint a separate one: chrome-devtools session create --profile {profile_name}"
+            ));
+        }
         return Err(message.to_string());
     }
     if !response.starts_with("bound=") {
         return Err(format!("unexpected bind response: {response}"));
     }
+    let _ = stream.set_read_timeout(None);
     Ok(())
 }
 
@@ -1115,8 +1206,41 @@ struct BatchOptions {
     fail_fast: bool,
 }
 
+const STEP_SHAPE_HINT: &str =
+    r#"{"type":"tool","name":"<mcp-tool>","args":{...}} or {"type":"sleep_ms","ms":<u64>}"#;
+
+enum BatchOutcome {
+    Completed,
+    StoppedOnError(String),
+}
+
 fn run_batch(config: &Config, args: &[String]) -> Result<(), String> {
     let options = parse_batch_args(args)?;
+    match execute_batch(config, &options) {
+        Ok(BatchOutcome::Completed) => Ok(()),
+        Ok(BatchOutcome::StoppedOnError(label)) => {
+            Err(format!("scenario stopped on error at step: {label}"))
+        }
+        Err(error) => {
+            let results = serde_json::json!([{ "type": "error", "error": error }]);
+            let output =
+                serde_json::to_string_pretty(&results).unwrap_or_else(|_| "[]".to_string());
+            let _ = write_batch_output(&options.output_path, &output);
+            Err(error)
+        }
+    }
+}
+
+fn write_batch_output(output_path: &Option<String>, output: &str) -> Result<(), String> {
+    if let Some(path) = output_path {
+        fs::write(path, output).map_err(|error| format!("failed to write {path}: {error}"))
+    } else {
+        println!("{output}");
+        Ok(())
+    }
+}
+
+fn execute_batch(config: &Config, options: &BatchOptions) -> Result<BatchOutcome, String> {
     let profile = find_profile(config, &options.profile_name)?;
     let script_content = read_script_source(&options.script_path)?;
     let steps_value: serde_json::Value = serde_json::from_str(&script_content)
@@ -1134,7 +1258,7 @@ fn run_batch(config: &Config, args: &[String]) -> Result<(), String> {
         .map_err(|error| format!("failed to clone daemon stream: {error}"))?;
     let mut reader = BufReader::new(&mut read_stream);
 
-    bind_session(&mut stream, &mut reader, &options.session_id)?;
+    bind_session(&mut stream, &mut reader, &options.session_id, &profile.name)?;
 
     write_json_line(
         &mut stream,
@@ -1154,7 +1278,7 @@ fn run_batch(config: &Config, args: &[String]) -> Result<(), String> {
         let step_type = step
             .get("type")
             .and_then(|value| value.as_str())
-            .ok_or_else(|| "step missing 'type'".to_string())?;
+            .ok_or_else(|| format!("step missing 'type': expected {STEP_SHAPE_HINT}"))?;
         let label = step.get("label").cloned();
         let on_error = step
             .get("on_error")
@@ -1184,7 +1308,10 @@ fn run_batch(config: &Config, args: &[String]) -> Result<(), String> {
                 let name = step
                     .get("name")
                     .and_then(|value| value.as_str())
-                    .ok_or_else(|| "tool requires 'name'".to_string())?;
+                    .ok_or_else(|| {
+                        "tool step requires 'name' (the MCP tool name, e.g. take_snapshot)"
+                            .to_string()
+                    })?;
                 let raw_arguments = step
                     .get("args")
                     .cloned()
@@ -1231,7 +1358,11 @@ fn run_batch(config: &Config, args: &[String]) -> Result<(), String> {
                     break;
                 }
             }
-            other => return Err(format!("unknown step type: {other}")),
+            other => {
+                return Err(format!(
+                    "unknown step type: {other}: expected {STEP_SHAPE_HINT}"
+                ))
+            }
         }
     }
 
@@ -1239,16 +1370,12 @@ fn run_batch(config: &Config, args: &[String]) -> Result<(), String> {
 
     let output = serde_json::to_string_pretty(&serde_json::Value::Array(results))
         .map_err(|error| format!("failed to serialize results: {error}"))?;
-    if let Some(path) = &options.output_path {
-        fs::write(path, &output).map_err(|error| format!("failed to write {path}: {error}"))?;
-    } else {
-        println!("{output}");
-    }
+    write_batch_output(&options.output_path, &output)?;
 
-    if let Some(label) = stopped_on_error {
-        return Err(format!("scenario stopped on error at step: {label}"));
+    match stopped_on_error {
+        Some(label) => Ok(BatchOutcome::StoppedOnError(label)),
+        None => Ok(BatchOutcome::Completed),
     }
-    Ok(())
 }
 
 fn read_script_source(path: &str) -> Result<String, String> {
@@ -1318,8 +1445,6 @@ fn parse_batch_args(args: &[String]) -> Result<BatchOptions, String> {
         fail_fast,
     })
 }
-
-/// Recursively resolve `{ "$ref": "<label>.<path>..." }` markers using `results`.
 /// `path` segments are dot-separated; numeric segments index into arrays.
 fn resolve_refs(
     value: serde_json::Value,
@@ -1385,7 +1510,17 @@ fn find_profile(config: &Config, name: &str) -> Result<Profile, String> {
         .iter()
         .find(|profile| profile.name == name)
         .cloned()
-        .ok_or_else(|| format!("unknown profile: {name}"))
+        .ok_or_else(|| {
+            let available = config
+                .profiles
+                .iter()
+                .map(|profile| profile.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "unknown profile: {name}; available: {available} (defined in ~/{CONFIG_RELATIVE_PATH})"
+            )
+        })
 }
 
 fn list_mcp_tools_via_daemon(profile: &Profile) -> Result<(), String> {
@@ -1440,6 +1575,7 @@ fn is_daemon_ready(profile: &Profile) -> Result<bool, String> {
     }
     match send_daemon_control(profile, "status") {
         Ok(response) => Ok(response.contains("daemon=ready")),
+        Err(error) if error.starts_with(DAEMON_BUSY_PREFIX) => Ok(true),
         Err(_) => Ok(false),
     }
 }
@@ -1497,6 +1633,31 @@ fn wait_for_daemon_stop(profile: &Profile, timeout: Duration) -> Result<(), Stri
     ))
 }
 
+const DAEMON_BUSY_PREFIX: &str = "daemon busy";
+
+fn control_timeout() -> Duration {
+    timeout_from_env("CHROME_DEVTOOLS_CONTROL_TIMEOUT_SECS", 10)
+}
+
+fn bind_timeout() -> Duration {
+    timeout_from_env("CHROME_DEVTOOLS_BIND_TIMEOUT_SECS", 120)
+}
+
+fn timeout_from_env(variable: &str, default_secs: u64) -> Duration {
+    env::var(variable)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or_else(|| Duration::from_secs(default_secs))
+}
+
+fn is_timeout_error(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    )
+}
+
 fn send_daemon_control(profile: &Profile, command: &str) -> Result<String, String> {
     send_daemon_request(profile, &format!("__chrome_devtools_daemon__:{command}\n"))
 }
@@ -1505,15 +1666,21 @@ fn send_daemon_request(profile: &Profile, request: &str) -> Result<String, Strin
     let socket_path = daemon_socket_path(profile)?;
     let mut stream = UnixStream::connect(&socket_path)
         .map_err(|error| format!("failed to connect {}: {error}", socket_path.display()))?;
+    let timeout = control_timeout();
+    let _ = stream.set_read_timeout(Some(timeout));
     stream
         .write_all(request.as_bytes())
         .and_then(|_| stream.shutdown(Shutdown::Write))
         .map_err(|error| format!("failed to send daemon request: {error}"))?;
     let mut response = String::new();
-    stream
-        .read_to_string(&mut response)
-        .map_err(|error| format!("failed to read daemon response: {error}"))?;
-    Ok(response)
+    match stream.read_to_string(&mut response) {
+        Ok(_) => Ok(response),
+        Err(error) if is_timeout_error(&error) => Err(format!(
+            "{DAEMON_BUSY_PREFIX}: no response within {}s; another client is likely using the daemon, retry shortly (raise CHROME_DEVTOOLS_CONTROL_TIMEOUT_SECS to wait longer)",
+            timeout.as_secs()
+        )),
+        Err(error) => Err(format!("failed to read daemon response: {error}")),
+    }
 }
 
 fn read_pid_file(path: &Path) -> Option<u32> {
@@ -1564,12 +1731,7 @@ fn require_profile(config: &Config, args: &[String]) -> Result<Profile, String> 
         return Err("--profile is required".to_string());
     };
 
-    config
-        .profiles
-        .iter()
-        .find(|profile| profile.name == profile_name)
-        .cloned()
-        .ok_or_else(|| format!("unknown profile: {profile_name}"))
+    find_profile(config, profile_name)
 }
 
 fn require_profile_and_session(
@@ -1602,12 +1764,7 @@ fn require_profile_and_session(
 
     let profile_name = profile_name.ok_or_else(|| "--profile is required".to_string())?;
     let session_id = session_id.ok_or_else(|| "--session is required".to_string())?;
-    let profile = config
-        .profiles
-        .iter()
-        .find(|profile| profile.name == profile_name)
-        .cloned()
-        .ok_or_else(|| format!("unknown profile: {profile_name}"))?;
+    let profile = find_profile(config, &profile_name)?;
     Ok((profile, session_id))
 }
 
@@ -1791,8 +1948,7 @@ fn read_response(
         let line = line.trim_end().to_string();
         if json_has_method(&line, "roots/list") {
             if let Some(id) = extract_jsonrpc_id(&line) {
-                let response = format!(r#"{{"jsonrpc":"2.0","id":{id},"result":{{"roots":[]}}}}"#);
-                write_json_line(stdin, &response)?;
+                write_json_line(stdin, &roots_list_response(id))?;
             }
             continue;
         }
@@ -1801,6 +1957,13 @@ fn read_response(
             return Ok(line);
         }
     }
+}
+
+fn roots_list_response(id: u64) -> String {
+    let home = env::var("HOME").unwrap_or_default();
+    format!(
+        r#"{{"jsonrpc":"2.0","id":{id},"result":{{"roots":[{{"uri":"file://{home}","name":"home"}}]}}}}"#
+    )
 }
 
 fn daemon_initialize_response(id: u64) -> String {
@@ -2020,7 +2183,7 @@ fn expand_home(path: &str) -> Result<PathBuf, String> {
 
 fn print_usage() {
     eprintln!(
-        "Usage:\n  chrome-devtools --version\n  chrome-devtools mcp list --profile <profile>\n  chrome-devtools mcp call --profile <profile> --session <id>\n  chrome-devtools mcp batch --profile <profile> --session <id> --script <path>\n  chrome-devtools mcp direct-list --profile <profile>\n  chrome-devtools mcp direct-call --profile <profile>\n  chrome-devtools mcp help\n  chrome-devtools session create --profile <profile>\n  chrome-devtools session list --profile <profile>\n  chrome-devtools session close --profile <profile> --session <id>\n  chrome-devtools daemon start --profile <profile>\n  chrome-devtools daemon status --profile <profile>\n  chrome-devtools daemon stop --profile <profile>\n  chrome-devtools profile status --profile <profile>\n  chrome-devtools profile stop --profile <profile>\n  chrome-devtools profile list\n\nConfig:\n  ~/.config/chrome-devtools/config.toml is created on startup if missing.\n\nConcurrency:\n  MCP commands take a per-profile lock under ~/.cache/chrome-devtools/locks.\n  Set CHROME_DEVTOOLS_LOCK_TIMEOUT_SECS to override the default 300 second wait."
+        "Usage:\n  chrome-devtools --version\n  chrome-devtools mcp list --profile <profile>\n  chrome-devtools mcp call --profile <profile> --session <id>\n  chrome-devtools mcp batch --profile <profile> --session <id> --script <path>\n  chrome-devtools mcp direct-list --profile <profile>\n  chrome-devtools mcp direct-call --profile <profile>\n  chrome-devtools mcp help\n  chrome-devtools session create --profile <profile>\n  chrome-devtools session list --profile <profile>\n  chrome-devtools session close --profile <profile> --session <id>\n  chrome-devtools daemon start --profile <profile>\n  chrome-devtools daemon status --profile <profile>\n  chrome-devtools daemon stop --profile <profile>\n  chrome-devtools profile status --profile <profile>\n  chrome-devtools profile stop --profile <profile>\n  chrome-devtools profile list\n\nConfig:\n  ~/.config/chrome-devtools/config.toml is created on startup if missing.\n\nConcurrency:\n  MCP commands take a per-profile lock under ~/.cache/chrome-devtools/locks.\n  Set CHROME_DEVTOOLS_LOCK_TIMEOUT_SECS to override the default 300 second wait.\n  When the daemon is held by another client, commands fail with 'daemon busy'\n  after CHROME_DEVTOOLS_BIND_TIMEOUT_SECS (default 120, call/batch bind) or\n  CHROME_DEVTOOLS_CONTROL_TIMEOUT_SECS (default 10, session/status commands)."
     );
 }
 
@@ -2615,5 +2778,140 @@ mod tests {
     fn sanitize_outgoing_request_passes_through_invalid_json() {
         let input = "not json";
         assert_eq!(sanitize_outgoing_request(input), input);
+    }
+
+    #[test]
+    fn split_command_args_accepts_leading_global_flags() {
+        let (positional, rest) =
+            split_command_args(args(&["--profile", "conao3", "session", "list"]));
+        assert_eq!(positional, args(&["session", "list"]));
+        assert_eq!(rest, args(&["--profile", "conao3"]));
+    }
+
+    #[test]
+    fn split_command_args_accepts_flags_between_object_and_action() {
+        let (positional, rest) = split_command_args(args(&[
+            "mcp",
+            "--profile",
+            "x",
+            "--session",
+            "sess-1",
+            "batch",
+            "--script",
+            "/tmp/a.json",
+        ]));
+        assert_eq!(positional, args(&["mcp", "batch"]));
+        assert_eq!(
+            rest,
+            args(&[
+                "--profile",
+                "x",
+                "--session",
+                "sess-1",
+                "--script",
+                "/tmp/a.json"
+            ])
+        );
+    }
+
+    #[test]
+    fn split_command_args_keeps_plain_invocation_unchanged() {
+        let (positional, rest) = split_command_args(args(&[
+            "session",
+            "close",
+            "--profile",
+            "x",
+            "--session",
+            "sess-1",
+        ]));
+        assert_eq!(positional, args(&["session", "close"]));
+        assert_eq!(rest, args(&["--profile", "x", "--session", "sess-1"]));
+    }
+
+    #[test]
+    fn find_profile_error_lists_available_profiles() {
+        let error = find_profile(&dummy_config(), "missing").unwrap_err();
+        assert!(error.contains("unknown profile: missing"));
+        assert!(error.contains("available: default"));
+    }
+
+    #[test]
+    fn roots_list_response_exposes_home_root() {
+        let response = roots_list_response(3);
+        assert!(response.contains("\"id\":3"));
+        assert!(response.contains("\"roots\":[{\"uri\":\"file://"));
+        let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(value["result"]["roots"][0]["name"], "home");
+    }
+
+    #[test]
+    fn timeout_from_env_parses_override_and_falls_back() {
+        env::remove_var("CHROME_DEVTOOLS_TEST_TIMEOUT_SECS");
+        assert_eq!(
+            timeout_from_env("CHROME_DEVTOOLS_TEST_TIMEOUT_SECS", 42),
+            Duration::from_secs(42)
+        );
+        env::set_var("CHROME_DEVTOOLS_TEST_TIMEOUT_SECS", "7");
+        assert_eq!(
+            timeout_from_env("CHROME_DEVTOOLS_TEST_TIMEOUT_SECS", 42),
+            Duration::from_secs(7)
+        );
+        env::set_var("CHROME_DEVTOOLS_TEST_TIMEOUT_SECS", "abc");
+        assert_eq!(
+            timeout_from_env("CHROME_DEVTOOLS_TEST_TIMEOUT_SECS", 42),
+            Duration::from_secs(42)
+        );
+        env::remove_var("CHROME_DEVTOOLS_TEST_TIMEOUT_SECS");
+    }
+
+    #[test]
+    fn read_mcp_response_line_answers_roots_list_inline() {
+        let input = concat!(
+            r#"{"jsonrpc":"2.0","id":9,"method":"roots/list"}"#,
+            "\n",
+            r#"{"jsonrpc":"2.0","id":5,"result":{}}"#,
+            "\n",
+        );
+        let mut reader = std::io::Cursor::new(input);
+        let mut written: Vec<u8> = Vec::new();
+        let line = read_mcp_response_line(&mut written, &mut reader).unwrap();
+        assert_eq!(line, r#"{"jsonrpc":"2.0","id":5,"result":{}}"#);
+        let sent = String::from_utf8(written).unwrap();
+        assert!(sent.contains("\"id\":9"));
+        assert!(sent.contains("\"roots\""));
+    }
+
+    #[test]
+    fn read_mcp_response_line_fails_fatal_on_closed_stdout() {
+        let mut reader = std::io::Cursor::new("");
+        let mut written: Vec<u8> = Vec::new();
+        let error = read_mcp_response_line(&mut written, &mut reader).unwrap_err();
+        assert!(matches!(error, DaemonError::Fatal(_)));
+    }
+
+    #[test]
+    fn drain_pending_mcp_response_consumes_until_pending_id() {
+        let input = concat!(
+            r#"{"jsonrpc":"2.0","method":"notifications/progress"}"#,
+            "\n",
+            r#"{"jsonrpc":"2.0","id":7,"result":{"content":[]}}"#,
+            "\n",
+            r#"{"jsonrpc":"2.0","id":8,"result":{}}"#,
+            "\n",
+        );
+        let mut reader = std::io::Cursor::new(input);
+        let mut written: Vec<u8> = Vec::new();
+        drain_pending_mcp_response(&mut written, &mut reader, 7, "junk").unwrap();
+        let mut remaining = String::new();
+        reader.read_line(&mut remaining).unwrap();
+        assert!(remaining.contains("\"id\":8"));
+    }
+
+    #[test]
+    fn drain_pending_mcp_response_skips_read_when_already_consumed() {
+        let mut reader = std::io::Cursor::new("");
+        let mut written: Vec<u8> = Vec::new();
+        drain_pending_mcp_response(&mut written, &mut reader, 7, r#"{"id":7,"result":{}}"#)
+            .unwrap();
     }
 }
