@@ -1,6 +1,6 @@
 [package]
 name = "chrome-devtools"
-version = "0.2.6"
+version = "0.3.0"
 edition = "2021"
 description = "Profile-aware CLI for running Chrome DevTools MCP with isolated Chrome user data directories"
 license = "Apache-2.0"
