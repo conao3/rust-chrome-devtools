@@ -21,6 +21,16 @@ Use `chrome-devtools` when you need browser automation through Chrome DevTools M
 - Take a fresh snapshot before using `click`, `fill`, or other uid-based actions if the page may have changed.
 - Do not start or kill the user's regular Chrome unless explicitly asked.
 - If a browser login is required, open the page and ask the user to complete the login manually.
+- The daemon and its Chrome are shared with other agents. `daemon stop` refuses while sessions are active and `profile stop` refuses while the daemon is running; only pass `--force` when the user explicitly asks to tear them down.
+
+## Tool Argument Notes
+
+- `navigate_page` requires a `type` discriminator: `{"type":"url","url":"...","timeout":30000}`. A bare `{"url":"..."}` fails with "Either URL or a type is required".
+- If a tool fails with "The selected page has been closed", start the batch with `list_pages` and open a fresh page via `new_page` (URL argument required) instead of relying on the previously selected page.
+- `fill` on a checkbox/toggle takes `value: "true"` / `"false"`. `click` and `fill` accept `includeSnapshot: true` to return a snapshot of the page right after the action.
+- `new_page`'s `isolatedContext` argument is stripped automatically (with a warning): isolated contexts are incognito-like and disable extensions. When you need a separate login state, add another profile to `~/.config/chrome-devtools/config.toml` instead.
+- File-writing arguments (`take_screenshot` `filePath` etc.) accept paths under the home directory and the OS tempdir.
+- `get_network_request --responseFilePath <path>` saves the body with a `.network-response` extension appended to the given path.
 
 ## Profile Setup
 
@@ -177,7 +187,16 @@ chrome-devtools mcp help
 chrome-devtools mcp batch --help
 ```
 
-Stop the profile daemon:
+Inspect daemon health (version, session count, whether the daemon-attached Chrome endpoint responds):
+
+```sh
+chrome-devtools daemon status --profile conao3
+# profile=conao3 daemon=ready version=0.3.1 sessions=1 chrome=ready port=46071 pid=... socket=...
+```
+
+`chrome=unreachable` means Chrome died or moved after the daemon attached to it; every tool call will fail until the daemon is restarted.
+
+Stop the profile daemon (refused while sessions are active; `--force` overrides):
 
 ```sh
 chrome-devtools daemon stop --profile conao3
@@ -189,7 +208,7 @@ Bypass the daemon only for manual fallback debugging (cannot preserve snapshot u
 chrome-devtools mcp direct-call --profile conao3
 ```
 
-Stop the Chrome instance owned by a profile:
+Stop the Chrome instance owned by a profile (refused while the profile daemon is running; `--force` overrides):
 
 ```sh
 chrome-devtools profile stop --profile conao3
@@ -201,6 +220,9 @@ chrome-devtools profile stop --profile conao3
 - If `mcp call` or `mcp batch` exits with `session in use`, another invocation is currently bound to that id. Wait for it to finish or mint a separate session for the new agent.
 - If a command exits with `daemon busy`, another client is holding the daemon. Retry shortly; the wait is bounded by `CHROME_DEVTOOLS_BIND_TIMEOUT_SECS` (default 120, for `mcp call` / `mcp batch` binds) and `CHROME_DEVTOOLS_CONTROL_TIMEOUT_SECS` (default 10, for `session` / `daemon status` / `mcp list`). Do not stop the daemon to recover; that destroys other agents' sessions.
 - File-writing tool arguments (`take_screenshot` `filePath` etc.) accept paths under your home directory and the OS tempdir.
+- If the CLI warns about a daemon version mismatch, the daemon predates the installed CLI. Behavior fixes in the daemon only apply after it restarts; `daemon stop` (without `--force`) is safe once `sessions=0`.
+- If `daemon status` shows `chrome=unreachable`, restart the daemon; it is attached to a Chrome endpoint that no longer answers.
+- The daemon runs `chrome-devtools-mcp` pinned to a fixed version; set `CHROME_DEVTOOLS_MCP_VERSION` (e.g. `latest`) before `daemon start` to override.
 - If `fill` or `click` fails with a missing snapshot, check whether the daemon restarted between the snapshot and the action. Re-snapshot inside the same `mcp batch` scenario, or inside one `mcp call` invocation.
 - If the page is not the expected page, run an `evaluate_script` step that returns `window.location.href` and verify before acting.
 - If the profile's Chrome is not running, `mcp call` / `mcp batch` / `mcp list` will start it on first use.

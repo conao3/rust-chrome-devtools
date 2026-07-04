@@ -268,8 +268,9 @@ fn run() -> Result<(), String> {
                 print_profile_stop_help();
                 return Ok(());
             }
+            let (force, rest) = extract_flag(&rest, "--force");
             let profile = require_profile(&config, &rest)?;
-            stop_profile(&profile)
+            stop_profile(&profile, force)
         }
         ("profile", "list") => {
             if wants_help(&rest) {
@@ -309,11 +310,18 @@ fn run() -> Result<(), String> {
                 print_daemon_stop_help();
                 return Ok(());
             }
+            let (force, rest) = extract_flag(&rest, "--force");
             let profile = require_profile(&config, &rest)?;
-            stop_daemon(&profile)
+            stop_daemon(&profile, force)
         }
         _ => Err(format!("unknown command: {object} {action}")),
     }
+}
+
+fn extract_flag(args: &[String], flag: &str) -> (bool, Vec<String>) {
+    let found = args.iter().any(|arg| arg == flag);
+    let remaining = args.iter().filter(|arg| *arg != flag).cloned().collect();
+    (found, remaining)
 }
 
 fn split_command_args(args: Vec<String>) -> (Vec<String>, Vec<String>) {
@@ -579,8 +587,18 @@ fn parse_lock_pid(content: &str) -> Option<u32> {
     })
 }
 
+#[cfg(target_os = "linux")]
 fn process_exists(pid: u32) -> bool {
     PathBuf::from(format!("/proc/{pid}")).exists()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_exists(pid: u32) -> bool {
+    match Command::new("kill").args(["-0", &pid.to_string()]).output() {
+        Ok(output) if output.status.success() => true,
+        Ok(output) => !String::from_utf8_lossy(&output.stderr).contains("No such process"),
+        Err(_) => true,
+    }
 }
 
 fn safe_lock_name(name: &str) -> String {
@@ -719,7 +737,15 @@ fn run_daemon(profile: &Profile) -> Result<(), String> {
     }
 
     ensure_chrome(profile)?;
-    let mut mcp = mcp_command(profile)
+    let mcp_port = current_port(profile)
+        .ok_or_else(|| "runtime port is missing after ensure_chrome".to_string())?;
+    let mut command = mcp_command(profile);
+    eprintln!(
+        "chrome-devtools {} daemon starting MCP: {:?}",
+        env!("CARGO_PKG_VERSION"),
+        command
+    );
+    let mut mcp = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -760,7 +786,13 @@ fn run_daemon(profile: &Profile) -> Result<(), String> {
                 continue;
             }
         };
-        match handle_daemon_client(&mut stream, &mut mcp_stdin, &mut mcp_reader, &sessions) {
+        match handle_daemon_client(
+            &mut stream,
+            &mut mcp_stdin,
+            &mut mcp_reader,
+            &sessions,
+            mcp_port,
+        ) {
             Ok(false) => {}
             Ok(true) => break,
             Err(DaemonError::Client(message)) => {
@@ -837,6 +869,7 @@ fn handle_daemon_client(
     mcp_stdin: &mut impl Write,
     mcp_reader: &mut impl BufRead,
     sessions: &Arc<Mutex<SessionRegistry>>,
+    mcp_port: u16,
 ) -> Result<bool, DaemonError> {
     let mut client_reader = BufReader::new(stream.try_clone().map_err(|error| {
         DaemonError::Client(format!("failed to clone daemon client stream: {error}"))
@@ -859,7 +892,7 @@ fn handle_daemon_client(
         }
 
         if let Some(command) = line.strip_prefix("__chrome_devtools_daemon__:") {
-            match handle_control_command(stream, sessions, &mut bound, command)? {
+            match handle_control_command(stream, sessions, &mut bound, command, mcp_port)? {
                 ControlOutcome::Continue => continue,
                 ControlOutcome::CloseConnection => return Ok(false),
                 ControlOutcome::StopDaemon => return Ok(true),
@@ -972,6 +1005,7 @@ fn handle_control_command(
     sessions: &Arc<Mutex<SessionRegistry>>,
     bound: &mut BoundSessionGuard,
     command: &str,
+    mcp_port: u16,
 ) -> Result<ControlOutcome, DaemonError> {
     let (head, rest) = match command.split_once(' ') {
         Some((head, rest)) => (head, rest.trim()),
@@ -979,10 +1013,29 @@ fn handle_control_command(
     };
     match head {
         "status" => {
-            write_control_line(stream, "daemon=ready")?;
+            let count = lock_sessions(sessions)?.list().len();
+            write_control_line(
+                stream,
+                &format!(
+                    "daemon=ready version={} sessions={count} mcp_port={mcp_port}",
+                    env!("CARGO_PKG_VERSION")
+                ),
+            )?;
             Ok(ControlOutcome::CloseConnection)
         }
         "stop" => {
+            if rest != "force" {
+                let count = lock_sessions(sessions)?.list().len();
+                if count > 0 {
+                    write_control_line(
+                        stream,
+                        &format!(
+                            "error={count} active session(s); other agents may be using this daemon, pass --force to stop anyway"
+                        ),
+                    )?;
+                    return Ok(ControlOutcome::CloseConnection);
+                }
+            }
             write_control_line(stream, "daemon=stopping")?;
             Ok(ControlOutcome::StopDaemon)
         }
@@ -1547,11 +1600,40 @@ fn list_mcp_tools_via_daemon(profile: &Profile) -> Result<(), String> {
 }
 
 fn ensure_daemon(profile: &Profile) -> Result<(), String> {
-    if is_daemon_ready(profile)? {
-        ensure_chrome(profile)?;
-        return Ok(());
+    if daemon_socket_path(profile)?.exists() {
+        match send_daemon_control(profile, "status") {
+            Ok(response) if response.contains("daemon=ready") => {
+                warn_on_version_mismatch(profile, &response);
+                ensure_chrome(profile)?;
+                return Ok(());
+            }
+            Err(error) if error.starts_with(DAEMON_BUSY_PREFIX) => return Ok(()),
+            _ => {}
+        }
     }
     start_daemon(profile, true)
+}
+
+fn warn_on_version_mismatch(profile: &Profile, status_response: &str) {
+    let daemon_version = parse_status_field(status_response, "version=");
+    let cli_version = env!("CARGO_PKG_VERSION");
+    match daemon_version {
+        Some(version) if version == cli_version => {}
+        Some(version) => eprintln!(
+            "warning: daemon for profile {} runs chrome-devtools {version} but this CLI is {cli_version}; restart it when idle: chrome-devtools daemon stop --profile {}",
+            profile.name, profile.name
+        ),
+        None => eprintln!(
+            "warning: daemon for profile {} was started by an older chrome-devtools than this CLI ({cli_version}); restart it when idle: chrome-devtools daemon stop --profile {}",
+            profile.name, profile.name
+        ),
+    }
+}
+
+fn parse_status_field<'a>(response: &'a str, prefix: &str) -> Option<&'a str> {
+    response
+        .split_whitespace()
+        .find_map(|part| part.strip_prefix(prefix))
 }
 
 fn wait_for_daemon(profile: &Profile, timeout: Duration) -> Result<(), String> {
@@ -1583,23 +1665,50 @@ fn is_daemon_ready(profile: &Profile) -> Result<bool, String> {
 fn print_daemon_status(profile: &Profile) -> Result<(), String> {
     let socket_path = daemon_socket_path(profile)?;
     let pid_path = daemon_pid_path(profile)?;
-    let ready = is_daemon_ready(profile)?;
     let pid = read_pid_file(&pid_path)
         .map(|pid| pid.to_string())
         .unwrap_or_else(|| "unknown".to_string());
+
+    let status_response = if socket_path.exists() {
+        send_daemon_control(profile, "status").ok()
+    } else {
+        None
+    };
+    let Some(response) = status_response.filter(|response| response.contains("daemon=ready"))
+    else {
+        println!(
+            "profile={} daemon=stopped pid={} socket={}",
+            profile.name,
+            pid,
+            socket_path.display()
+        );
+        return Ok(());
+    };
+
+    let version = parse_status_field(&response, "version=").unwrap_or("pre-0.3.1");
+    let sessions = parse_status_field(&response, "sessions=").unwrap_or("unknown");
+    let chrome = match parse_status_field(&response, "mcp_port=")
+        .and_then(|port| port.parse::<u16>().ok())
+    {
+        Some(port) if is_devtools_ready(port) => format!("ready port={port}"),
+        Some(port) => format!("unreachable port={port} (restart the daemon to reattach Chrome)"),
+        None => "unknown".to_string(),
+    };
     println!(
-        "profile={} daemon={} pid={} socket={}",
+        "profile={} daemon=ready version={version} sessions={sessions} chrome={chrome} pid={pid} socket={}",
         profile.name,
-        if ready { "ready" } else { "stopped" },
-        pid,
         socket_path.display()
     );
     Ok(())
 }
 
-fn stop_daemon(profile: &Profile) -> Result<(), String> {
+fn stop_daemon(profile: &Profile, force: bool) -> Result<(), String> {
     if is_daemon_ready(profile)? {
-        let response = send_daemon_control(profile, "stop")?;
+        let command = if force { "stop force" } else { "stop" };
+        let response = send_daemon_control(profile, command)?;
+        if let Some(message) = response.trim_end().strip_prefix("error=") {
+            return Err(message.to_string());
+        }
         print!("{response}");
         wait_for_daemon_stop(profile, Duration::from_secs(5))?;
         return Ok(());
@@ -1695,10 +1804,8 @@ fn cleanup_stale_daemon_files(profile: &Profile) -> Result<(), String> {
         }
     }
     let socket_path = daemon_socket_path(profile)?;
-    let port_path = daemon_port_path(profile)?;
     let _ = fs::remove_file(socket_path);
     let _ = fs::remove_file(pid_path);
-    let _ = fs::remove_file(port_path);
     Ok(())
 }
 
@@ -1897,12 +2004,18 @@ fn list_mcp_tools(profile: &Profile) -> Result<(), String> {
     Ok(())
 }
 
+const DEFAULT_MCP_VERSION: &str = "1.5.0";
+
 fn mcp_command(profile: &Profile) -> Command {
     let mut command = if let Ok(program) = env::var("CHROME_DEVTOOLS_MCP_COMMAND") {
         Command::new(program)
     } else {
+        let version = env::var("CHROME_DEVTOOLS_MCP_VERSION")
+            .unwrap_or_else(|_| DEFAULT_MCP_VERSION.to_string());
         let mut command = Command::new("npx");
-        command.arg("-y").arg("chrome-devtools-mcp@latest");
+        command
+            .arg("-y")
+            .arg(format!("chrome-devtools-mcp@{version}"));
         command
     };
     let max_old_space_mb =
@@ -2011,29 +2124,22 @@ fn sanitize_outgoing_request(line: &str) -> String {
 }
 
 fn json_has_method(line: &str, method: &str) -> bool {
-    compact_json_line(line).contains(&format!(r#""method":"{method}""#))
-}
-
-fn compact_json_line(line: &str) -> String {
-    line.chars()
-        .filter(|character| !character.is_whitespace())
-        .collect()
+    serde_json::from_str::<serde_json::Value>(line)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("method")
+                .and_then(|found| found.as_str())
+                .map(|found| found == method)
+        })
+        .unwrap_or(false)
 }
 
 fn extract_jsonrpc_id(line: &str) -> Option<u64> {
-    let compact = compact_json_line(line);
-    let marker = r#""id":"#;
-    let start = compact.find(marker)? + marker.len();
-    let rest = &compact[start..];
-    let digits = rest
-        .chars()
-        .take_while(|character| character.is_ascii_digit())
-        .collect::<String>();
-    if digits.is_empty() {
-        None
-    } else {
-        digits.parse().ok()
-    }
+    serde_json::from_str::<serde_json::Value>(line)
+        .ok()?
+        .get("id")?
+        .as_u64()
 }
 
 fn terminate_child(child: &mut Child) {
@@ -2108,7 +2214,13 @@ fn extract_remote_debugging_port(cmdline: &str) -> Option<u16> {
     rest[..end].parse().ok()
 }
 
-fn stop_profile(profile: &Profile) -> Result<(), String> {
+fn stop_profile(profile: &Profile, force: bool) -> Result<(), String> {
+    if !force && is_daemon_ready(profile)? {
+        return Err(format!(
+            "daemon for profile {} is running and other agents may be using it; stopping Chrome would break their sessions. run 'chrome-devtools daemon stop --profile {}' first, or pass --force",
+            profile.name, profile.name
+        ));
+    }
     let user_data_dir = expand_home(&profile.user_data_dir)?;
     let pattern = format!("--user-data-dir={}", user_data_dir.display());
 
@@ -2247,7 +2359,7 @@ fn print_profile_status_help() {
 
 fn print_profile_stop_help() {
     println!(
-        "chrome-devtools profile stop\n\nUsage:\n  chrome-devtools profile stop --profile <profile>\n\nDescription:\n  Stop the Chrome instance bound to the given profile by matching processes\n  whose command line contains --user-data-dir=<profile user_data_dir>.\n\nOptions:\n  --profile <name>  Required. Profile name from ~/.config/chrome-devtools/config.toml.\n  -h, --help        Show this help and exit."
+        "chrome-devtools profile stop\n\nUsage:\n  chrome-devtools profile stop --profile <profile> [--force]\n\nDescription:\n  Stop the Chrome instance bound to the given profile by matching processes\n  whose command line contains --user-data-dir=<profile user_data_dir>.\n  Refused while the profile daemon is running, because other agents may be\n  driving that Chrome through it; stop the daemon first or pass --force.\n\nOptions:\n  --profile <name>  Required. Profile name from ~/.config/chrome-devtools/config.toml.\n  --force           Stop Chrome even while the profile daemon is running.\n  -h, --help        Show this help and exit."
     );
 }
 
@@ -2271,13 +2383,13 @@ fn print_daemon_run_help() {
 
 fn print_daemon_status_help() {
     println!(
-        "chrome-devtools daemon status\n\nUsage:\n  chrome-devtools daemon status --profile <profile>\n\nDescription:\n  Print whether the per-profile daemon is ready or stopped, with its pid and\n  Unix socket path.\n\nOptions:\n  --profile <name>  Required. Profile name from ~/.config/chrome-devtools/config.toml.\n  -h, --help        Show this help and exit."
+        "chrome-devtools daemon status\n\nUsage:\n  chrome-devtools daemon status --profile <profile>\n\nDescription:\n  Print whether the per-profile daemon is ready or stopped. Ready output:\n\n    profile=<p> daemon=ready version=<v> sessions=<n> chrome=<state> pid=<pid> socket=<path>\n\n  chrome=ready means the DevTools endpoint the daemon's MCP is attached to\n  responds; chrome=unreachable means every tool call will fail until the\n  daemon is restarted.\n\nOptions:\n  --profile <name>  Required. Profile name from ~/.config/chrome-devtools/config.toml.\n  -h, --help        Show this help and exit."
     );
 }
 
 fn print_daemon_stop_help() {
     println!(
-        "chrome-devtools daemon stop\n\nUsage:\n  chrome-devtools daemon stop --profile <profile>\n\nDescription:\n  Ask the per-profile daemon to stop and clean up its socket and pid files.\n  If the daemon is unreachable but a pid file exists, fall back to sending it\n  a TERM signal via kill.\n\nOptions:\n  --profile <name>  Required. Profile name from ~/.config/chrome-devtools/config.toml.\n  -h, --help        Show this help and exit."
+        "chrome-devtools daemon stop\n\nUsage:\n  chrome-devtools daemon stop --profile <profile> [--force]\n\nDescription:\n  Ask the per-profile daemon to stop and clean up its socket and pid files.\n  Refused while sessions are active, because other agents may own them;\n  pass --force to stop anyway (their sessions are destroyed).\n  If the daemon is unreachable but a pid file exists, fall back to sending it\n  a TERM signal via kill.\n\nOptions:\n  --profile <name>  Required. Profile name from ~/.config/chrome-devtools/config.toml.\n  --force           Stop even while sessions are active.\n  -h, --help        Show this help and exit."
     );
 }
 
@@ -2422,8 +2534,27 @@ mod tests {
     }
 
     #[test]
-    fn compact_json_line_strips_whitespace() {
-        assert_eq!(compact_json_line(" { \"id\" : 1 } "), "{\"id\":1}");
+    fn extract_jsonrpc_id_ignores_nested_id() {
+        assert_eq!(
+            extract_jsonrpc_id(
+                r#"{"jsonrpc":"2.0","method":"notifications/progress","params":{"id":5}}"#
+            ),
+            None
+        );
+        assert_eq!(
+            extract_jsonrpc_id(
+                r#"{"jsonrpc":"2.0","id":3,"result":{"content":[{"text":"\"id\":9"}]}}"#
+            ),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn json_has_method_ignores_method_in_string_values() {
+        assert!(!json_has_method(
+            r#"{"jsonrpc":"2.0","id":1,"result":{"text":"\"method\":\"roots/list\""}}"#,
+            "roots/list"
+        ));
     }
 
     #[test]
@@ -2905,6 +3036,34 @@ mod tests {
         let mut remaining = String::new();
         reader.read_line(&mut remaining).unwrap();
         assert!(remaining.contains("\"id\":8"));
+    }
+
+    #[test]
+    fn extract_flag_detects_and_removes_flag() {
+        let (found, rest) = extract_flag(&args(&["--profile", "x", "--force"]), "--force");
+        assert!(found);
+        assert_eq!(rest, args(&["--profile", "x"]));
+        let (found, rest) = extract_flag(&args(&["--profile", "x"]), "--force");
+        assert!(!found);
+        assert_eq!(rest, args(&["--profile", "x"]));
+    }
+
+    #[test]
+    fn parse_status_field_extracts_named_fields() {
+        let response = "daemon=ready version=0.3.1 sessions=2 mcp_port=46071";
+        assert_eq!(parse_status_field(response, "version="), Some("0.3.1"));
+        assert_eq!(parse_status_field(response, "sessions="), Some("2"));
+        assert_eq!(parse_status_field(response, "mcp_port="), Some("46071"));
+        assert_eq!(parse_status_field("daemon=ready", "version="), None);
+    }
+
+    #[test]
+    fn process_exists_detects_live_and_dead_processes() {
+        assert!(process_exists(std::process::id()));
+        let mut child = Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        assert!(!process_exists(pid));
     }
 
     #[test]
