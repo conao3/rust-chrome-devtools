@@ -633,6 +633,35 @@ fn daemon_port_path(profile: &Profile) -> Result<PathBuf, String> {
     Ok(daemon_dir()?.join(format!("{}.port", safe_lock_name(&profile.name))))
 }
 
+fn daemon_health_path(profile: &Profile) -> Result<PathBuf, String> {
+    Ok(daemon_dir()?.join(format!("{}.health", safe_lock_name(&profile.name))))
+}
+
+fn record_daemon_exit(profile: &Profile, result: &Result<(), String>) {
+    let Ok(path) = daemon_health_path(profile) else {
+        return;
+    };
+    let now = unix_secs(SystemTime::now());
+    let line = match result {
+        Ok(()) => format!("ts={now} exit=ok reason=stop\n"),
+        Err(reason) => format!("ts={now} exit=error reason={}\n", reason.replace('\n', " ")),
+    };
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = file.write_all(line.as_bytes());
+    }
+}
+
+fn read_daemon_health(profile: &Profile) -> Option<(String, usize)> {
+    let path = daemon_health_path(profile).ok()?;
+    let content = fs::read_to_string(path).ok()?;
+    let abnormal = content
+        .lines()
+        .filter(|line| line.contains("exit=error"))
+        .count();
+    let last = content.lines().last()?.to_string();
+    Some((last, abnormal))
+}
+
 fn read_runtime_port(profile: &Profile) -> Option<u16> {
     let path = daemon_port_path(profile).ok()?;
     let raw = fs::read_to_string(path).ok()?;
@@ -819,6 +848,7 @@ fn run_daemon(profile: &Profile) -> Result<(), String> {
     terminate_child(&mut mcp);
     let _ = fs::remove_file(&socket_path);
     let _ = fs::remove_file(&pid_path);
+    record_daemon_exit(profile, &daemon_result);
     daemon_result
 }
 
@@ -846,17 +876,31 @@ enum DaemonError {
 struct BoundSessionGuard<'a> {
     sessions: &'a Arc<Mutex<SessionRegistry>>,
     id: Option<String>,
+    bound_at: Instant,
 }
 
 impl<'a> BoundSessionGuard<'a> {
     fn new(sessions: &'a Arc<Mutex<SessionRegistry>>) -> Self {
-        Self { sessions, id: None }
+        Self {
+            sessions,
+            id: None,
+            bound_at: Instant::now(),
+        }
+    }
+
+    fn mark_bound(&mut self, id: String) {
+        self.id = Some(id);
+        self.bound_at = Instant::now();
     }
 }
 
 impl Drop for BoundSessionGuard<'_> {
     fn drop(&mut self) {
         if let Some(id) = self.id.take() {
+            eprintln!(
+                "bind session={id} held_ms={}",
+                self.bound_at.elapsed().as_millis()
+            );
             if let Ok(mut registry) = self.sessions.lock() {
                 registry.unbind(&id);
             }
@@ -1065,7 +1109,7 @@ fn handle_control_command(
             let result = lock_sessions(sessions)?.bind(&id);
             match result {
                 Ok(()) => {
-                    bound.id = Some(id.clone());
+                    bound.mark_bound(id.clone());
                     write_control_line(stream, &format!("bound={id}"))?;
                     Ok(ControlOutcome::Continue)
                 }
@@ -1674,10 +1718,14 @@ fn print_daemon_status(profile: &Profile) -> Result<(), String> {
     } else {
         None
     };
+    let health = read_daemon_health(profile)
+        .map(|(last, abnormal)| format!(" abnormal_exits={abnormal} last_exit=[{last}]"))
+        .unwrap_or_default();
+
     let Some(response) = status_response.filter(|response| response.contains("daemon=ready"))
     else {
         println!(
-            "profile={} daemon=stopped pid={} socket={}",
+            "profile={} daemon=stopped pid={} socket={}{health}",
             profile.name,
             pid,
             socket_path.display()
@@ -1695,7 +1743,7 @@ fn print_daemon_status(profile: &Profile) -> Result<(), String> {
         None => "unknown".to_string(),
     };
     println!(
-        "profile={} daemon=ready version={version} sessions={sessions} chrome={chrome} pid={pid} socket={}",
+        "profile={} daemon=ready version={version} sessions={sessions} chrome={chrome} pid={pid} socket={}{health}",
         profile.name,
         socket_path.display()
     );
