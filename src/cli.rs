@@ -356,7 +356,7 @@ pub(crate) fn print_profile_list_help() {
 
 pub(crate) fn print_daemon_start_help() {
     println!(
-        "chrome-devtools daemon start\n\nUsage:\n  chrome-devtools daemon start --profile <profile>\n\nDescription:\n  Start a background daemon for the profile if one is not already running.\n  The daemon owns one chrome-devtools-mcp process and serializes MCP calls\n  over a Unix socket under ~/.cache/chrome-devtools/daemons.\n\nOptions:\n  --profile <name>  Required. Profile name from ~/.config/chrome-devtools/config.toml.\n  -h, --help        Show this help and exit."
+        "chrome-devtools daemon start\n\nUsage:\n  chrome-devtools daemon start --profile <profile>\n\nDescription:\n  Start a background daemon for the profile if one is not already running.\n  The daemon owns one chrome-devtools-mcp process and routes MCP calls\n  over a Unix socket under ~/.cache/chrome-devtools/daemons.\n\nOptions:\n  --profile <name>  Required. Profile name from ~/.config/chrome-devtools/config.toml.\n  -h, --help        Show this help and exit."
     );
 }
 
@@ -368,7 +368,7 @@ pub(crate) fn print_daemon_run_help() {
 
 pub(crate) fn print_daemon_status_help() {
     println!(
-        "chrome-devtools daemon status\n\nUsage:\n  chrome-devtools daemon status --profile <profile>\n\nDescription:\n  Print whether the per-profile daemon is ready or stopped. Ready output:\n\n    profile=<p> daemon=ready version=<v> sessions=<n> active_sessions=<n> pages=<ids> queued_mcp_requests=<n> chrome=<state> pid=<pid> socket=<path>\n\n  chrome=ready means the DevTools endpoint the daemon's MCP is attached to\n  responds; chrome=unreachable means every tool call will fail until the\n  daemon is restarted.\n\nOptions:\n  --profile <name>  Required. Profile name from ~/.config/chrome-devtools/config.toml.\n  -h, --help        Show this help and exit."
+        "chrome-devtools daemon status\n\nUsage:\n  chrome-devtools daemon status --profile <profile>\n\nDescription:\n  Print whether the per-profile daemon is ready or stopped. Ready output:\n\n    profile=<p> daemon=ready version=<v> sessions=<n> active_sessions=<n> pages=<ids> queued_mcp_requests=<n> chrome=<state> respawns=<n> pid=<pid> socket=<path>\n\n  chrome=ready means the DevTools endpoint currently responds.\n  respawns=<n> counts daemon-managed MCP respawns; mint a new session after it changes.\n\nOptions:\n  --profile <name>  Required. Profile name from ~/.config/chrome-devtools/config.toml.\n  -h, --help        Show this help and exit."
     );
 }
 

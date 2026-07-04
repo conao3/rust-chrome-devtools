@@ -22,6 +22,7 @@ Use `chrome-devtools` when you need browser automation through Chrome DevTools M
 - Do not start or kill the user's regular Chrome unless explicitly asked.
 - If a browser login is required, open the page and ask the user to complete the login manually.
 - The daemon and its Chrome are shared with other agents. `daemon stop` refuses while sessions are active and `profile stop` refuses while the daemon is running; only pass `--force` when the user explicitly asks to tear them down.
+- If Chrome's DevTools endpoint or MCP stops responding, the daemon respawns MCP and drops in-memory sessions. Mint a new session after an `unknown session` response.
 
 ## Tool Argument Notes
 
@@ -191,10 +192,10 @@ Inspect daemon health (version, session count, active session count, session pag
 
 ```sh
 chrome-devtools daemon status --profile conao3
-# profile=conao3 daemon=ready version=0.5.0 sessions=1 active_sessions=0 pages=2 queued_mcp_requests=0 chrome=ready port=46071 pid=... socket=...
+# profile=conao3 daemon=ready version=0.5.0 sessions=1 active_sessions=0 pages=2 queued_mcp_requests=0 chrome=ready respawns=0 port=46071 pid=... socket=...
 ```
 
-`chrome=unreachable` means Chrome died or moved after the daemon attached to it; every tool call will fail until the daemon is restarted.
+`respawns=<n>` counts daemon-managed MCP respawns. After a respawn, mint a new session.
 
 Stop the profile daemon (refused while sessions are active; `--force` overrides):
 
@@ -220,7 +221,7 @@ chrome-devtools profile stop --profile conao3
 - If `mcp call` or `mcp batch` exits with `session in use`, another invocation is currently bound to that id. Wait for it to finish or mint a separate session for the new agent.
 - File-writing tool arguments (`take_screenshot` `filePath` etc.) accept paths under your home directory and the OS tempdir.
 - If the CLI warns about a daemon version mismatch, the daemon predates the installed CLI. Behavior fixes in the daemon only apply after it restarts; `daemon stop` (without `--force`) is safe once `sessions=0`.
-- If `daemon status` shows `chrome=unreachable`, restart the daemon; it is attached to a Chrome endpoint that no longer answers.
+- If `daemon status` shows `respawns` increased, mint a new session before continuing browser work.
 - The daemon runs `chrome-devtools-mcp` pinned to a fixed version; set `CHROME_DEVTOOLS_MCP_VERSION` (e.g. `latest`) before `daemon start` to override.
 - If `fill` or `click` fails with a stale or foreign uid token, take a fresh snapshot in the same session and use the new token.
 - If the page is not the expected page, run an `evaluate_script` step that returns `window.location.href` and verify before acting.

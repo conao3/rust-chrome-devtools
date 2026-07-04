@@ -71,15 +71,33 @@ pub(crate) fn record_daemon_exit(profile: &Profile, result: &Result<(), String>)
     }
 }
 
-pub(crate) fn read_daemon_health(profile: &Profile) -> Option<(String, usize)> {
+pub(crate) fn record_daemon_respawn(profile: &Profile, reason: &str) {
+    let Ok(path) = daemon_health_path(profile) else {
+        return;
+    };
+    let now = unix_secs(SystemTime::now());
+    let line = format!(
+        "ts={now} event=respawn reason={}\n",
+        reason.replace('\n', " ")
+    );
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = file.write_all(line.as_bytes());
+    }
+}
+
+pub(crate) fn read_daemon_health(profile: &Profile) -> Option<(String, usize, usize)> {
     let path = daemon_health_path(profile).ok()?;
     let content = fs::read_to_string(path).ok()?;
     let abnormal = content
         .lines()
         .filter(|line| line.contains("exit=error"))
         .count();
+    let respawns = content
+        .lines()
+        .filter(|line| line.contains("event=respawn"))
+        .count();
     let last = content.lines().last()?.to_string();
-    Some((last, abnormal))
+    Some((last, abnormal, respawns))
 }
 
 pub(crate) fn read_runtime_port(profile: &Profile) -> Option<u16> {
@@ -185,35 +203,11 @@ pub(crate) fn run_daemon(profile: &Profile) -> Result<(), String> {
         })?;
     }
 
-    ensure_chrome(profile)?;
-    let mcp_port = current_port(profile)
-        .ok_or_else(|| "runtime port is missing after ensure_chrome".to_string())?;
-    let mut command = daemon_mcp_command(profile);
-    eprintln!(
-        "chrome-devtools {} daemon starting MCP: {:?}",
-        env!("CARGO_PKG_VERSION"),
-        command
-    );
-    let mut mcp = command
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .map_err(|error| format!("failed to run chrome-devtools-mcp: {error}"))?;
-    let mut mcp_stdin = mcp
-        .stdin
-        .take()
-        .ok_or_else(|| "failed to open chrome-devtools-mcp stdin".to_string())?;
-    let mcp_stdout = mcp
-        .stdout
-        .take()
-        .ok_or_else(|| "failed to open chrome-devtools-mcp stdout".to_string())?;
-    let mut runtime = DaemonRuntimeGuard::new(mcp, socket_path.clone(), pid_path.clone());
-    let mut mcp_reader = BufReader::new(mcp_stdout);
-    initialize_daemon_mcp(&mut mcp_stdin, &mut mcp_reader)?;
+    let mcp_runtime = start_mcp_runtime(profile)?;
+    let runtime = DaemonRuntimeGuard::new(socket_path.clone(), pid_path.clone());
     let sessions: SharedSessions =
         Arc::new((Mutex::new(SessionRegistry::default()), Condvar::new()));
-    let router = RouterHandle::start(mcp_stdin, mcp_reader, Arc::clone(&sessions));
+    let router = RouterHandle::start(profile.clone(), mcp_runtime, Arc::clone(&sessions));
 
     fs::write(&pid_path, format!("{}\n", std::process::id()))
         .map_err(|error| format!("failed to write {}: {error}", pid_path.display()))?;
@@ -239,21 +233,10 @@ pub(crate) fn run_daemon(profile: &Profile) -> Result<(), String> {
 
     let stopping = Arc::new(AtomicBool::new(false));
     let (stop_tx, stop_rx) = mpsc::channel();
-    let mut daemon_result = Ok(());
+    let daemon_result = Ok(());
     while !stopping.load(Ordering::SeqCst) {
         if stop_rx.try_recv().is_ok() {
             break;
-        }
-        match runtime.child.try_wait() {
-            Ok(None) => {}
-            Ok(Some(status)) => {
-                daemon_result = Err(format!("chrome-devtools-mcp exited with {status}"));
-                break;
-            }
-            Err(error) => {
-                daemon_result = Err(format!("failed to poll chrome-devtools-mcp: {error}"));
-                break;
-            }
         }
         let stream = match listener.accept() {
             Ok((stream, _)) => stream,
@@ -268,10 +251,11 @@ pub(crate) fn run_daemon(profile: &Profile) -> Result<(), String> {
         };
         let router = router.clone();
         let sessions = Arc::clone(&sessions);
+        let profile = profile.clone();
         let stop_tx = stop_tx.clone();
         let stopping = Arc::clone(&stopping);
         thread::spawn(
-            move || match handle_daemon_client(stream, router, &sessions, mcp_port) {
+            move || match handle_daemon_client(stream, router, &sessions, &profile) {
                 Ok(false) => {}
                 Ok(true) => {
                     stopping.store(true, Ordering::SeqCst);
@@ -295,15 +279,13 @@ pub(crate) fn run_daemon(profile: &Profile) -> Result<(), String> {
 }
 
 pub(crate) struct DaemonRuntimeGuard {
-    child: Child,
     socket_path: PathBuf,
     pid_path: PathBuf,
 }
 
 impl DaemonRuntimeGuard {
-    fn new(child: Child, socket_path: PathBuf, pid_path: PathBuf) -> Self {
+    fn new(socket_path: PathBuf, pid_path: PathBuf) -> Self {
         Self {
-            child,
             socket_path,
             pid_path,
         }
@@ -312,7 +294,6 @@ impl DaemonRuntimeGuard {
 
 impl Drop for DaemonRuntimeGuard {
     fn drop(&mut self) {
-        terminate_child(&mut self.child);
         let _ = fs::remove_file(&self.socket_path);
         let _ = fs::remove_file(&self.pid_path);
     }
@@ -562,7 +543,9 @@ pub(crate) fn print_daemon_status(profile: &Profile) -> Result<(), String> {
         None
     };
     let health = read_daemon_health(profile)
-        .map(|(last, abnormal)| format!(" abnormal_exits={abnormal} last_exit=[{last}]"))
+        .map(|(last, abnormal, respawns)| {
+            format!(" abnormal_exits={abnormal} respawns={respawns} last_event=[{last}]")
+        })
         .unwrap_or_default();
 
     let Some(response) = status_response.filter(|response| response.contains("daemon=ready"))

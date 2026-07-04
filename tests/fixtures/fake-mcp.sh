@@ -133,6 +133,9 @@ while IFS= read -r line; do
       printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":%s}}\n' "$id" "$(tools_list)" ;;
     *'"method":"tools/call"'*)
       name=$(field_string "$line" name)
+      if [ "${FAKE_MCP_HANG_TOOL:-}" = "$name" ]; then
+        sleep 60
+      fi
       case "$name" in
         new_page)
           url=$(field_string "$line" url)

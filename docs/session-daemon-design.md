@@ -27,6 +27,7 @@ The daemon owns:
 - per-profile concurrency control;
 - in-memory session metadata (id, created/last-used timestamps, owned flag);
 - a background reaper that drops sessions idle for more than 30 minutes.
+- MCP respawn and Chrome endpoint recovery.
 
 ## Implemented behavior
 
@@ -75,7 +76,7 @@ Each client connection sends a line beginning with `__chrome_devtools_daemon__:`
 
 After a successful `bind`, the daemon stays in JSON-RPC forwarding mode on that connection: each JSON-RPC line is forwarded to the long-lived `chrome-devtools-mcp` child, and matching responses are streamed back.
 
-Control commands use independent daemon client connections and only take the session registry mutex. They respond while clients are bound. MCP forwarding goes through a single router that owns the MCP stdin/stdout pair, rewrites each client JSON-RPC id to a daemon-local numeric id, restores the original id in the response, injects the session page id for page-scoped tools, and rewrites snapshot uids to session uid tokens.
+Control commands use independent daemon client connections and only take the session registry mutex. They respond while clients are bound. MCP forwarding goes through a single router that owns the MCP stdin/stdout pair, rewrites each client JSON-RPC id to a daemon-local numeric id, restores the original id in the response, injects the session page id for page-scoped tools, and rewrites snapshot uids to session uid tokens. If the Chrome DevTools endpoint dies or an MCP request times out, the router respawns MCP, clears in-memory sessions, and records the event in daemon health.
 
 ## Future direction
 

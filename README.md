@@ -2,6 +2,8 @@
 
 `chrome-devtools` is a profile-aware command-line wrapper for running Chrome DevTools MCP operations with isolated Chrome user data directories.
 
+Use it instead of raw `chrome-devtools-mcp` when multiple agents need to share one Chrome profile: the daemon separates sessions by page, keeps snapshot uids scoped to each session, and respawns Chrome/MCP when the browser endpoint or MCP process fails.
+
 The tool is designed to be called as a regular CLI from agent skills. It is not registered in Hermes as an MCP server.
 
 ## Agent Skill Installation
@@ -42,7 +44,7 @@ npx skills add ./rust-chrome-devtools
 - MCP JSON-RPC input and output are routed through one long-lived per-profile daemon by default.
 - Hermes-side Chrome DevTools MCP registration is not required for this workflow.
 - Daemon-routed snapshot `uid` values are session uid tokens. Keep `take_snapshot -> click/fill` on the same daemon session.
-- The daemon owns one `chrome-devtools-mcp` process per profile, so multiple CLI invocations do not create competing MCP processes for the same Chrome profile.
+- The daemon owns one `chrome-devtools-mcp` process per profile, so multiple CLI invocations do not create competing MCP processes for the same Chrome profile. If Chrome's DevTools endpoint or MCP stops responding, the daemon respawns MCP and drops in-memory sessions so clients can mint fresh ones.
 - The daemon accepts control commands independently of MCP forwarding, so `session create`, `session list`, `session close`, `daemon status`, and `daemon stop` respond while clients are bound.
 - The daemon rewrites client JSON-RPC ids internally and restores the original id in responses, including string ids.
 - `mcp direct-call` and `mcp direct-list` remain available as a fallback and take a per-profile lock under `~/.cache/chrome-devtools/locks`.

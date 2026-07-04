@@ -1,10 +1,14 @@
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
+use std::net::TcpStream;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::thread;
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 struct TestEnv {
@@ -12,17 +16,46 @@ struct TestEnv {
     daemon: Option<Child>,
     session_ttl_secs: Option<u64>,
     reaper_interval_ms: Option<u64>,
+    mcp_request_timeout_secs: Option<u64>,
+    fake_mcp_hang_tool: Option<String>,
+    devtools: Vec<FakeDevTools>,
+}
+
+struct FakeDevTools {
+    port: u16,
+    stop: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
 }
 
 impl TestEnv {
     fn new(tag: &str) -> Self {
-        Self::new_with_reaper(tag, None, None)
+        Self::new_with_options(tag, None, None, None, None)
     }
 
     fn new_with_reaper(
         tag: &str,
         session_ttl_secs: Option<u64>,
         reaper_interval_ms: Option<u64>,
+    ) -> Self {
+        Self::new_with_options(tag, session_ttl_secs, reaper_interval_ms, None, None)
+    }
+
+    fn new_with_mcp_timeout(tag: &str, timeout_secs: u64, hang_tool: &str) -> Self {
+        Self::new_with_options(
+            tag,
+            None,
+            None,
+            Some(timeout_secs),
+            Some(hang_tool.to_string()),
+        )
+    }
+
+    fn new_with_options(
+        tag: &str,
+        session_ttl_secs: Option<u64>,
+        reaper_interval_ms: Option<u64>,
+        mcp_request_timeout_secs: Option<u64>,
+        fake_mcp_hang_tool: Option<String>,
     ) -> Self {
         let home = std::env::temp_dir().join(format!(
             "cdt-{}-{}",
@@ -38,10 +71,10 @@ impl TestEnv {
         )
         .unwrap();
 
-        let devtools_port = spawn_fake_devtools();
+        let devtools = spawn_fake_devtools();
         fs::write(
             home.join(".cache/chrome-devtools/daemons/default.port"),
-            devtools_port.to_string(),
+            devtools.port.to_string(),
         )
         .unwrap();
 
@@ -50,6 +83,9 @@ impl TestEnv {
             daemon: None,
             session_ttl_secs,
             reaper_interval_ms,
+            mcp_request_timeout_secs,
+            fake_mcp_hang_tool,
+            devtools: vec![devtools],
         }
     }
 
@@ -68,7 +104,30 @@ impl TestEnv {
                 value.to_string(),
             );
         }
+        if let Some(value) = self.mcp_request_timeout_secs {
+            command.env(
+                "CHROME_DEVTOOLS_MCP_REQUEST_TIMEOUT_SECS",
+                value.to_string(),
+            );
+        }
+        if let Some(value) = self.fake_mcp_hang_tool.as_ref() {
+            command.env("FAKE_MCP_HANG_TOOL", value);
+        }
         command
+    }
+
+    fn replace_devtools(&mut self) -> u16 {
+        self.devtools.clear();
+        let devtools = spawn_fake_devtools();
+        let port = devtools.port;
+        fs::write(
+            self.home
+                .join(".cache/chrome-devtools/daemons/default.port"),
+            port.to_string(),
+        )
+        .unwrap();
+        self.devtools.push(devtools);
+        port
     }
 
     fn start_daemon(&mut self) {
@@ -143,16 +202,32 @@ impl Drop for TestEnv {
     }
 }
 
+impl Drop for FakeDevTools {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        let _ = TcpStream::connect(("127.0.0.1", self.port));
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
 fn fake_mcp_path() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-mcp.sh")
 }
 
-fn spawn_fake_devtools() -> u16 {
+fn spawn_fake_devtools() -> FakeDevTools {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
-    thread::spawn(move || {
-        for stream in listener.incoming() {
-            let Ok(mut stream) = stream else { continue };
+    listener.set_nonblocking(true).unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_for_thread = Arc::clone(&stop);
+    let handle = thread::spawn(move || {
+        while !stop_for_thread.load(Ordering::SeqCst) {
+            let Ok((mut stream, _)) = listener.accept() else {
+                thread::sleep(Duration::from_millis(10));
+                continue;
+            };
             let mut buffer = [0u8; 1024];
             let _ = stream.read(&mut buffer);
             let _ = stream.write_all(
@@ -160,7 +235,11 @@ fn spawn_fake_devtools() -> u16 {
             );
         }
     });
-    port
+    FakeDevTools {
+        port,
+        stop,
+        handle: Some(handle),
+    }
 }
 
 fn control_roundtrip(stream: &mut UnixStream, command: &str) -> String {
@@ -953,6 +1032,83 @@ fn daemon_status_reports_pages_and_queue() {
         "output: {output}"
     );
     assert!(output.contains("queued_mcp_requests=0"), "output: {output}");
+}
+
+#[test]
+fn mcp_request_timeout_respawns_and_drops_sessions() {
+    let mut env = TestEnv::new_with_mcp_timeout("mcptimeout", 1, "take_snapshot");
+    env.start_daemon();
+    let session = env.create_session();
+    let mut stream = env.connect();
+    bind_stream(&mut stream, &session);
+
+    let response = tool_call(&mut stream, 150, "take_snapshot", serde_json::json!({}));
+    assert!(
+        response["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("MCP request timed out"),
+        "response: {response}"
+    );
+
+    let (ok, output) = env.run_cli(&["session", "list", "--profile", "default"]);
+    assert!(ok, "session list failed: {output}");
+    assert!(!output.contains(&session), "output: {output}");
+
+    let next_session = env.create_session();
+    let mut next_stream = env.connect();
+    bind_stream(&mut next_stream, &next_session);
+    let eval = tool_call(
+        &mut next_stream,
+        151,
+        "evaluate_script",
+        serde_json::json!({"function": "() => location.href"}),
+    );
+    assert!(content_text(&eval).contains("evaluated page="));
+
+    let (ok, output) = env.run_cli(&["daemon", "status", "--profile", "default"]);
+    assert!(ok, "status failed: {output}");
+    assert!(output.contains("respawns=1"), "output: {output}");
+}
+
+#[test]
+fn devtools_port_change_respawns_mcp_and_drops_sessions() {
+    let mut env = TestEnv::new("devresp");
+    env.start_daemon();
+    let session = env.create_session();
+    let mut stream = env.connect();
+    bind_stream(&mut stream, &session);
+    let new_port = env.replace_devtools();
+
+    let response = tool_call(
+        &mut stream,
+        160,
+        "evaluate_script",
+        serde_json::json!({"function": "() => location.href"}),
+    );
+    assert_eq!(
+        response["error"]["message"],
+        format!("unknown session: {session}")
+    );
+
+    let next_session = env.create_session();
+    let mut next_stream = env.connect();
+    bind_stream(&mut next_stream, &next_session);
+    let eval = tool_call(
+        &mut next_stream,
+        161,
+        "evaluate_script",
+        serde_json::json!({"function": "() => location.href"}),
+    );
+    assert!(content_text(&eval).contains("evaluated page="));
+
+    let (ok, output) = env.run_cli(&["daemon", "status", "--profile", "default"]);
+    assert!(ok, "status failed: {output}");
+    assert!(
+        output.contains(&format!("port={new_port}")),
+        "output: {output}"
+    );
+    assert!(output.contains("respawns=1"), "output: {output}");
 }
 
 #[test]

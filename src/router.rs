@@ -1,9 +1,19 @@
+use crate::config::Profile;
+use crate::daemon::{
+    current_port, daemon_mcp_command, ensure_chrome, initialize_daemon_mcp, is_devtools_ready,
+    record_daemon_respawn, terminate_child,
+};
 use std::collections::HashMap;
 use std::env;
 use std::io::BufRead;
 use std::io::BufReader;
 use std::io::Write;
+use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
+use std::process::Child;
+use std::process::ChildStdin;
+use std::process::ChildStdout;
+use std::process::Stdio;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
@@ -20,6 +30,16 @@ use std::time::UNIX_EPOCH;
 pub(crate) const SESSION_IDLE_TTL: Duration = Duration::from_secs(30 * 60);
 
 pub(crate) const SESSION_REAPER_INTERVAL: Duration = Duration::from_secs(60);
+
+pub(crate) const MCP_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
+
+pub(crate) fn mcp_request_timeout() -> Duration {
+    env::var("CHROME_DEVTOOLS_MCP_REQUEST_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(MCP_REQUEST_TIMEOUT)
+}
 
 pub(crate) fn session_idle_ttl() -> Duration {
     env::var("CHROME_DEVTOOLS_SESSION_IDLE_TTL_SECS")
@@ -186,6 +206,10 @@ impl SessionRegistry {
         }
     }
 
+    pub(crate) fn clear_sessions(&mut self) {
+        self.sessions.clear();
+    }
+
     pub(crate) fn record_snapshot_uids(
         &mut self,
         id: &str,
@@ -301,6 +325,119 @@ pub(crate) enum DaemonError {
 
 pub(crate) type SharedSessions = Arc<(Mutex<SessionRegistry>, Condvar)>;
 
+#[cfg(target_os = "linux")]
+const O_NONBLOCK: i32 = 0o4000;
+#[cfg(target_os = "macos")]
+const O_NONBLOCK: i32 = 0x0004;
+const F_GETFL: i32 = 3;
+const F_SETFL: i32 = 4;
+
+unsafe extern "C" {
+    fn fcntl(fd: i32, cmd: i32, ...) -> i32;
+}
+
+pub(crate) struct McpRuntime {
+    child: Child,
+    stdin: ChildStdin,
+    reader: BufReader<ChildStdout>,
+    port: u16,
+}
+
+pub(crate) fn set_nonblocking(fd: i32) -> Result<(), String> {
+    let flags = unsafe { fcntl(fd, F_GETFL) };
+    if flags < 0 {
+        return Err("failed to read pipe flags".to_string());
+    }
+    let result = unsafe { fcntl(fd, F_SETFL, flags | O_NONBLOCK) };
+    if result < 0 {
+        return Err("failed to set pipe nonblocking".to_string());
+    }
+    Ok(())
+}
+
+pub(crate) fn start_mcp_runtime(profile: &Profile) -> Result<McpRuntime, String> {
+    ensure_chrome(profile)?;
+    let port = current_port(profile)
+        .ok_or_else(|| "runtime port is missing after ensure_chrome".to_string())?;
+    let mut command = daemon_mcp_command(profile);
+    eprintln!(
+        "chrome-devtools {} daemon starting MCP: {:?}",
+        env!("CARGO_PKG_VERSION"),
+        command
+    );
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .map_err(|error| format!("failed to run chrome-devtools-mcp: {error}"))?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| "failed to open chrome-devtools-mcp stdin".to_string())?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "failed to open chrome-devtools-mcp stdout".to_string())?;
+    let mut reader = BufReader::new(stdout);
+    initialize_daemon_mcp(&mut stdin, &mut reader)?;
+    set_nonblocking(reader.get_ref().as_raw_fd())?;
+    Ok(McpRuntime {
+        child,
+        stdin,
+        reader,
+        port,
+    })
+}
+
+impl Drop for McpRuntime {
+    fn drop(&mut self) {
+        terminate_child(&mut self.child);
+    }
+}
+
+fn clear_sessions(sessions: &SharedSessions) {
+    let (lock, cvar) = &**sessions;
+    if let Ok(mut registry) = lock.lock() {
+        registry.clear_sessions();
+        cvar.notify_all();
+    }
+}
+
+fn respawn_runtime(
+    profile: &Profile,
+    runtime: &mut McpRuntime,
+    sessions: &SharedSessions,
+    reason: &str,
+) -> Result<(), String> {
+    terminate_child(&mut runtime.child);
+    ensure_chrome(profile)?;
+    let next = start_mcp_runtime(profile)?;
+    *runtime = next;
+    clear_sessions(sessions);
+    record_daemon_respawn(profile, reason);
+    Ok(())
+}
+
+fn ensure_runtime_ready(
+    profile: &Profile,
+    runtime: &mut McpRuntime,
+    sessions: &SharedSessions,
+) -> Result<(), String> {
+    if runtime
+        .child
+        .try_wait()
+        .map_err(|error| format!("failed to poll chrome-devtools-mcp: {error}"))?
+        .is_some()
+    {
+        return respawn_runtime(profile, runtime, sessions, "mcp exited");
+    }
+    if !is_devtools_ready(runtime.port) {
+        return respawn_runtime(profile, runtime, sessions, "devtools unreachable");
+    }
+    Ok(())
+}
+
 #[derive(Clone)]
 pub(crate) struct RouterHandle {
     sender: mpsc::Sender<RouterRequest>,
@@ -321,8 +458,8 @@ pub(crate) enum RouterRequest {
 
 impl RouterHandle {
     pub(crate) fn start(
-        mut mcp_stdin: impl Write + Send + 'static,
-        mut mcp_reader: impl BufRead + Send + 'static,
+        profile: Profile,
+        mut runtime: McpRuntime,
         sessions: SharedSessions,
     ) -> Self {
         let (sender, receiver) = mpsc::channel::<RouterRequest>();
@@ -332,6 +469,9 @@ impl RouterHandle {
             let mut next_id: u64 = 10_000;
             for request in receiver {
                 queued_for_router.fetch_sub(1, Ordering::SeqCst);
+                if let Err(error) = ensure_runtime_ready(&profile, &mut runtime, &sessions) {
+                    eprintln!("warning: failed to self-heal MCP runtime: {error}");
+                }
                 match request {
                     RouterRequest::Forward {
                         line,
@@ -339,19 +479,33 @@ impl RouterHandle {
                         response,
                     } => {
                         let result = route_request(
-                            &mut mcp_stdin,
-                            &mut mcp_reader,
+                            &mut runtime.stdin,
+                            &mut runtime.reader,
                             &sessions,
                             session_id.as_deref(),
                             &line,
                             &mut next_id,
                         );
+                        let result = match result {
+                            Ok(lines) => Ok(lines),
+                            Err(message) => {
+                                if message.contains("MCP request timed out") {
+                                    let _ = respawn_runtime(
+                                        &profile,
+                                        &mut runtime,
+                                        &sessions,
+                                        "mcp request timeout",
+                                    );
+                                }
+                                Ok(error_response_for_line(&line, &message))
+                            }
+                        };
                         let _ = response.send(result);
                     }
                     RouterRequest::ClosePages { pages, response } => {
                         let result = close_daemon_pages(
-                            &mut mcp_stdin,
-                            &mut mcp_reader,
+                            &mut runtime.stdin,
+                            &mut runtime.reader,
                             &mut next_id,
                             pages,
                         );
@@ -897,6 +1051,13 @@ fn request_error_line(value: &serde_json::Value, message: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+fn error_response_for_line(line: &str, message: &str) -> Vec<String> {
+    serde_json::from_str::<serde_json::Value>(line)
+        .ok()
+        .map(|value| request_error_line(&value, message))
+        .unwrap_or_default()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn route_request(
     mcp_stdin: &mut impl Write,
@@ -1117,7 +1278,7 @@ pub(crate) fn handle_daemon_client(
     mut stream: UnixStream,
     router: RouterHandle,
     sessions: &SharedSessions,
-    mcp_port: u16,
+    profile: &Profile,
 ) -> Result<bool, DaemonError> {
     let mut client_reader = BufReader::new(stream.try_clone().map_err(|error| {
         DaemonError::Client(format!("failed to clone daemon client stream: {error}"))
@@ -1146,7 +1307,7 @@ pub(crate) fn handle_daemon_client(
                 sessions,
                 &mut bound,
                 command,
-                mcp_port,
+                profile,
             )? {
                 ControlOutcome::Continue => continue,
                 ControlOutcome::CloseConnection => return Ok(false),
@@ -1212,11 +1373,40 @@ pub(crate) fn read_mcp_response_line(
     mcp_stdin: &mut impl Write,
     mcp_reader: &mut impl BufRead,
 ) -> Result<String, DaemonError> {
+    read_mcp_response_line_until(
+        mcp_stdin,
+        mcp_reader,
+        Instant::now() + mcp_request_timeout(),
+    )
+}
+
+pub(crate) fn read_mcp_response_line_until(
+    mcp_stdin: &mut impl Write,
+    mcp_reader: &mut impl BufRead,
+    deadline: Instant,
+) -> Result<String, DaemonError> {
     loop {
         let mut response_line = String::new();
-        let bytes = mcp_reader
-            .read_line(&mut response_line)
-            .map_err(|error| DaemonError::Fatal(format!("failed to read MCP response: {error}")))?;
+        let bytes = match mcp_reader.read_line(&mut response_line) {
+            Ok(bytes) => bytes,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                if Instant::now() >= deadline {
+                    return Err(DaemonError::Fatal("MCP request timed out".to_string()));
+                }
+                thread::sleep(Duration::from_millis(10));
+                continue;
+            }
+            Err(error) => {
+                return Err(DaemonError::Fatal(format!(
+                    "failed to read MCP response: {error}"
+                )));
+            }
+        };
         if bytes == 0 {
             return Err(DaemonError::Fatal(
                 "chrome-devtools-mcp closed stdout before responding".to_string(),
@@ -1263,7 +1453,7 @@ pub(crate) fn handle_control_command(
     sessions: &SharedSessions,
     bound: &mut BoundSessionGuard,
     command: &str,
-    mcp_port: u16,
+    profile: &Profile,
 ) -> Result<ControlOutcome, DaemonError> {
     let (head, rest) = match command.split_once(' ') {
         Some((head, rest)) => (head, rest.trim()),
@@ -1284,7 +1474,8 @@ pub(crate) fn handle_control_command(
                 &format!(
                     "daemon=ready version={} sessions={count} active_sessions={active} pages={pages} queued_mcp_requests={} mcp_port={mcp_port}",
                     env!("CARGO_PKG_VERSION"),
-                    router.queued_requests()
+                    router.queued_requests(),
+                    mcp_port = current_port(profile).unwrap_or_default()
                 ),
             )?;
             Ok(ControlOutcome::CloseConnection)
