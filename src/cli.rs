@@ -368,7 +368,7 @@ pub(crate) fn print_daemon_run_help() {
 
 pub(crate) fn print_daemon_status_help() {
     println!(
-        "chrome-devtools daemon status\n\nUsage:\n  chrome-devtools daemon status --profile <profile>\n\nDescription:\n  Print whether the per-profile daemon is ready or stopped. Ready output:\n\n    profile=<p> daemon=ready version=<v> sessions=<n> chrome=<state> pid=<pid> socket=<path>\n\n  chrome=ready means the DevTools endpoint the daemon's MCP is attached to\n  responds; chrome=unreachable means every tool call will fail until the\n  daemon is restarted.\n\nOptions:\n  --profile <name>  Required. Profile name from ~/.config/chrome-devtools/config.toml.\n  -h, --help        Show this help and exit."
+        "chrome-devtools daemon status\n\nUsage:\n  chrome-devtools daemon status --profile <profile>\n\nDescription:\n  Print whether the per-profile daemon is ready or stopped. Ready output:\n\n    profile=<p> daemon=ready version=<v> sessions=<n> active_sessions=<n> pages=<ids> queued_mcp_requests=<n> chrome=<state> pid=<pid> socket=<path>\n\n  chrome=ready means the DevTools endpoint the daemon's MCP is attached to\n  responds; chrome=unreachable means every tool call will fail until the\n  daemon is restarted.\n\nOptions:\n  --profile <name>  Required. Profile name from ~/.config/chrome-devtools/config.toml.\n  -h, --help        Show this help and exit."
     );
 }
 
@@ -380,7 +380,7 @@ pub(crate) fn print_daemon_stop_help() {
 
 pub(crate) fn print_session_help() {
     println!(
-        "chrome-devtools session\n\nUsage:\n  chrome-devtools session create --profile <profile>\n  chrome-devtools session list --profile <profile>\n  chrome-devtools session close --profile <profile> --session <id>\n\nCommands:\n  create  Mint a new session id on the profile daemon.\n  list    List active sessions held by the profile daemon.\n  close   Close (drop) the named session.\n\nOptions:\n  -h, --help  Show this help and exit.\n\nNotes:\n  Sessions live in-memory on the profile daemon. They are dropped after\n  30 minutes of inactivity or when the daemon stops.\n  mcp call and mcp batch require --session <id>; use session create to mint it."
+        "chrome-devtools session\n\nUsage:\n  chrome-devtools session create --profile <profile>\n  chrome-devtools session list --profile <profile>\n  chrome-devtools session close --profile <profile> --session <id>\n\nCommands:\n  create  Mint a new session id on the profile daemon.\n  list    List active sessions held by the profile daemon.\n  close   Close (drop) the named session and its daemon-created page.\n\nOptions:\n  -h, --help  Show this help and exit.\n\nNotes:\n  Sessions live in-memory on the profile daemon. They are dropped after\n  30 minutes of inactivity or when the daemon stops.\n  mcp call and mcp batch require --session <id>; use session create to mint it."
     );
 }
 
@@ -398,6 +398,6 @@ pub(crate) fn print_session_list_help() {
 
 pub(crate) fn print_session_close_help() {
     println!(
-        "chrome-devtools session close\n\nUsage:\n  chrome-devtools session close --profile <profile> --session <id>\n\nDescription:\n  Ask the profile daemon to drop the named session. Fails if the session is\n  unknown or the daemon is not running.\n\nOptions:\n  --profile <name>  Required. Profile name from ~/.config/chrome-devtools/config.toml.\n  --session <id>    Required. Session id minted by `session create`.\n  -h, --help        Show this help and exit."
+        "chrome-devtools session close\n\nUsage:\n  chrome-devtools session close --profile <profile> --session <id>\n\nDescription:\n  Ask the profile daemon to drop the named session. If the session owns a\n  daemon-created page, the daemon closes that page while preserving Chrome's\n  last tab. Fails if the session is unknown or the daemon is not running.\n\nOptions:\n  --profile <name>  Required. Profile name from ~/.config/chrome-devtools/config.toml.\n  --session <id>    Required. Session id minted by `session create`.\n  -h, --help        Show this help and exit."
     );
 }

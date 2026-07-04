@@ -5,6 +5,7 @@ use std::io::BufReader;
 use std::io::Write;
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::AtomicU64;
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -19,6 +20,27 @@ use std::time::UNIX_EPOCH;
 pub(crate) const SESSION_IDLE_TTL: Duration = Duration::from_secs(30 * 60);
 
 pub(crate) const SESSION_REAPER_INTERVAL: Duration = Duration::from_secs(60);
+
+pub(crate) fn session_idle_ttl() -> Duration {
+    env::var("CHROME_DEVTOOLS_SESSION_IDLE_TTL_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(SESSION_IDLE_TTL)
+}
+
+pub(crate) fn session_reaper_interval() -> Duration {
+    env::var("CHROME_DEVTOOLS_SESSION_REAPER_INTERVAL_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(SESSION_REAPER_INTERVAL)
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PageCleanup {
+    pub(crate) page_id: u64,
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct UidBinding {
@@ -70,15 +92,14 @@ impl SessionRegistry {
         sessions
     }
 
-    pub(crate) fn close(&mut self, id: &str) -> Result<(), String> {
+    pub(crate) fn close(&mut self, id: &str) -> Result<Option<PageCleanup>, String> {
         let Some(session) = self.sessions.get(id) else {
             return Err(format!("unknown session: {id}"));
         };
         if session.owned {
             return Err(format!("session in use: {id}"));
         }
-        self.sessions.remove(id);
-        Ok(())
+        Ok(self.sessions.remove(id).and_then(page_cleanup_for_session))
     }
 
     pub(crate) fn bind(&mut self, id: &str) -> Result<(), String> {
@@ -107,17 +128,25 @@ impl SessionRegistry {
         }
     }
 
-    pub(crate) fn reap_expired(&mut self) {
+    pub(crate) fn reap_expired(&mut self, ttl: Duration) -> Vec<PageCleanup> {
         let now = SystemTime::now();
+        let mut cleanup = Vec::new();
         self.sessions.retain(|_, session| {
             if session.owned {
                 return true;
             }
-            match now.duration_since(session.last_used_at) {
-                Ok(elapsed) => elapsed < SESSION_IDLE_TTL,
+            let keep = match now.duration_since(session.last_used_at) {
+                Ok(elapsed) => elapsed < ttl,
                 Err(_) => true,
+            };
+            if !keep {
+                if let Some(page) = page_cleanup_for_session(session.clone()) {
+                    cleanup.push(page);
+                }
             }
+            keep
         });
+        cleanup
     }
 
     pub(crate) fn page_id(&self, id: &str) -> Option<u64> {
@@ -231,6 +260,14 @@ impl SessionRegistry {
     }
 }
 
+fn page_cleanup_for_session(session: SessionState) -> Option<PageCleanup> {
+    if session.page_created_by_daemon {
+        session.page_id.map(|page_id| PageCleanup { page_id })
+    } else {
+        None
+    }
+}
+
 pub(crate) fn generate_session_id() -> String {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let nanos = SystemTime::now()
@@ -267,12 +304,19 @@ pub(crate) type SharedSessions = Arc<(Mutex<SessionRegistry>, Condvar)>;
 #[derive(Clone)]
 pub(crate) struct RouterHandle {
     sender: mpsc::Sender<RouterRequest>,
+    queued: Arc<AtomicUsize>,
 }
 
-pub(crate) struct RouterRequest {
-    line: String,
-    session_id: Option<String>,
-    response: mpsc::Sender<Result<Vec<String>, String>>,
+pub(crate) enum RouterRequest {
+    Forward {
+        line: String,
+        session_id: Option<String>,
+        response: mpsc::Sender<Result<Vec<String>, String>>,
+    },
+    ClosePages {
+        pages: Vec<PageCleanup>,
+        response: mpsc::Sender<Result<(), String>>,
+    },
 }
 
 impl RouterHandle {
@@ -282,21 +326,41 @@ impl RouterHandle {
         sessions: SharedSessions,
     ) -> Self {
         let (sender, receiver) = mpsc::channel::<RouterRequest>();
+        let queued = Arc::new(AtomicUsize::new(0));
+        let queued_for_router = Arc::clone(&queued);
         thread::spawn(move || {
             let mut next_id: u64 = 10_000;
             for request in receiver {
-                let result = route_request(
-                    &mut mcp_stdin,
-                    &mut mcp_reader,
-                    &sessions,
-                    request.session_id.as_deref(),
-                    &request.line,
-                    &mut next_id,
-                );
-                let _ = request.response.send(result);
+                queued_for_router.fetch_sub(1, Ordering::SeqCst);
+                match request {
+                    RouterRequest::Forward {
+                        line,
+                        session_id,
+                        response,
+                    } => {
+                        let result = route_request(
+                            &mut mcp_stdin,
+                            &mut mcp_reader,
+                            &sessions,
+                            session_id.as_deref(),
+                            &line,
+                            &mut next_id,
+                        );
+                        let _ = response.send(result);
+                    }
+                    RouterRequest::ClosePages { pages, response } => {
+                        let result = close_daemon_pages(
+                            &mut mcp_stdin,
+                            &mut mcp_reader,
+                            &mut next_id,
+                            pages,
+                        );
+                        let _ = response.send(result);
+                    }
+                }
             }
         });
-        Self { sender }
+        Self { sender, queued }
     }
 
     pub(crate) fn forward(
@@ -305,19 +369,52 @@ impl RouterHandle {
         line: &str,
     ) -> Result<Vec<String>, DaemonError> {
         let (response_tx, response_rx) = mpsc::channel();
-        self.sender
-            .send(RouterRequest {
-                line: line.to_string(),
-                session_id: session_id.map(|id| id.to_string()),
-                response: response_tx,
-            })
-            .map_err(|error| DaemonError::Fatal(format!("failed to queue MCP request: {error}")))?;
+        self.queued.fetch_add(1, Ordering::SeqCst);
+        if let Err(error) = self.sender.send(RouterRequest::Forward {
+            line: line.to_string(),
+            session_id: session_id.map(|id| id.to_string()),
+            response: response_tx,
+        }) {
+            self.queued.fetch_sub(1, Ordering::SeqCst);
+            return Err(DaemonError::Fatal(format!(
+                "failed to queue MCP request: {error}"
+            )));
+        }
         response_rx
             .recv()
             .map_err(|error| {
                 DaemonError::Fatal(format!("failed to receive MCP response: {error}"))
             })?
             .map_err(DaemonError::Fatal)
+    }
+
+    pub(crate) fn close_pages(&self, pages: Vec<PageCleanup>) -> Result<(), DaemonError> {
+        if pages.is_empty() {
+            return Ok(());
+        }
+        let (response_tx, response_rx) = mpsc::channel();
+        self.queued.fetch_add(1, Ordering::SeqCst);
+        if let Err(error) = self.sender.send(RouterRequest::ClosePages {
+            pages,
+            response: response_tx,
+        }) {
+            self.queued.fetch_sub(1, Ordering::SeqCst);
+            return Err(DaemonError::Fatal(format!(
+                "failed to queue MCP page cleanup: {error}"
+            )));
+        }
+        response_rx
+            .recv()
+            .map_err(|error| {
+                DaemonError::Fatal(format!(
+                    "failed to receive MCP page cleanup response: {error}"
+                ))
+            })?
+            .map_err(DaemonError::Fatal)
+    }
+
+    pub(crate) fn queued_requests(&self) -> usize {
+        self.queued.load(Ordering::SeqCst)
     }
 }
 
@@ -411,6 +508,68 @@ fn selected_page_id(response: &serde_json::Value) -> Option<u64> {
         .find(|page| page.get("selected").and_then(|value| value.as_bool()) == Some(true))
         .and_then(|page| page.get("id"))
         .and_then(|id| id.as_u64())
+}
+
+fn response_page_ids(response: &serde_json::Value) -> Vec<u64> {
+    response
+        .get("result")
+        .and_then(|result| result.get("structuredContent"))
+        .and_then(|structured| structured.get("pages"))
+        .and_then(|pages| pages.as_array())
+        .map(|pages| {
+            pages
+                .iter()
+                .filter_map(|page| page.get("id").and_then(|id| id.as_u64()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn list_page_ids(
+    mcp_stdin: &mut impl Write,
+    mcp_reader: &mut impl BufRead,
+    next_id: &mut u64,
+) -> Result<Vec<u64>, String> {
+    let response = mcp_call(
+        mcp_stdin,
+        mcp_reader,
+        next_id,
+        serde_json::json!({
+            "method": "tools/call",
+            "params": {
+                "name": "list_pages",
+                "arguments": {}
+            }
+        }),
+    )?;
+    Ok(response_page_ids(&response))
+}
+
+fn close_daemon_pages(
+    mcp_stdin: &mut impl Write,
+    mcp_reader: &mut impl BufRead,
+    next_id: &mut u64,
+    pages: Vec<PageCleanup>,
+) -> Result<(), String> {
+    for page in pages {
+        let current = list_page_ids(mcp_stdin, mcp_reader, next_id)?;
+        if current.len() <= 1 || !current.contains(&page.page_id) {
+            continue;
+        }
+        let _ = mcp_call(
+            mcp_stdin,
+            mcp_reader,
+            next_id,
+            serde_json::json!({
+                "method": "tools/call",
+                "params": {
+                    "name": "close_page",
+                    "arguments": { "pageId": page.page_id }
+                }
+            }),
+        )?;
+    }
+    Ok(())
 }
 
 fn ensure_session_page(
@@ -981,7 +1140,14 @@ pub(crate) fn handle_daemon_client(
         }
 
         if let Some(command) = line.strip_prefix("__chrome_devtools_daemon__:") {
-            match handle_control_command(&mut stream, sessions, &mut bound, command, mcp_port)? {
+            match handle_control_command(
+                &mut stream,
+                &router,
+                sessions,
+                &mut bound,
+                command,
+                mcp_port,
+            )? {
                 ControlOutcome::Continue => continue,
                 ControlOutcome::CloseConnection => return Ok(false),
                 ControlOutcome::StopDaemon => return Ok(true),
@@ -1093,6 +1259,7 @@ pub(crate) enum ControlOutcome {
 
 pub(crate) fn handle_control_command(
     stream: &mut UnixStream,
+    router: &RouterHandle,
     sessions: &SharedSessions,
     bound: &mut BoundSessionGuard,
     command: &str,
@@ -1104,12 +1271,20 @@ pub(crate) fn handle_control_command(
     };
     match head {
         "status" => {
-            let count = lock_sessions(sessions)?.list().len();
+            let snapshot = lock_sessions(sessions)?.list();
+            let count = snapshot.len();
+            let active = snapshot.iter().filter(|session| session.owned).count();
+            let pages = snapshot
+                .iter()
+                .filter_map(|session| session.page_id.map(|page| page.to_string()))
+                .collect::<Vec<_>>()
+                .join(",");
             write_control_line(
                 stream,
                 &format!(
-                    "daemon=ready version={} sessions={count} mcp_port={mcp_port}",
-                    env!("CARGO_PKG_VERSION")
+                    "daemon=ready version={} sessions={count} active_sessions={active} pages={pages} queued_mcp_requests={} mcp_port={mcp_port}",
+                    env!("CARGO_PKG_VERSION"),
+                    router.queued_requests()
                 ),
             )?;
             Ok(ControlOutcome::CloseConnection)
@@ -1146,7 +1321,12 @@ pub(crate) fn handle_control_command(
             let id = parse_session_arg(rest).map_err(DaemonError::Client)?;
             let result = lock_sessions(sessions)?.close(&id);
             match result {
-                Ok(()) => write_control_line(stream, &format!("closed={id}"))?,
+                Ok(cleanup) => {
+                    if let Some(cleanup) = cleanup {
+                        router.close_pages(vec![cleanup])?;
+                    }
+                    write_control_line(stream, &format!("closed={id}"))?;
+                }
                 Err(message) => write_control_line(stream, &format!("error={message}"))?,
             }
             Ok(ControlOutcome::CloseConnection)

@@ -75,7 +75,7 @@ chrome-devtools session list --profile conao3
 chrome-devtools session close --profile conao3 --session "$SESSION"
 ```
 
-Sessions are in-memory on the daemon. They are dropped after 30 minutes of inactivity or when the daemon stops (`chrome-devtools daemon stop --profile <name>`). After expiry, mint a new id. When a session first uses a page-scoped tool, the daemon assigns it a background page and routes later page-scoped calls to that page.
+Sessions are in-memory on the daemon. They are dropped after 30 minutes of inactivity or when the daemon stops (`chrome-devtools daemon stop --profile <name>`). After expiry, mint a new id. When a session first uses a page-scoped tool, the daemon assigns it a background page and routes later page-scoped calls to that page. `session close` and expiry close daemon-created pages when Chrome has another tab; attached pages stay open.
 
 ## Batch Execution (Preferred for Multi-Step Workflows)
 
@@ -187,11 +187,11 @@ chrome-devtools mcp help
 chrome-devtools mcp batch --help
 ```
 
-Inspect daemon health (version, session count, whether the daemon-attached Chrome endpoint responds):
+Inspect daemon health (version, session count, active session count, session pages, queued MCP requests, whether the daemon-attached Chrome endpoint responds):
 
 ```sh
 chrome-devtools daemon status --profile conao3
-# profile=conao3 daemon=ready version=0.3.1 sessions=1 chrome=ready port=46071 pid=... socket=...
+# profile=conao3 daemon=ready version=0.5.0 sessions=1 active_sessions=0 pages=2 queued_mcp_requests=0 chrome=ready port=46071 pid=... socket=...
 ```
 
 `chrome=unreachable` means Chrome died or moved after the daemon attached to it; every tool call will fail until the daemon is restarted.

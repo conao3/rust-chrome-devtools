@@ -225,12 +225,16 @@ pub(crate) fn run_daemon(profile: &Profile) -> Result<(), String> {
         .map_err(|error| format!("failed to configure {}: {error}", socket_path.display()))?;
 
     let sessions_for_reaper = Arc::clone(&sessions);
+    let router_for_reaper = router.clone();
     thread::spawn(move || loop {
-        thread::sleep(SESSION_REAPER_INTERVAL);
-        let (lock, _) = &*sessions_for_reaper;
-        if let Ok(mut registry) = lock.lock() {
-            registry.reap_expired();
-        }
+        thread::sleep(session_reaper_interval());
+        let cleanup = {
+            let (lock, _) = &*sessions_for_reaper;
+            lock.lock()
+                .map(|mut registry| registry.reap_expired(session_idle_ttl()))
+                .unwrap_or_default()
+        };
+        let _ = router_for_reaper.close_pages(cleanup);
     });
 
     let stopping = Arc::new(AtomicBool::new(false));
@@ -574,6 +578,9 @@ pub(crate) fn print_daemon_status(profile: &Profile) -> Result<(), String> {
 
     let version = parse_status_field(&response, "version=").unwrap_or("pre-0.3.1");
     let sessions = parse_status_field(&response, "sessions=").unwrap_or("unknown");
+    let active_sessions = parse_status_field(&response, "active_sessions=").unwrap_or("unknown");
+    let pages = parse_status_field(&response, "pages=").unwrap_or("");
+    let queued = parse_status_field(&response, "queued_mcp_requests=").unwrap_or("unknown");
     let chrome = match parse_status_field(&response, "mcp_port=")
         .and_then(|port| port.parse::<u16>().ok())
     {
@@ -582,7 +589,7 @@ pub(crate) fn print_daemon_status(profile: &Profile) -> Result<(), String> {
         None => "unknown".to_string(),
     };
     println!(
-        "profile={} daemon=ready version={version} sessions={sessions} chrome={chrome} pid={pid} socket={}{health}",
+        "profile={} daemon=ready version={version} sessions={sessions} active_sessions={active_sessions} pages={pages} queued_mcp_requests={queued} chrome={chrome} pid={pid} socket={}{health}",
         profile.name,
         socket_path.display()
     );

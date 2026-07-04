@@ -10,10 +10,20 @@ use std::time::{Duration, Instant};
 struct TestEnv {
     home: PathBuf,
     daemon: Option<Child>,
+    session_ttl_secs: Option<u64>,
+    reaper_interval_ms: Option<u64>,
 }
 
 impl TestEnv {
     fn new(tag: &str) -> Self {
+        Self::new_with_reaper(tag, None, None)
+    }
+
+    fn new_with_reaper(
+        tag: &str,
+        session_ttl_secs: Option<u64>,
+        reaper_interval_ms: Option<u64>,
+    ) -> Self {
         let home =
             std::env::temp_dir().join(format!("chrome-devtools-it-{tag}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&home);
@@ -32,7 +42,12 @@ impl TestEnv {
         )
         .unwrap();
 
-        Self { home, daemon: None }
+        Self {
+            home,
+            daemon: None,
+            session_ttl_secs,
+            reaper_interval_ms,
+        }
     }
 
     fn cli(&self) -> Command {
@@ -41,6 +56,15 @@ impl TestEnv {
             .env("HOME", &self.home)
             .env("CHROME_DEVTOOLS_MCP_COMMAND", fake_mcp_path())
             .env("CHROME", "/nonexistent-chrome-for-tests");
+        if let Some(value) = self.session_ttl_secs {
+            command.env("CHROME_DEVTOOLS_SESSION_IDLE_TTL_SECS", value.to_string());
+        }
+        if let Some(value) = self.reaper_interval_ms {
+            command.env(
+                "CHROME_DEVTOOLS_SESSION_REAPER_INTERVAL_MS",
+                value.to_string(),
+            );
+        }
         command
     }
 
@@ -203,6 +227,15 @@ fn selected_page_id(response: &serde_json::Value) -> u64 {
         .find(|page| page["selected"] == true)
         .and_then(|page| page["id"].as_u64())
         .unwrap()
+}
+
+fn page_ids(response: &serde_json::Value) -> Vec<u64> {
+    response["result"]["structuredContent"]["pages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|page| page["id"].as_u64())
+        .collect()
 }
 
 #[test]
@@ -758,6 +791,154 @@ fn include_snapshot_response_rewrites_returned_uids() {
     let text = content_text(&click);
     assert!(text.contains(&format!("clicked page={page} raw={page}_button")));
     assert!(text.contains(&format!("snapshot page={page} uid=u:")));
+}
+
+#[test]
+fn session_close_closes_daemon_created_page() {
+    let mut env = TestEnv::new("closeowned");
+    env.start_daemon();
+    let session = env.create_session();
+    let mut stream = env.connect();
+    bind_stream(&mut stream, &session);
+    let page = selected_page_id(&tool_call(
+        &mut stream,
+        100,
+        "new_page",
+        serde_json::json!({"url": "https://owned.test/"}),
+    ));
+    drop(stream);
+
+    let (ok, output) = env.run_cli(&[
+        "session",
+        "close",
+        "--profile",
+        "default",
+        "--session",
+        &session,
+    ]);
+    assert!(ok, "session close failed: {output}");
+
+    let probe = env.create_session();
+    let mut probe_stream = env.connect();
+    bind_stream(&mut probe_stream, &probe);
+    let pages = tool_call(&mut probe_stream, 101, "list_pages", serde_json::json!({}));
+    assert!(!page_ids(&pages).contains(&page), "pages: {pages}");
+}
+
+#[test]
+fn session_close_keeps_attached_page() {
+    let mut env = TestEnv::new("closeattached");
+    env.start_daemon();
+    let session = env.create_session();
+    let mut control = env.connect();
+    let attached = control_roundtrip(
+        &mut control,
+        &format!("session_attach session={session} page=1"),
+    );
+    assert_eq!(attached, format!("session={session} page=1"));
+
+    let (ok, output) = env.run_cli(&[
+        "session",
+        "close",
+        "--profile",
+        "default",
+        "--session",
+        &session,
+    ]);
+    assert!(ok, "session close failed: {output}");
+
+    let probe = env.create_session();
+    let mut probe_stream = env.connect();
+    bind_stream(&mut probe_stream, &probe);
+    let pages = tool_call(&mut probe_stream, 110, "list_pages", serde_json::json!({}));
+    assert!(page_ids(&pages).contains(&1), "pages: {pages}");
+}
+
+#[test]
+fn session_expiry_closes_daemon_created_page() {
+    let mut env = TestEnv::new_with_reaper("expireowned", Some(1), Some(50));
+    env.start_daemon();
+    let session = env.create_session();
+    let mut stream = env.connect();
+    bind_stream(&mut stream, &session);
+    let page = selected_page_id(&tool_call(
+        &mut stream,
+        120,
+        "new_page",
+        serde_json::json!({"url": "https://expire.test/"}),
+    ));
+    drop(stream);
+
+    let started = Instant::now();
+    loop {
+        let (ok, output) = env.run_cli(&["session", "list", "--profile", "default"]);
+        assert!(ok, "session list failed: {output}");
+        if !output.contains(&session) {
+            break;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "session did not expire: {output}"
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    let probe = env.create_session();
+    let mut probe_stream = env.connect();
+    bind_stream(&mut probe_stream, &probe);
+    let pages = tool_call(&mut probe_stream, 121, "list_pages", serde_json::json!({}));
+    assert!(!page_ids(&pages).contains(&page), "pages: {pages}");
+}
+
+#[test]
+fn last_tab_is_kept_when_daemon_created_page_is_closed() {
+    let mut env = TestEnv::new("lasttab");
+    env.start_daemon();
+    let session = env.create_session();
+    let mut stream = env.connect();
+    bind_stream(&mut stream, &session);
+    tool_call(&mut stream, 130, "take_snapshot", serde_json::json!({}));
+    drop(stream);
+
+    let (ok, output) = env.run_cli(&[
+        "session",
+        "close",
+        "--profile",
+        "default",
+        "--session",
+        &session,
+    ]);
+    assert!(ok, "session close failed: {output}");
+
+    let probe = env.create_session();
+    let mut probe_stream = env.connect();
+    bind_stream(&mut probe_stream, &probe);
+    let pages = tool_call(&mut probe_stream, 131, "list_pages", serde_json::json!({}));
+    assert_eq!(page_ids(&pages), vec![1]);
+}
+
+#[test]
+fn daemon_status_reports_pages_and_queue() {
+    let mut env = TestEnv::new("statuspages");
+    env.start_daemon();
+    let session = env.create_session();
+    let mut stream = env.connect();
+    bind_stream(&mut stream, &session);
+    let page = selected_page_id(&tool_call(
+        &mut stream,
+        140,
+        "new_page",
+        serde_json::json!({"url": "https://status.test/"}),
+    ));
+
+    let (ok, output) = env.run_cli(&["daemon", "status", "--profile", "default"]);
+    assert!(ok, "status failed: {output}");
+    assert!(output.contains("active_sessions=1"), "output: {output}");
+    assert!(
+        output.contains(&format!("pages={page}")),
+        "output: {output}"
+    );
+    assert!(output.contains("queued_mcp_requests=0"), "output: {output}");
 }
 
 #[test]

@@ -51,6 +51,30 @@ set_page_url() {
   page_urls="${next}${next:+ }$id=$url"
 }
 
+remove_page() {
+  local remove="$1"
+  local next_ids=""
+  local id
+  for id in $page_ids; do
+    [ "$id" = "$remove" ] && continue
+    next_ids="${next_ids}${next_ids:+ }$id"
+  done
+  page_ids="$next_ids"
+  local next_urls=""
+  local entry
+  for entry in $page_urls; do
+    case "$entry" in
+      "$remove="*) ;;
+      *) next_urls="${next_urls}${next_urls:+ }$entry" ;;
+    esac
+  done
+  page_urls="$next_urls"
+  case " $page_ids " in
+    *" $selected_page "*) ;;
+    *) selected_page="${page_ids%% *}" ;;
+  esac
+}
+
 pages_structured() {
   local first=1
   local id url title selected
@@ -80,7 +104,7 @@ pages_text() {
 
 tools_list() {
   cat <<JSON
-[{"name":"click","inputSchema":{"type":"object","properties":{"pageId":{"type":"number"},"uid":{"type":"string"},"includeSnapshot":{"type":"boolean"}},"required":["pageId","uid"]}},{"name":"drag","inputSchema":{"type":"object","properties":{"pageId":{"type":"number"},"from_uid":{"type":"string"},"to_uid":{"type":"string"}},"required":["pageId","from_uid","to_uid"]}},{"name":"evaluate_script","inputSchema":{"type":"object","properties":{"pageId":{"type":"number"},"function":{"type":"string"},"args":{"type":"array","items":{"type":"string"}}},"required":["pageId","function"]}},{"name":"fill_form","inputSchema":{"type":"object","properties":{"pageId":{"type":"number"},"elements":{"type":"array","items":{"type":"object","properties":{"uid":{"type":"string"}}}}},"required":["pageId","elements"]}},{"name":"list_pages","inputSchema":{"type":"object","properties":{},"required":[]}}, {"name":"new_page","inputSchema":{"type":"object","properties":{"url":{"type":"string"},"background":{"type":"boolean"}},"required":["url"]}},{"name":"select_page","inputSchema":{"type":"object","properties":{"pageId":{"type":"number"}},"required":["pageId"]}},{"name":"take_snapshot","inputSchema":{"type":"object","properties":{"pageId":{"type":"number"}},"required":["pageId"]}}]
+[{"name":"click","inputSchema":{"type":"object","properties":{"pageId":{"type":"number"},"uid":{"type":"string"},"includeSnapshot":{"type":"boolean"}},"required":["pageId","uid"]}},{"name":"close_page","inputSchema":{"type":"object","properties":{"pageId":{"type":"number"}},"required":["pageId"]}},{"name":"drag","inputSchema":{"type":"object","properties":{"pageId":{"type":"number"},"from_uid":{"type":"string"},"to_uid":{"type":"string"}},"required":["pageId","from_uid","to_uid"]}},{"name":"evaluate_script","inputSchema":{"type":"object","properties":{"pageId":{"type":"number"},"function":{"type":"string"},"args":{"type":"array","items":{"type":"string"}}},"required":["pageId","function"]}},{"name":"fill_form","inputSchema":{"type":"object","properties":{"pageId":{"type":"number"},"elements":{"type":"array","items":{"type":"object","properties":{"uid":{"type":"string"}}}}},"required":["pageId","elements"]}},{"name":"list_pages","inputSchema":{"type":"object","properties":{},"required":[]}}, {"name":"new_page","inputSchema":{"type":"object","properties":{"url":{"type":"string"},"background":{"type":"boolean"}},"required":["url"]}},{"name":"select_page","inputSchema":{"type":"object","properties":{"pageId":{"type":"number"}},"required":["pageId"]}},{"name":"take_snapshot","inputSchema":{"type":"object","properties":{"pageId":{"type":"number"}},"required":["pageId"]}}]
 JSON
 }
 
@@ -121,6 +145,15 @@ while IFS= read -r line; do
           tool_response "$id" "$(pages_text)" "{\"pages\":$(pages_structured)}" ;;
         list_pages)
           tool_response "$id" "$(pages_text)" "{\"pages\":$(pages_structured)}" ;;
+        close_page)
+          page_id=$(field_number "$line" pageId)
+          count=$(printf '%s\n' $page_ids | wc -l)
+          if [ "$count" -gt 1 ]; then
+            remove_page "$page_id"
+            tool_response "$id" "$(pages_text)" "{\"pages\":$(pages_structured)}"
+          else
+            error_response "$id" "The last open page cannot be closed. It is fine to keep it open."
+          fi ;;
         select_page)
           page_id=$(field_number "$line" pageId)
           selected_page="$page_id"

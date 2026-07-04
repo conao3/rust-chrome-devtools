@@ -75,7 +75,7 @@ chrome-devtools profile stop --profile default
 
 `session create` starts the profile daemon when needed and mints a new in-memory session id. The session expires after 30 minutes of inactivity or when the daemon stops. Output looks like `session=sess-xxxxxxxxxxxxxxxx created=<ts> last_used=<ts> owned=false`.
 
-`session list` prints one line per active session. `session close` drops the named session when it is idle.
+`session list` prints one line per active session. `session close` drops the named session when it is idle and closes its daemon-created page when Chrome has another tab.
 
 `mcp list` starts the profile daemon when needed, queries `tools/list` through that daemon, and prints the raw MCP JSON response.
 

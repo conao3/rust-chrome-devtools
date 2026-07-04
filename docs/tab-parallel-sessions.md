@@ -144,7 +144,7 @@ A later design can split read-only calls or run multiple MCP child processes aga
 
 A session-owned page is idle-managed with the session.
 
-- When the session expires, pages created by the daemon may be closed.
+- When the session expires, pages created by the daemon are closed when Chrome has another tab.
 - Pages attached from an existing tab stay open when the session expires.
 - `session close` closes daemon-created pages when they are idle.
 - `daemon stop` keeps Chrome ownership behavior unchanged: stopping the daemon ends in-memory sessions and leaves Chrome cleanup to existing profile/daemon commands.
@@ -189,7 +189,7 @@ Acceptance checks:
 
 ### Phase 3: lifecycle and fairness
 
-Add page cleanup on session expiry and measure queued tool wait time.
+Implemented. Session close and expiry clean up daemon-created pages, attached pages stay open, and daemon status reports active sessions, session pages, and queued MCP requests.
 
 Acceptance checks:
 

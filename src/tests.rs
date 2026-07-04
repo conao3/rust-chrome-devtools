@@ -324,7 +324,7 @@ fn session_registry_reap_expired_drops_only_expired_unowned_sessions() {
     let owned = registry.sessions.get_mut(&expired_owned.id).unwrap();
     owned.last_used_at = stale;
     owned.owned = true;
-    registry.reap_expired();
+    registry.reap_expired(SESSION_IDLE_TTL);
     let remaining: Vec<_> = registry
         .list()
         .into_iter()

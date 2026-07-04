@@ -57,7 +57,7 @@ A session records:
 - last-used timestamp;
 - `owned` flag (whether a client connection currently holds it).
 
-Sessions live in-memory on the daemon. A reaper thread wakes up every 60 seconds and drops sessions whose `last_used_at` is more than 30 minutes old and that are not currently owned. Sessions are also dropped when the daemon stops (`daemon stop` or process exit).
+Sessions live in-memory on the daemon. A reaper thread wakes up every 60 seconds and drops sessions whose `last_used_at` is more than 30 minutes old and that are not currently owned. When an expired or closed session owns a daemon-created page, the daemon closes that page while preserving Chrome's last tab rule. Sessions are also dropped when the daemon stops (`daemon stop` or process exit).
 
 ## Daemon control protocol
 
@@ -70,6 +70,7 @@ Each client connection sends a line beginning with `__chrome_devtools_daemon__:`
 | `session_create`                     | `session=<id> created=<ts> last_used=<ts> owned=false`  |
 | `session_list`                       | one line per session in the same format                 |
 | `session_close session=<id>`         | `closed=<id>` or `error=<message>`                      |
+| `session_attach session=<id> page=<id>` | `session=<id> page=<id>` or `error=<message>`        |
 | `bind session=<id>`                  | `bound=<id>` or `error=<message>`                       |
 
 After a successful `bind`, the daemon stays in JSON-RPC forwarding mode on that connection: each JSON-RPC line is forwarded to the long-lived `chrome-devtools-mcp` child, and matching responses are streamed back.
