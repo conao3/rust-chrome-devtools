@@ -212,6 +212,10 @@ fn format_session_line_renders_all_fields() {
         created_at: now,
         last_used_at: now,
         owned: true,
+        page_id: Some(7),
+        page_created_by_daemon: true,
+        page_url: Some("about:blank".to_string()),
+        snapshot_epoch: 0,
     };
     let line = format_session_line(&state);
     assert!(line.starts_with("session=sess-test "));
@@ -273,13 +277,14 @@ fn session_registry_bind_marks_owned_and_rejects_second_bind() {
 }
 
 #[test]
-fn session_registry_bind_rejects_when_another_session_is_bound() {
+fn session_registry_bind_allows_another_session_to_bind() {
     let mut registry = SessionRegistry::default();
     let first = registry.create();
     let second = registry.create();
     registry.bind(&first.id).unwrap();
-    let error = registry.bind(&second.id).unwrap_err();
-    assert!(error.contains("daemon busy"));
+    registry.bind(&second.id).unwrap();
+    assert!(registry.sessions.get(&first.id).unwrap().owned);
+    assert!(registry.sessions.get(&second.id).unwrap().owned);
 }
 
 #[test]
@@ -290,7 +295,6 @@ fn session_registry_unbind_clears_owned() {
     registry.unbind(&state.id);
     let session = registry.sessions.get(&state.id).unwrap();
     assert!(!session.owned);
-    assert!(registry.bound_session.is_none());
 }
 
 #[test]

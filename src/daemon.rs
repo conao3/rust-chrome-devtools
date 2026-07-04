@@ -188,7 +188,7 @@ pub(crate) fn run_daemon(profile: &Profile) -> Result<(), String> {
     ensure_chrome(profile)?;
     let mcp_port = current_port(profile)
         .ok_or_else(|| "runtime port is missing after ensure_chrome".to_string())?;
-    let mut command = mcp_command(profile);
+    let mut command = daemon_mcp_command(profile);
     eprintln!(
         "chrome-devtools {} daemon starting MCP: {:?}",
         env!("CARGO_PKG_VERSION"),
@@ -211,7 +211,9 @@ pub(crate) fn run_daemon(profile: &Profile) -> Result<(), String> {
     let mut runtime = DaemonRuntimeGuard::new(mcp, socket_path.clone(), pid_path.clone());
     let mut mcp_reader = BufReader::new(mcp_stdout);
     initialize_daemon_mcp(&mut mcp_stdin, &mut mcp_reader)?;
-    let router = RouterHandle::start(mcp_stdin, mcp_reader);
+    let sessions: SharedSessions =
+        Arc::new((Mutex::new(SessionRegistry::default()), Condvar::new()));
+    let router = RouterHandle::start(mcp_stdin, mcp_reader, Arc::clone(&sessions));
 
     fs::write(&pid_path, format!("{}\n", std::process::id()))
         .map_err(|error| format!("failed to write {}: {error}", pid_path.display()))?;
@@ -222,8 +224,6 @@ pub(crate) fn run_daemon(profile: &Profile) -> Result<(), String> {
         .set_nonblocking(true)
         .map_err(|error| format!("failed to configure {}: {error}", socket_path.display()))?;
 
-    let sessions: SharedSessions =
-        Arc::new((Mutex::new(SessionRegistry::default()), Condvar::new()));
     let sessions_for_reaper = Arc::clone(&sessions);
     thread::spawn(move || loop {
         thread::sleep(SESSION_REAPER_INTERVAL);
@@ -429,7 +429,7 @@ pub(crate) fn bind_session(
     let bytes = reader.read_line(&mut response).map_err(|error| {
         if is_timeout_error(&error) {
             format!(
-                "{DAEMON_BUSY_PREFIX}: bind not acknowledged within {}s; another client is bound to the daemon, retry shortly (raise CHROME_DEVTOOLS_BIND_TIMEOUT_SECS to wait longer)",
+                "{DAEMON_BUSY_PREFIX}: bind not acknowledged within {}s; retry shortly (raise CHROME_DEVTOOLS_BIND_TIMEOUT_SECS to wait longer)",
                 timeout.as_secs()
             )
         } else {
@@ -820,6 +820,14 @@ pub(crate) fn list_mcp_tools(profile: &Profile) -> Result<(), String> {
 }
 
 pub(crate) const DEFAULT_MCP_VERSION: &str = "1.5.0";
+
+pub(crate) fn daemon_mcp_command(profile: &Profile) -> Command {
+    let mut command = mcp_command(profile);
+    command
+        .arg("--experimentalPageIdRouting")
+        .arg("--experimentalStructuredContent");
+    command
+}
 
 pub(crate) fn mcp_command(profile: &Profile) -> Command {
     let mut command = if let Ok(program) = env::var("CHROME_DEVTOOLS_MCP_COMMAND") {

@@ -43,10 +43,10 @@ npx skills add ./rust-chrome-devtools
 - Hermes-side Chrome DevTools MCP registration is not required for this workflow.
 - Snapshot `uid` values are MCP-process-local. Keep `take_snapshot -> click/fill` on the same profile daemon, or in one direct MCP process when bypassing the daemon.
 - The daemon owns one `chrome-devtools-mcp` process per profile, so multiple CLI invocations do not create competing MCP processes for the same Chrome profile.
-- The daemon accepts control commands independently of MCP forwarding, so `session create`, `session list`, `session close`, `daemon status`, and `daemon stop` respond while another client is bound.
+- The daemon accepts control commands independently of MCP forwarding, so `session create`, `session list`, `session close`, `daemon status`, and `daemon stop` respond while clients are bound.
 - The daemon rewrites client JSON-RPC ids internally and restores the original id in responses, including string ids.
 - `mcp direct-call` and `mcp direct-list` remain available as a fallback and take a per-profile lock under `~/.cache/chrome-devtools/locks`.
-- `mcp call` and `mcp batch` require an explicit `--session <id>` minted by `session create`. Sessions live in-memory on the daemon and expire after 30 minutes of inactivity. Concurrent agents must mint and use their own session ids so the daemon can serialize their `take_snapshot` -> `click/fill` flows independently.
+- `mcp call` and `mcp batch` require an explicit `--session <id>` minted by `session create`. Sessions live in-memory on the daemon and expire after 30 minutes of inactivity. Concurrent agents must mint and use their own session ids; the daemon assigns each session to a page and injects `pageId` for page-scoped tools.
 
 ## Configuration
 

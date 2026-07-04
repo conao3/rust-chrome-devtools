@@ -13,10 +13,10 @@ Use `chrome-devtools` when you need browser automation through Chrome DevTools M
 - **Mint a session before running `mcp call` or `mcp batch`.** Both subcommands require `--session <id>` and refuse to start without it. Use `chrome-devtools session create --profile <name>` to get an id, then reuse the same id for every related invocation.
 - **For multi-step automation, prefer `chrome-devtools mcp batch --profile <name> --session <id> --script <path>`.** It executes a JSON scenario through the daemon and returns a JSON array of results, which is far easier to parse than line-delimited JSON-RPC.
 - For ad-hoc/interactive flows (especially `take_snapshot` → inspect uids → follow-up tool call in the same shell session), use `chrome-devtools mcp call --profile <name> --session <id>` with stdin JSON-RPC.
-- Both `mcp batch` and `mcp call` route through one long-lived per-profile daemon, so `take_snapshot` uids returned in step N can be reused in step N+1 within the same scenario or the same `mcp call` invocation.
+- Both `mcp batch` and `mcp call` route through one long-lived per-profile daemon. The daemon assigns each session to a page and injects `pageId` for page-scoped tools.
 - Sessions expire after 30 minutes of inactivity. Activity (any tool call) refreshes the timer. After expiry, mint a new id.
-- A session is held exclusively while bound by a `mcp call` / `mcp batch` invocation. A second concurrent invocation on the same session id is rejected by the daemon. Each parallel agent should own its own session id.
-- `take_snapshot` result `uid` values are MCP-session-local. They stay valid only while the same daemon-owned MCP process is alive.
+- A session is held exclusively while bound by a `mcp call` / `mcp batch` invocation. A second concurrent invocation on the same session id is rejected by the daemon. Different session ids may run concurrently.
+- `take_snapshot` result `uid` values are valid for the session's current page inside the daemon-owned MCP process.
 - Do not use `mcp direct-call` for a split `take_snapshot` then `click`/`fill` workflow; direct mode starts a separate MCP process and the snapshot cache is lost.
 - Take a fresh snapshot before using `click`, `fill`, or other uid-based actions if the page may have changed.
 - Do not start or kill the user's regular Chrome unless explicitly asked.
@@ -75,7 +75,7 @@ chrome-devtools session list --profile conao3
 chrome-devtools session close --profile conao3 --session "$SESSION"
 ```
 
-Sessions are in-memory on the daemon. They are dropped after 30 minutes of inactivity or when the daemon stops (`chrome-devtools daemon stop --profile <name>`). After expiry, mint a new id.
+Sessions are in-memory on the daemon. They are dropped after 30 minutes of inactivity or when the daemon stops (`chrome-devtools daemon stop --profile <name>`). After expiry, mint a new id. When a session first uses a page-scoped tool, the daemon assigns it a background page and routes later page-scoped calls to that page.
 
 ## Batch Execution (Preferred for Multi-Step Workflows)
 
@@ -126,7 +126,7 @@ chrome-devtools mcp batch --profile conao3 --session "$SESSION" --script /tmp/sc
 
 ### Example: snapshot → click reusing the uid
 
-Because all steps share the same daemon-owned MCP session, a `take_snapshot` step's uid can be referenced by a later `click` step in the same scenario.
+Because all steps share the same daemon session page, a `take_snapshot` step's uid can be referenced by a later `click` step in the same scenario.
 
 ```sh
 cat > /tmp/click-scenario.json <<'JSON'
@@ -218,7 +218,6 @@ chrome-devtools profile stop --profile conao3
 
 - If `mcp call` or `mcp batch` exits with `unknown session`, the session expired (30 min idle) or the daemon restarted. Mint a new id via `session create` and retry.
 - If `mcp call` or `mcp batch` exits with `session in use`, another invocation is currently bound to that id. Wait for it to finish or mint a separate session for the new agent.
-- If `mcp call` or `mcp batch` exits with `daemon busy`, another client is bound to the daemon. Retry shortly; the wait is bounded by `CHROME_DEVTOOLS_BIND_TIMEOUT_SECS` (default 120). Do not stop the daemon to recover; that destroys other agents' sessions.
 - File-writing tool arguments (`take_screenshot` `filePath` etc.) accept paths under your home directory and the OS tempdir.
 - If the CLI warns about a daemon version mismatch, the daemon predates the installed CLI. Behavior fixes in the daemon only apply after it restarts; `daemon stop` (without `--force`) is safe once `sessions=0`.
 - If `daemon status` shows `chrome=unreachable`, restart the daemon; it is attached to a Chrome endpoint that no longer answers.

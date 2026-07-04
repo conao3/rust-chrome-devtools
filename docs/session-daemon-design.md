@@ -33,7 +33,7 @@ The daemon owns:
 1. Start one daemon per profile with `chrome-devtools daemon start --profile <name>`.
 2. Keep one `chrome-devtools-mcp` process alive inside the daemon.
 3. Route `chrome-devtools mcp call --profile <name> --session <id>`, `mcp batch --profile <name> --session <id> --script <path>`, and `mcp list --profile <name>` through the daemon by default.
-4. Serialize client requests per profile so `take_snapshot -> click` stays inside the same MCP process and is not interleaved with another writer.
+4. Route page-scoped tools through session-owned pages so `take_snapshot -> click` stays on the session page.
 5. Keep `mcp direct-call` and `mcp direct-list` as fallbacks for simple/manual debugging.
 
 The daemon uses a Unix domain socket under `~/.cache/chrome-devtools/daemons/<profile>.sock` and a pid file next to it. The profile-level lock under `~/.cache/chrome-devtools/locks` is held for the daemon lifetime, so direct fallback MCP commands do not run concurrently with the profile daemon.
@@ -74,11 +74,10 @@ Each client connection sends a line beginning with `__chrome_devtools_daemon__:`
 
 After a successful `bind`, the daemon stays in JSON-RPC forwarding mode on that connection: each JSON-RPC line is forwarded to the long-lived `chrome-devtools-mcp` child, and matching responses are streamed back.
 
-Control commands use independent daemon client connections and only take the session registry mutex. They respond while another client is bound. MCP forwarding goes through a single router that owns the MCP stdin/stdout pair, rewrites each client JSON-RPC id to a daemon-local numeric id, and restores the original id in the response.
+Control commands use independent daemon client connections and only take the session registry mutex. They respond while clients are bound. MCP forwarding goes through a single router that owns the MCP stdin/stdout pair, rewrites each client JSON-RPC id to a daemon-local numeric id, restores the original id in the response, and injects the session page id for page-scoped tools.
 
 ## Future direction
 
-- Background tab parallelism: bind multiple sessions to background browser tabs and run independent agents in parallel without sharing the active tab.
 - Per-tab snapshot cache: route snapshot uids through session-scoped maps so concurrent agents do not invalidate each other's uids.
 - Lock modes (`read`, `write`, `exclusive`) and origin-scoped locking for mutating operations.
 - Commands must not rely on Chrome's active tab.
@@ -87,10 +86,10 @@ Control commands use independent daemon client connections and only take the ses
 
 - No Chrome extension yet.
 - No attempt to bypass website access controls, CAPTCHA, or login prompts.
-- No BrowserContext-level isolation between sessions. Sessions today gate the daemon-level mutex and `last_used_at` timer; they do not yet partition cookies, snapshot uids, or active tab.
+- No BrowserContext-level isolation between sessions. Sessions route page-scoped tools to a session page; they share cookies and profile storage.
 - No parallel writes to the same website/account.
 - No implicit active-tab operations for automation flows.
 
 ## Operational rule for agents
 
-For any action sequence that uses snapshot `uid` values, keep all related MCP calls in the same `chrome-devtools mcp call` invocation, or chain them inside one `mcp batch` script. Both bind a single session for their lifetime, so the daemon prevents another client from interleaving. Do not take a snapshot in one command invocation and click/fill in another independent MCP process.
+For any action sequence that uses snapshot `uid` values, keep all related MCP calls in the same session. The daemon assigns the session to a page and injects that page id for page-scoped tools. Use one `chrome-devtools mcp call` invocation, or chain the calls inside one `mcp batch` script.

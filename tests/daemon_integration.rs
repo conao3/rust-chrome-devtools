@@ -136,6 +136,57 @@ fn control_roundtrip(stream: &mut UnixStream, command: &str) -> String {
     line.trim_end().to_string()
 }
 
+fn bind_stream(stream: &mut UnixStream, session: &str) {
+    let bound = control_roundtrip(stream, &format!("bind session={session}"));
+    assert_eq!(bound, format!("bound={session}"));
+}
+
+fn json_roundtrip(stream: &mut UnixStream, request: serde_json::Value) -> serde_json::Value {
+    stream
+        .write_all(request.to_string().as_bytes())
+        .and_then(|_| stream.write_all(b"\n"))
+        .and_then(|_| stream.flush())
+        .unwrap();
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    let mut line = String::new();
+    reader.read_line(&mut line).unwrap();
+    serde_json::from_str(line.trim_end()).unwrap()
+}
+
+fn tool_call(
+    stream: &mut UnixStream,
+    id: u64,
+    name: &str,
+    arguments: serde_json::Value,
+) -> serde_json::Value {
+    json_roundtrip(
+        stream,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/call",
+            "params": {
+                "name": name,
+                "arguments": arguments
+            }
+        }),
+    )
+}
+
+fn content_text(response: &serde_json::Value) -> &str {
+    response["result"]["content"][0]["text"].as_str().unwrap()
+}
+
+fn selected_page_id(response: &serde_json::Value) -> u64 {
+    response["result"]["structuredContent"]["pages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|page| page["selected"] == true)
+        .and_then(|page| page["id"].as_u64())
+        .unwrap()
+}
+
 #[test]
 fn smoke_session_create_and_batch() {
     let mut env = TestEnv::new("smoke");
@@ -159,10 +210,7 @@ fn smoke_session_create_and_batch() {
         script.to_str().unwrap(),
     ]);
     assert!(ok, "batch failed: {output}");
-    assert!(
-        output.contains("\"text\": \"ok\""),
-        "batch output: {output}"
-    );
+    assert!(output.contains("snapshot page="), "batch output: {output}");
 }
 
 #[test]
@@ -254,7 +302,13 @@ fn string_jsonrpc_id_roundtrips_through_daemon() {
     reader.read_line(&mut line).unwrap();
     let value: serde_json::Value = serde_json::from_str(line.trim_end()).unwrap();
     assert_eq!(value["id"], "client-a");
-    assert_eq!(value["result"]["tools"], serde_json::json!([]));
+    let click = value["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "click")
+        .unwrap();
+    assert!(click["inputSchema"]["properties"].get("pageId").is_none());
 }
 
 #[test]
@@ -306,6 +360,231 @@ fn control_commands_respond_while_client_bound() {
         .read_line(&mut line)
         .expect("session_create should answer within 5s while another client is bound");
     assert!(line.starts_with("session="), "unexpected response: {line}");
+}
+
+#[test]
+fn daemon_starts_mcp_with_page_id_routing_and_hides_page_id_schema() {
+    let mut env = TestEnv::new("pageidflag");
+    env.start_daemon();
+    let args = fs::read_to_string(env.home.join("fake-mcp-args")).unwrap();
+    assert!(args.contains("--experimentalPageIdRouting"), "args: {args}");
+
+    let (ok, output) = env.run_cli(&["mcp", "list", "--profile", "default"]);
+    assert!(ok, "mcp list failed: {output}");
+    let value: serde_json::Value = serde_json::from_str(output.trim()).unwrap();
+    let tools = value["result"]["tools"].as_array().unwrap();
+    let click = tools.iter().find(|tool| tool["name"] == "click").unwrap();
+    let select_page = tools
+        .iter()
+        .find(|tool| tool["name"] == "select_page")
+        .unwrap();
+    assert!(
+        click["inputSchema"]["properties"].get("pageId").is_none(),
+        "output: {output}"
+    );
+    assert!(
+        click["inputSchema"]["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|entry| entry.as_str() != Some("pageId")),
+        "output: {output}"
+    );
+    assert!(
+        select_page["inputSchema"]["properties"]
+            .get("pageId")
+            .is_some(),
+        "output: {output}"
+    );
+}
+
+#[test]
+fn multiple_sessions_can_bind_at_the_same_time() {
+    let mut env = TestEnv::new("multibind");
+    env.start_daemon();
+    let first = env.create_session();
+    let second = env.create_session();
+
+    let mut first_stream = env.connect();
+    bind_stream(&mut first_stream, &first);
+    let mut second_stream = env.connect();
+    bind_stream(&mut second_stream, &second);
+
+    let first_response = tool_call(
+        &mut first_stream,
+        10,
+        "evaluate_script",
+        serde_json::json!({
+            "function": "() => location.href"
+        }),
+    );
+    let second_response = tool_call(
+        &mut second_stream,
+        11,
+        "evaluate_script",
+        serde_json::json!({
+            "function": "() => location.href"
+        }),
+    );
+    assert!(content_text(&first_response).contains("evaluated page="));
+    assert!(content_text(&second_response).contains("evaluated page="));
+}
+
+#[test]
+fn session_tabs_keep_snapshot_state_independent() {
+    let mut env = TestEnv::new("tabstate");
+    env.start_daemon();
+    let first = env.create_session();
+    let second = env.create_session();
+    let mut first_stream = env.connect();
+    let mut second_stream = env.connect();
+    bind_stream(&mut first_stream, &first);
+    bind_stream(&mut second_stream, &second);
+
+    let first_page = selected_page_id(&tool_call(
+        &mut first_stream,
+        20,
+        "new_page",
+        serde_json::json!({"url": "https://a.test/"}),
+    ));
+    let second_page = selected_page_id(&tool_call(
+        &mut second_stream,
+        21,
+        "new_page",
+        serde_json::json!({"url": "https://b.test/"}),
+    ));
+    assert_ne!(first_page, second_page);
+
+    let first_snapshot = tool_call(
+        &mut first_stream,
+        22,
+        "take_snapshot",
+        serde_json::json!({}),
+    );
+    let second_snapshot = tool_call(
+        &mut second_stream,
+        23,
+        "take_snapshot",
+        serde_json::json!({}),
+    );
+    assert!(content_text(&first_snapshot).contains(&format!("page={first_page}")));
+    assert!(content_text(&second_snapshot).contains(&format!("page={second_page}")));
+
+    let first_click = tool_call(
+        &mut first_stream,
+        24,
+        "click",
+        serde_json::json!({"uid": format!("{first_page}_button")}),
+    );
+    let second_click = tool_call(
+        &mut second_stream,
+        25,
+        "click",
+        serde_json::json!({"uid": format!("{second_page}_button")}),
+    );
+    assert_eq!(
+        content_text(&first_click),
+        format!("clicked page={first_page} uid={first_page}_button")
+    );
+    assert_eq!(
+        content_text(&second_click),
+        format!("clicked page={second_page} uid={second_page}_button")
+    );
+}
+
+#[test]
+fn list_pages_marks_the_calling_session_page() {
+    let mut env = TestEnv::new("listpages");
+    env.start_daemon();
+    let first = env.create_session();
+    let second = env.create_session();
+    let mut first_stream = env.connect();
+    let mut second_stream = env.connect();
+    bind_stream(&mut first_stream, &first);
+    bind_stream(&mut second_stream, &second);
+
+    let first_page = selected_page_id(&tool_call(
+        &mut first_stream,
+        30,
+        "new_page",
+        serde_json::json!({"url": "https://a.test/"}),
+    ));
+    let second_page = selected_page_id(&tool_call(
+        &mut second_stream,
+        31,
+        "new_page",
+        serde_json::json!({"url": "https://b.test/"}),
+    ));
+
+    let first_pages = tool_call(&mut first_stream, 32, "list_pages", serde_json::json!({}));
+    let second_pages = tool_call(&mut second_stream, 33, "list_pages", serde_json::json!({}));
+    assert_eq!(selected_page_id(&first_pages), first_page);
+    assert_eq!(selected_page_id(&second_pages), second_page);
+}
+
+#[test]
+fn select_page_changes_only_the_calling_session_target() {
+    let mut env = TestEnv::new("selectpage");
+    env.start_daemon();
+    let first = env.create_session();
+    let second = env.create_session();
+    let mut first_stream = env.connect();
+    let mut second_stream = env.connect();
+    bind_stream(&mut first_stream, &first);
+    bind_stream(&mut second_stream, &second);
+
+    tool_call(
+        &mut first_stream,
+        40,
+        "new_page",
+        serde_json::json!({"url": "https://a.test/"}),
+    );
+    let second_page = selected_page_id(&tool_call(
+        &mut second_stream,
+        41,
+        "new_page",
+        serde_json::json!({"url": "https://b.test/"}),
+    ));
+    tool_call(
+        &mut first_stream,
+        42,
+        "select_page",
+        serde_json::json!({"pageId": 1}),
+    );
+
+    let first_snapshot = tool_call(
+        &mut first_stream,
+        43,
+        "take_snapshot",
+        serde_json::json!({}),
+    );
+    let second_snapshot = tool_call(
+        &mut second_stream,
+        44,
+        "take_snapshot",
+        serde_json::json!({}),
+    );
+    assert!(content_text(&first_snapshot).contains("page=1 "));
+    assert!(content_text(&second_snapshot).contains(&format!("page={second_page}")));
+}
+
+#[test]
+fn session_attach_sets_page_target() {
+    let mut env = TestEnv::new("attachpage");
+    env.start_daemon();
+    let session = env.create_session();
+
+    let mut control = env.connect();
+    let attached = control_roundtrip(
+        &mut control,
+        &format!("session_attach session={session} page=1"),
+    );
+    assert_eq!(attached, format!("session={session} page=1"));
+
+    let mut stream = env.connect();
+    bind_stream(&mut stream, &session);
+    let snapshot = tool_call(&mut stream, 50, "take_snapshot", serde_json::json!({}));
+    assert!(content_text(&snapshot).contains("page=1 "));
 }
 
 #[test]

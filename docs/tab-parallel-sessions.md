@@ -134,7 +134,7 @@ Regular client output should present the session page as the selected page so ag
 
 ## Execution model
 
-Multiple daemon client connections can be bound to different sessions at the same time. The session registry should replace the single `bound_session` slot with per-session ownership.
+Multiple daemon client connections can be bound to different sessions at the same time. The session registry uses per-session ownership.
 
 The router still serializes writes to the single MCP process. MCP 1.5.0 also has a process-wide `toolMutex`, so one long-running tool call delays later tool calls. Tab parallelism gives state isolation first: sessions can stay active, hold their own page ids, and keep uid maps while preserving each session's page and uid state.
 
