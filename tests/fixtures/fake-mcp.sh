@@ -5,6 +5,17 @@ page_ids="1"
 page_urls="1=about:blank"
 selected_page=1
 next_page=2
+state_file="${HOME}/fake-mcp-pages"
+
+if [ "${FAKE_MCP_PERSIST_PAGES:-}" = "1" ] && [ -f "$state_file" ]; then
+  . "$state_file"
+fi
+
+save_state() {
+  if [ "${FAKE_MCP_PERSIST_PAGES:-}" = "1" ]; then
+    declare -p page_ids page_urls selected_page next_page > "$state_file"
+  fi
+}
 
 json_escape() {
   printf '%s' "$1" | sed ':a;N;$!ba;s|\\|\\\\|g; s|"|\\"|g; s|\n|\\n|g'
@@ -134,7 +145,7 @@ while IFS= read -r line; do
     *'"method":"tools/call"'*)
       name=$(field_string "$line" name)
       if [ "${FAKE_MCP_HANG_TOOL:-}" = "$name" ]; then
-        sleep 60
+        sleep "${FAKE_MCP_HANG_SECS:-60}"
       fi
       case "$name" in
         new_page)
@@ -145,6 +156,7 @@ while IFS= read -r line; do
           page_ids="$page_ids $page_id"
           set_page_url "$page_id" "$url"
           selected_page="$page_id"
+          save_state
           tool_response "$id" "$(pages_text)" "{\"pages\":$(pages_structured)}" ;;
         list_pages)
           tool_response "$id" "$(pages_text)" "{\"pages\":$(pages_structured)}" ;;
@@ -153,6 +165,7 @@ while IFS= read -r line; do
           count=$(printf '%s\n' $page_ids | wc -l)
           if [ "$count" -gt 1 ]; then
             remove_page "$page_id"
+            save_state
             tool_response "$id" "$(pages_text)" "{\"pages\":$(pages_structured)}"
           else
             error_response "$id" "The last open page cannot be closed. It is fine to keep it open."
@@ -160,6 +173,7 @@ while IFS= read -r line; do
         select_page)
           page_id=$(field_number "$line" pageId)
           selected_page="$page_id"
+          save_state
           tool_response "$id" "$(pages_text)" "{\"pages\":$(pages_structured)}" ;;
         take_snapshot)
           page_id=$(field_number "$line" pageId)
@@ -213,6 +227,7 @@ while IFS= read -r line; do
           [ -z "$page_id" ] && page_id="$selected_page"
           url=$(field_string "$line" url)
           [ -n "$url" ] && set_page_url "$page_id" "$url"
+          save_state
           tool_response "$id" "navigated page=$page_id" "{}" ;;
         *)
           page_id=$(field_number "$line" pageId)

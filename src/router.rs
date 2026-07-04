@@ -4,6 +4,7 @@ use crate::daemon::{
     record_daemon_respawn, terminate_child,
 };
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::env;
 use std::io::BufRead;
 use std::io::BufReader;
@@ -31,7 +32,7 @@ pub(crate) const SESSION_IDLE_TTL: Duration = Duration::from_secs(30 * 60);
 
 pub(crate) const SESSION_REAPER_INTERVAL: Duration = Duration::from_secs(60);
 
-pub(crate) const MCP_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
+pub(crate) const MCP_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 pub(crate) fn mcp_request_timeout() -> Duration {
     env::var("CHROME_DEVTOOLS_MCP_REQUEST_TIMEOUT_SECS")
@@ -39,6 +40,16 @@ pub(crate) fn mcp_request_timeout() -> Duration {
         .and_then(|value| value.parse::<u64>().ok())
         .map(Duration::from_secs)
         .unwrap_or(MCP_REQUEST_TIMEOUT)
+}
+
+pub(crate) const MCP_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
+pub(crate) fn mcp_probe_timeout() -> Duration {
+    env::var("CHROME_DEVTOOLS_MCP_PROBE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(MCP_PROBE_TIMEOUT)
 }
 
 pub(crate) fn session_idle_ttl() -> Duration {
@@ -60,6 +71,7 @@ pub(crate) fn session_reaper_interval() -> Duration {
 #[derive(Clone, Debug)]
 pub(crate) struct PageCleanup {
     pub(crate) page_id: u64,
+    pub(crate) page_url: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -286,7 +298,10 @@ impl SessionRegistry {
 
 fn page_cleanup_for_session(session: SessionState) -> Option<PageCleanup> {
     if session.page_created_by_daemon {
-        session.page_id.map(|page_id| PageCleanup { page_id })
+        session.page_id.map(|page_id| PageCleanup {
+            page_id,
+            page_url: session.page_url,
+        })
     } else {
         None
     }
@@ -404,16 +419,41 @@ fn clear_sessions(sessions: &SharedSessions) {
     }
 }
 
+fn daemon_page_cleanups(sessions: &SharedSessions) -> Vec<PageCleanup> {
+    let (lock, _) = &**sessions;
+    lock.lock()
+        .map(|registry| {
+            registry
+                .list()
+                .into_iter()
+                .filter_map(page_cleanup_for_session)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn respawn_runtime(
     profile: &Profile,
     runtime: &mut McpRuntime,
     sessions: &SharedSessions,
+    next_id: &mut u64,
+    abandoned_ids: &mut HashSet<u64>,
     reason: &str,
 ) -> Result<(), String> {
+    let pages = daemon_page_cleanups(sessions);
     terminate_child(&mut runtime.child);
     ensure_chrome(profile)?;
     let next = start_mcp_runtime(profile)?;
     *runtime = next;
+    if let Err(error) = close_respawned_daemon_pages(
+        &mut runtime.stdin,
+        &mut runtime.reader,
+        next_id,
+        abandoned_ids,
+        pages,
+    ) {
+        eprintln!("warning: failed to clean daemon-created pages after MCP respawn: {error}");
+    }
     clear_sessions(sessions);
     record_daemon_respawn(profile, reason);
     Ok(())
@@ -423,6 +463,8 @@ fn ensure_runtime_ready(
     profile: &Profile,
     runtime: &mut McpRuntime,
     sessions: &SharedSessions,
+    next_id: &mut u64,
+    abandoned_ids: &mut HashSet<u64>,
 ) -> Result<(), String> {
     if runtime
         .child
@@ -430,10 +472,24 @@ fn ensure_runtime_ready(
         .map_err(|error| format!("failed to poll chrome-devtools-mcp: {error}"))?
         .is_some()
     {
-        return respawn_runtime(profile, runtime, sessions, "mcp exited");
+        return respawn_runtime(
+            profile,
+            runtime,
+            sessions,
+            next_id,
+            abandoned_ids,
+            "mcp exited",
+        );
     }
     if !is_devtools_ready(runtime.port) {
-        return respawn_runtime(profile, runtime, sessions, "devtools unreachable");
+        return respawn_runtime(
+            profile,
+            runtime,
+            sessions,
+            next_id,
+            abandoned_ids,
+            "devtools unreachable",
+        );
     }
     Ok(())
 }
@@ -467,9 +523,16 @@ impl RouterHandle {
         let queued_for_router = Arc::clone(&queued);
         thread::spawn(move || {
             let mut next_id: u64 = 10_000;
+            let mut abandoned_ids = HashSet::new();
             for request in receiver {
                 queued_for_router.fetch_sub(1, Ordering::SeqCst);
-                if let Err(error) = ensure_runtime_ready(&profile, &mut runtime, &sessions) {
+                if let Err(error) = ensure_runtime_ready(
+                    &profile,
+                    &mut runtime,
+                    &sessions,
+                    &mut next_id,
+                    &mut abandoned_ids,
+                ) {
                     eprintln!("warning: failed to self-heal MCP runtime: {error}");
                 }
                 match request {
@@ -485,28 +548,45 @@ impl RouterHandle {
                             session_id.as_deref(),
                             &line,
                             &mut next_id,
+                            &mut abandoned_ids,
                         );
-                        let result = match result {
-                            Ok(lines) => Ok(lines),
-                            Err(message) => {
-                                if message.contains("MCP request timed out") {
+                        match result {
+                            Ok(lines) => {
+                                let _ = response.send(Ok(lines));
+                            }
+                            Err(message) if message.contains("MCP request timed out") => {
+                                let _ = response.send(Ok(error_response_for_line(&line, &message)));
+                                if let Err(error) = probe_mcp_runtime(
+                                    &mut runtime.stdin,
+                                    &mut runtime.reader,
+                                    &mut next_id,
+                                    &mut abandoned_ids,
+                                ) {
+                                    eprintln!(
+                                        "warning: MCP probe failed after request timeout: {error}"
+                                    );
                                     let _ = respawn_runtime(
                                         &profile,
                                         &mut runtime,
                                         &sessions,
-                                        "mcp request timeout",
+                                        &mut next_id,
+                                        &mut abandoned_ids,
+                                        "mcp probe failed after request timeout",
                                     );
+                                    abandoned_ids.clear();
                                 }
-                                Ok(error_response_for_line(&line, &message))
                             }
-                        };
-                        let _ = response.send(result);
+                            Err(message) => {
+                                let _ = response.send(Ok(error_response_for_line(&line, &message)));
+                            }
+                        }
                     }
                     RouterRequest::ClosePages { pages, response } => {
                         let result = close_daemon_pages(
                             &mut runtime.stdin,
                             &mut runtime.reader,
                             &mut next_id,
+                            &mut abandoned_ids,
                             pages,
                         );
                         let _ = response.send(result);
@@ -609,6 +689,7 @@ pub(crate) fn forward_line(
     mcp_reader: &mut impl BufRead,
     line: &str,
     next_id: &mut u64,
+    abandoned_ids: &mut HashSet<u64>,
 ) -> Result<Vec<String>, String> {
     let Some(original_id) = extract_jsonrpc_id_value(line) else {
         write_json_line(mcp_stdin, line)?;
@@ -619,9 +700,21 @@ pub(crate) fn forward_line(
     let forwarded = rewrite_jsonrpc_id(line, serde_json::json!(internal_id))?;
     write_json_line(mcp_stdin, &forwarded)?;
     let mut lines = Vec::new();
+    let deadline = Instant::now() + mcp_request_timeout();
     loop {
-        let response_line =
-            read_mcp_response_line(mcp_stdin, mcp_reader).map_err(|error| format!("{error:?}"))?;
+        let response_line = read_mcp_response_line_until_ignoring(
+            mcp_stdin,
+            mcp_reader,
+            deadline,
+            abandoned_ids,
+        )
+        .map_err(|error| {
+            if matches!(error, DaemonError::Fatal(ref message) if message == "MCP request timed out")
+            {
+                abandoned_ids.insert(internal_id);
+            }
+            format!("{error:?}")
+        })?;
         if extract_jsonrpc_id(&response_line) == Some(internal_id) {
             lines.push(rewrite_jsonrpc_id(&response_line, original_id.clone())?);
             return Ok(lines);
@@ -634,7 +727,26 @@ fn mcp_call(
     mcp_stdin: &mut impl Write,
     mcp_reader: &mut impl BufRead,
     next_id: &mut u64,
+    abandoned_ids: &mut HashSet<u64>,
+    request: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    mcp_call_until(
+        mcp_stdin,
+        mcp_reader,
+        next_id,
+        abandoned_ids,
+        request,
+        Instant::now() + mcp_request_timeout(),
+    )
+}
+
+fn mcp_call_until(
+    mcp_stdin: &mut impl Write,
+    mcp_reader: &mut impl BufRead,
+    next_id: &mut u64,
+    abandoned_ids: &mut HashSet<u64>,
     mut request: serde_json::Value,
+    deadline: Instant,
 ) -> Result<serde_json::Value, String> {
     let internal_id = *next_id;
     *next_id = next_id.wrapping_add(1);
@@ -642,13 +754,44 @@ fn mcp_call(
     request["id"] = serde_json::json!(internal_id);
     write_json_line(mcp_stdin, &request.to_string())?;
     loop {
-        let response_line =
-            read_mcp_response_line(mcp_stdin, mcp_reader).map_err(|error| format!("{error:?}"))?;
+        let response_line = read_mcp_response_line_until_ignoring(
+            mcp_stdin,
+            mcp_reader,
+            deadline,
+            abandoned_ids,
+        )
+        .map_err(|error| {
+            if matches!(error, DaemonError::Fatal(ref message) if message == "MCP request timed out")
+            {
+                abandoned_ids.insert(internal_id);
+            }
+            format!("{error:?}")
+        })?;
         if extract_jsonrpc_id(&response_line) == Some(internal_id) {
             return serde_json::from_str(&response_line)
                 .map_err(|error| format!("failed to parse MCP response: {error}"));
         }
     }
+}
+
+fn probe_mcp_runtime(
+    mcp_stdin: &mut impl Write,
+    mcp_reader: &mut impl BufRead,
+    next_id: &mut u64,
+    abandoned_ids: &mut HashSet<u64>,
+) -> Result<(), String> {
+    let _ = mcp_call_until(
+        mcp_stdin,
+        mcp_reader,
+        next_id,
+        abandoned_ids,
+        serde_json::json!({
+            "method": "tools/list",
+            "params": {}
+        }),
+        Instant::now() + mcp_probe_timeout(),
+    )?;
+    Ok(())
 }
 
 fn selected_page_id(response: &serde_json::Value) -> Option<u64> {
@@ -679,15 +822,47 @@ fn response_page_ids(response: &serde_json::Value) -> Vec<u64> {
         .unwrap_or_default()
 }
 
+#[derive(Clone, Debug)]
+struct PageEntry {
+    id: u64,
+    url: String,
+}
+
+fn response_page_entries(response: &serde_json::Value) -> Vec<PageEntry> {
+    response
+        .get("result")
+        .and_then(|result| result.get("structuredContent"))
+        .and_then(|structured| structured.get("pages"))
+        .and_then(|pages| pages.as_array())
+        .map(|pages| {
+            pages
+                .iter()
+                .filter_map(|page| {
+                    Some(PageEntry {
+                        id: page.get("id").and_then(|id| id.as_u64())?,
+                        url: page
+                            .get("url")
+                            .and_then(|url| url.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn list_page_ids(
     mcp_stdin: &mut impl Write,
     mcp_reader: &mut impl BufRead,
     next_id: &mut u64,
+    abandoned_ids: &mut HashSet<u64>,
 ) -> Result<Vec<u64>, String> {
     let response = mcp_call(
         mcp_stdin,
         mcp_reader,
         next_id,
+        abandoned_ids,
         serde_json::json!({
             "method": "tools/call",
             "params": {
@@ -699,14 +874,120 @@ fn list_page_ids(
     Ok(response_page_ids(&response))
 }
 
+fn close_respawned_daemon_pages(
+    mcp_stdin: &mut impl Write,
+    mcp_reader: &mut impl BufRead,
+    next_id: &mut u64,
+    abandoned_ids: &mut HashSet<u64>,
+    pages: Vec<PageCleanup>,
+) -> Result<(), String> {
+    if pages.is_empty() {
+        return Ok(());
+    }
+    let response = mcp_call_until(
+        mcp_stdin,
+        mcp_reader,
+        next_id,
+        abandoned_ids,
+        serde_json::json!({
+            "method": "tools/call",
+            "params": {
+                "name": "list_pages",
+                "arguments": {}
+            }
+        }),
+        Instant::now() + mcp_probe_timeout(),
+    )?;
+    let entries = response_page_entries(&response);
+    let mut open_count = entries.len();
+    let mut closed_ids = HashSet::new();
+    let mut remaining_urls = pages.iter().filter_map(|page| page.page_url.as_ref()).fold(
+        HashMap::<String, usize>::new(),
+        |mut counts, url| {
+            *counts.entry(url.clone()).or_default() += 1;
+            counts
+        },
+    );
+
+    for page in &pages {
+        if open_count <= 1 {
+            return Ok(());
+        }
+        let Some(entry) = entries.iter().find(|entry| {
+            entry.id == page.page_id
+                && page
+                    .page_url
+                    .as_ref()
+                    .map(|url| &entry.url == url)
+                    .unwrap_or(true)
+        }) else {
+            continue;
+        };
+        let _ = mcp_call_until(
+            mcp_stdin,
+            mcp_reader,
+            next_id,
+            abandoned_ids,
+            serde_json::json!({
+                "method": "tools/call",
+                "params": {
+                    "name": "close_page",
+                    "arguments": { "pageId": entry.id }
+                }
+            }),
+            Instant::now() + mcp_probe_timeout(),
+        )?;
+        closed_ids.insert(entry.id);
+        open_count -= 1;
+        if let Some(url) = page.page_url.as_ref() {
+            if let Some(count) = remaining_urls.get_mut(url) {
+                *count = count.saturating_sub(1);
+            }
+        }
+    }
+
+    for entry in &entries {
+        if open_count <= 1 {
+            return Ok(());
+        }
+        if closed_ids.contains(&entry.id) || entry.url == "about:blank" {
+            continue;
+        }
+        let Some(count) = remaining_urls.get_mut(&entry.url) else {
+            continue;
+        };
+        if *count == 0 {
+            continue;
+        }
+        let _ = mcp_call_until(
+            mcp_stdin,
+            mcp_reader,
+            next_id,
+            abandoned_ids,
+            serde_json::json!({
+                "method": "tools/call",
+                "params": {
+                    "name": "close_page",
+                    "arguments": { "pageId": entry.id }
+                }
+            }),
+            Instant::now() + mcp_probe_timeout(),
+        )?;
+        *count -= 1;
+        open_count -= 1;
+    }
+    Ok(())
+}
+
 fn close_daemon_pages(
     mcp_stdin: &mut impl Write,
     mcp_reader: &mut impl BufRead,
     next_id: &mut u64,
+    abandoned_ids: &mut HashSet<u64>,
     pages: Vec<PageCleanup>,
 ) -> Result<(), String> {
     for page in pages {
-        let current = list_page_ids(mcp_stdin, mcp_reader, next_id)?;
+        let current = list_page_ids(mcp_stdin, mcp_reader, next_id, abandoned_ids)?;
         if current.len() <= 1 || !current.contains(&page.page_id) {
             continue;
         }
@@ -714,6 +995,7 @@ fn close_daemon_pages(
             mcp_stdin,
             mcp_reader,
             next_id,
+            abandoned_ids,
             serde_json::json!({
                 "method": "tools/call",
                 "params": {
@@ -732,12 +1014,16 @@ fn ensure_session_page(
     sessions: &SharedSessions,
     session_id: &str,
     next_id: &mut u64,
+    abandoned_ids: &mut HashSet<u64>,
 ) -> Result<u64, String> {
     {
         let (lock, _) = &**sessions;
         let registry = lock
             .lock()
             .map_err(|_| "session registry poisoned".to_string())?;
+        if !registry.sessions.contains_key(session_id) {
+            return Err(format!("unknown session: {session_id}"));
+        }
         if let Some(page_id) = registry.page_id(session_id) {
             return Ok(page_id);
         }
@@ -746,6 +1032,7 @@ fn ensure_session_page(
         mcp_stdin,
         mcp_reader,
         next_id,
+        abandoned_ids,
         serde_json::json!({
             "method": "tools/call",
             "params": {
@@ -769,6 +1056,15 @@ fn session_page(sessions: &SharedSessions, session_id: &str) -> Option<u64> {
     lock.lock()
         .ok()
         .and_then(|registry| registry.page_id(session_id))
+}
+
+fn session_page_created_by_daemon(sessions: &SharedSessions, session_id: &str) -> bool {
+    let (lock, _) = &**sessions;
+    lock.lock()
+        .ok()
+        .and_then(|registry| registry.sessions.get(session_id).cloned())
+        .map(|session| session.page_created_by_daemon)
+        .unwrap_or(false)
 }
 
 fn record_session_page(
@@ -1066,20 +1362,21 @@ fn route_request(
     session_id: Option<&str>,
     line: &str,
     next_id: &mut u64,
+    abandoned_ids: &mut HashSet<u64>,
 ) -> Result<Vec<String>, String> {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
-        return forward_line(mcp_stdin, mcp_reader, line, next_id);
+        return forward_line(mcp_stdin, mcp_reader, line, next_id, abandoned_ids);
     };
     let method = value.get("method").and_then(|m| m.as_str()).unwrap_or("");
     if method == "tools/list" {
-        let mut lines = forward_line(mcp_stdin, mcp_reader, line, next_id)?;
+        let mut lines = forward_line(mcp_stdin, mcp_reader, line, next_id, abandoned_ids)?;
         if let Some(last) = lines.last_mut() {
             *last = strip_page_id_schema(last);
         }
         return Ok(lines);
     }
     if method != "tools/call" {
-        return forward_line(mcp_stdin, mcp_reader, line, next_id);
+        return forward_line(mcp_stdin, mcp_reader, line, next_id, abandoned_ids);
     }
     let name = value
         .get("params")
@@ -1088,26 +1385,53 @@ fn route_request(
         .unwrap_or("")
         .to_string();
     match name.as_str() {
-        "new_page" => route_new_page(mcp_stdin, mcp_reader, sessions, session_id, value, next_id),
+        "new_page" => route_new_page(
+            mcp_stdin,
+            mcp_reader,
+            sessions,
+            session_id,
+            value,
+            next_id,
+            abandoned_ids,
+        ),
         "list_pages" => {
-            let lines = forward_line(mcp_stdin, mcp_reader, line, next_id)?;
+            let lines = forward_line(mcp_stdin, mcp_reader, line, next_id, abandoned_ids)?;
             Ok(annotate_session_page(
                 lines,
                 session_id.and_then(|id| session_page(sessions, id)),
             ))
         }
         "select_page" => route_select_page(
-            mcp_stdin, mcp_reader, sessions, session_id, &value, line, next_id,
+            mcp_stdin,
+            mcp_reader,
+            sessions,
+            session_id,
+            &value,
+            line,
+            next_id,
+            abandoned_ids,
         ),
-        "close_page" => {
-            route_close_page(mcp_stdin, mcp_reader, sessions, session_id, &value, next_id)
-        }
+        "close_page" => route_close_page(
+            mcp_stdin,
+            mcp_reader,
+            sessions,
+            session_id,
+            &value,
+            next_id,
+            abandoned_ids,
+        ),
         other if is_page_scoped_tool(other) => {
             let Some(session_id) = session_id else {
                 return Err("page-scoped tool requires a bound session".to_string());
             };
-            let page_id =
-                ensure_session_page(mcp_stdin, mcp_reader, sessions, session_id, next_id)?;
+            let page_id = ensure_session_page(
+                mcp_stdin,
+                mcp_reader,
+                sessions,
+                session_id,
+                next_id,
+                abandoned_ids,
+            )?;
             let mut forwarded = value;
             inject_page_id(&mut forwarded, page_id);
             if let Some(arguments) = forwarded
@@ -1119,10 +1443,49 @@ fn route_request(
                     return Ok(request_error_line(&forwarded, &message));
                 }
             }
-            let lines = forward_line(mcp_stdin, mcp_reader, &forwarded.to_string(), next_id)?;
+            let navigated_url = if other == "navigate_page" {
+                forwarded
+                    .get("params")
+                    .and_then(|params| params.get("arguments"))
+                    .and_then(|arguments| arguments.get("url"))
+                    .and_then(|url| url.as_str())
+                    .map(|url| url.to_string())
+            } else {
+                None
+            };
+            let lines = forward_line(
+                mcp_stdin,
+                mcp_reader,
+                &forwarded.to_string(),
+                next_id,
+                abandoned_ids,
+            )?;
+            if let Some(url) = navigated_url {
+                let errored = lines
+                    .last()
+                    .and_then(|last| serde_json::from_str::<serde_json::Value>(last).ok())
+                    .map(|response| {
+                        response.get("error").is_some()
+                            || response
+                                .get("result")
+                                .and_then(|result| result.get("isError"))
+                                .and_then(|is_error| is_error.as_bool())
+                                == Some(true)
+                    })
+                    .unwrap_or(false);
+                if !errored {
+                    let _ = record_session_page(
+                        sessions,
+                        session_id,
+                        page_id,
+                        session_page_created_by_daemon(sessions, session_id),
+                        Some(url),
+                    );
+                }
+            }
             rewrite_uid_responses(lines, sessions, session_id, page_id)
         }
-        _ => forward_line(mcp_stdin, mcp_reader, line, next_id),
+        _ => forward_line(mcp_stdin, mcp_reader, line, next_id, abandoned_ids),
     }
 }
 
@@ -1140,6 +1503,7 @@ fn route_new_page(
     session_id: Option<&str>,
     value: serde_json::Value,
     next_id: &mut u64,
+    abandoned_ids: &mut HashSet<u64>,
 ) -> Result<Vec<String>, String> {
     let mut forwarded = value;
     let url = forwarded
@@ -1162,7 +1526,13 @@ fn route_new_page(
             .entry("background".to_string())
             .or_insert_with(|| serde_json::json!(true));
     }
-    let lines = forward_line(mcp_stdin, mcp_reader, &forwarded.to_string(), next_id)?;
+    let lines = forward_line(
+        mcp_stdin,
+        mcp_reader,
+        &forwarded.to_string(),
+        next_id,
+        abandoned_ids,
+    )?;
     if let (Some(session_id), Some(last)) = (session_id, lines.last()) {
         if let Ok(response) = serde_json::from_str::<serde_json::Value>(last) {
             if let Some(page_id) = selected_page_id(&response) {
@@ -1173,6 +1543,7 @@ fn route_new_page(
     Ok(lines)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn route_select_page(
     mcp_stdin: &mut impl Write,
     mcp_reader: &mut impl BufRead,
@@ -1181,13 +1552,14 @@ fn route_select_page(
     value: &serde_json::Value,
     line: &str,
     next_id: &mut u64,
+    abandoned_ids: &mut HashSet<u64>,
 ) -> Result<Vec<String>, String> {
     let requested = value
         .get("params")
         .and_then(|params| params.get("arguments"))
         .and_then(|arguments| arguments.get("pageId"))
         .and_then(|page_id| page_id.as_u64());
-    let lines = forward_line(mcp_stdin, mcp_reader, line, next_id)?;
+    let lines = forward_line(mcp_stdin, mcp_reader, line, next_id, abandoned_ids)?;
     if let (Some(session_id), Some(page_id)) = (session_id, requested) {
         let errored = lines
             .last()
@@ -1208,6 +1580,7 @@ fn route_close_page(
     session_id: Option<&str>,
     value: &serde_json::Value,
     next_id: &mut u64,
+    abandoned_ids: &mut HashSet<u64>,
 ) -> Result<Vec<String>, String> {
     let mut forwarded = value.clone();
     let requested = forwarded
@@ -1218,14 +1591,26 @@ fn route_close_page(
     let page_id = match (session_id, requested) {
         (_, Some(page_id)) => Some(page_id),
         (Some(session_id), None) => {
-            let page_id =
-                ensure_session_page(mcp_stdin, mcp_reader, sessions, session_id, next_id)?;
+            let page_id = ensure_session_page(
+                mcp_stdin,
+                mcp_reader,
+                sessions,
+                session_id,
+                next_id,
+                abandoned_ids,
+            )?;
             inject_page_id(&mut forwarded, page_id);
             Some(page_id)
         }
         _ => None,
     };
-    let lines = forward_line(mcp_stdin, mcp_reader, &forwarded.to_string(), next_id)?;
+    let lines = forward_line(
+        mcp_stdin,
+        mcp_reader,
+        &forwarded.to_string(),
+        next_id,
+        abandoned_ids,
+    )?;
     if let (Some(session_id), Some(page_id)) = (session_id, page_id) {
         if session_page(sessions, session_id) == Some(page_id) {
             let (lock, _) = &**sessions;
@@ -1369,6 +1754,7 @@ pub(crate) fn handle_daemon_client(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn read_mcp_response_line(
     mcp_stdin: &mut impl Write,
     mcp_reader: &mut impl BufRead,
@@ -1418,6 +1804,23 @@ pub(crate) fn read_mcp_response_line_until(
                 write_json_line(mcp_stdin, &roots_list_response(id)).map_err(DaemonError::Fatal)?;
             }
             continue;
+        }
+        return Ok(response_line);
+    }
+}
+
+fn read_mcp_response_line_until_ignoring(
+    mcp_stdin: &mut impl Write,
+    mcp_reader: &mut impl BufRead,
+    deadline: Instant,
+    abandoned_ids: &mut HashSet<u64>,
+) -> Result<String, DaemonError> {
+    loop {
+        let response_line = read_mcp_response_line_until(mcp_stdin, mcp_reader, deadline)?;
+        if let Some(id) = extract_jsonrpc_id(&response_line) {
+            if abandoned_ids.remove(&id) {
+                continue;
+            }
         }
         return Ok(response_line);
     }

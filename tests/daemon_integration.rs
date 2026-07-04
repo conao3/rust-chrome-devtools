@@ -17,7 +17,10 @@ struct TestEnv {
     session_ttl_secs: Option<u64>,
     reaper_interval_ms: Option<u64>,
     mcp_request_timeout_secs: Option<u64>,
+    mcp_probe_timeout_secs: Option<u64>,
     fake_mcp_hang_tool: Option<String>,
+    fake_mcp_hang_secs: Option<u64>,
+    fake_mcp_persist_pages: bool,
     devtools: Vec<FakeDevTools>,
 }
 
@@ -29,7 +32,7 @@ struct FakeDevTools {
 
 impl TestEnv {
     fn new(tag: &str) -> Self {
-        Self::new_with_options(tag, None, None, None, None)
+        Self::new_with_options(tag, None, None, None, None, None, None)
     }
 
     fn new_with_reaper(
@@ -37,7 +40,15 @@ impl TestEnv {
         session_ttl_secs: Option<u64>,
         reaper_interval_ms: Option<u64>,
     ) -> Self {
-        Self::new_with_options(tag, session_ttl_secs, reaper_interval_ms, None, None)
+        Self::new_with_options(
+            tag,
+            session_ttl_secs,
+            reaper_interval_ms,
+            None,
+            None,
+            None,
+            None,
+        )
     }
 
     fn new_with_mcp_timeout(tag: &str, timeout_secs: u64, hang_tool: &str) -> Self {
@@ -46,8 +57,34 @@ impl TestEnv {
             None,
             None,
             Some(timeout_secs),
+            Some(1),
             Some(hang_tool.to_string()),
+            None,
         )
+    }
+
+    fn new_with_transient_mcp_timeout(
+        tag: &str,
+        timeout_secs: u64,
+        probe_timeout_secs: u64,
+        hang_tool: &str,
+        hang_secs: u64,
+    ) -> Self {
+        Self::new_with_options(
+            tag,
+            None,
+            None,
+            Some(timeout_secs),
+            Some(probe_timeout_secs),
+            Some(hang_tool.to_string()),
+            Some(hang_secs),
+        )
+    }
+
+    fn new_with_persistent_mcp(tag: &str) -> Self {
+        let mut env = Self::new(tag);
+        env.fake_mcp_persist_pages = true;
+        env
     }
 
     fn new_with_options(
@@ -55,7 +92,9 @@ impl TestEnv {
         session_ttl_secs: Option<u64>,
         reaper_interval_ms: Option<u64>,
         mcp_request_timeout_secs: Option<u64>,
+        mcp_probe_timeout_secs: Option<u64>,
         fake_mcp_hang_tool: Option<String>,
+        fake_mcp_hang_secs: Option<u64>,
     ) -> Self {
         let home = std::env::temp_dir().join(format!(
             "cdt-{}-{}",
@@ -84,7 +123,10 @@ impl TestEnv {
             session_ttl_secs,
             reaper_interval_ms,
             mcp_request_timeout_secs,
+            mcp_probe_timeout_secs,
             fake_mcp_hang_tool,
+            fake_mcp_hang_secs,
+            fake_mcp_persist_pages: false,
             devtools: vec![devtools],
         }
     }
@@ -110,8 +152,17 @@ impl TestEnv {
                 value.to_string(),
             );
         }
+        if let Some(value) = self.mcp_probe_timeout_secs {
+            command.env("CHROME_DEVTOOLS_MCP_PROBE_TIMEOUT_SECS", value.to_string());
+        }
         if let Some(value) = self.fake_mcp_hang_tool.as_ref() {
             command.env("FAKE_MCP_HANG_TOOL", value);
+        }
+        if let Some(value) = self.fake_mcp_hang_secs {
+            command.env("FAKE_MCP_HANG_SECS", value.to_string());
+        }
+        if self.fake_mcp_persist_pages {
+            command.env("FAKE_MCP_PERSIST_PAGES", "1");
         }
         command
     }
@@ -1035,7 +1086,41 @@ fn daemon_status_reports_pages_and_queue() {
 }
 
 #[test]
-fn mcp_request_timeout_respawns_and_drops_sessions() {
+fn mcp_request_timeout_keeps_session_when_probe_succeeds() {
+    let mut env = TestEnv::new_with_transient_mcp_timeout("mcpsurv", 1, 5, "take_snapshot", 2);
+    env.start_daemon();
+    let session = env.create_session();
+    let mut stream = env.connect();
+    bind_stream(&mut stream, &session);
+
+    let response = tool_call(&mut stream, 145, "take_snapshot", serde_json::json!({}));
+    assert!(
+        response["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("MCP request timed out"),
+        "response: {response}"
+    );
+
+    let (ok, output) = env.run_cli(&["session", "list", "--profile", "default"]);
+    assert!(ok, "session list failed: {output}");
+    assert!(output.contains(&session), "output: {output}");
+
+    let eval = tool_call(
+        &mut stream,
+        146,
+        "evaluate_script",
+        serde_json::json!({"function": "() => location.href"}),
+    );
+    assert!(content_text(&eval).contains("evaluated page="));
+
+    let (ok, output) = env.run_cli(&["daemon", "status", "--profile", "default"]);
+    assert!(ok, "status failed: {output}");
+    assert!(!output.contains("respawns="), "output: {output}");
+}
+
+#[test]
+fn mcp_request_timeout_respawns_when_probe_fails() {
     let mut env = TestEnv::new_with_mcp_timeout("mcptimeout", 1, "take_snapshot");
     env.start_daemon();
     let session = env.create_session();
@@ -1051,8 +1136,18 @@ fn mcp_request_timeout_respawns_and_drops_sessions() {
         "response: {response}"
     );
 
-    let (ok, output) = env.run_cli(&["session", "list", "--profile", "default"]);
-    assert!(ok, "session list failed: {output}");
+    let started = Instant::now();
+    let output = loop {
+        let (ok, output) = env.run_cli(&["session", "list", "--profile", "default"]);
+        assert!(ok, "session list failed: {output}");
+        if !output.contains(&session) {
+            break output;
+        }
+        if started.elapsed() > Duration::from_secs(5) {
+            panic!("session stayed alive after respawn: {output}");
+        }
+        thread::sleep(Duration::from_millis(100));
+    };
     assert!(!output.contains(&session), "output: {output}");
 
     let next_session = env.create_session();
@@ -1109,6 +1204,40 @@ fn devtools_port_change_respawns_mcp_and_drops_sessions() {
         "output: {output}"
     );
     assert!(output.contains("respawns=1"), "output: {output}");
+}
+
+#[test]
+fn respawn_closes_daemon_created_pages() {
+    let mut env = TestEnv::new_with_persistent_mcp("orphan");
+    env.start_daemon();
+    let session = env.create_session();
+    let mut stream = env.connect();
+    bind_stream(&mut stream, &session);
+    let created = selected_page_id(&tool_call(
+        &mut stream,
+        165,
+        "new_page",
+        serde_json::json!({"url": "https://orphan.test/"}),
+    ));
+    assert_eq!(created, 2);
+    env.replace_devtools();
+
+    let response = tool_call(
+        &mut stream,
+        166,
+        "evaluate_script",
+        serde_json::json!({"function": "() => location.href"}),
+    );
+    assert_eq!(
+        response["error"]["message"],
+        format!("unknown session: {session}")
+    );
+
+    let next_session = env.create_session();
+    let mut next_stream = env.connect();
+    bind_stream(&mut next_stream, &next_session);
+    let pages = tool_call(&mut next_stream, 167, "list_pages", serde_json::json!({}));
+    assert_eq!(page_ids(&pages), vec![1]);
 }
 
 #[test]

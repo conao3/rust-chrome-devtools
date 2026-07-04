@@ -76,7 +76,7 @@ Each client connection sends a line beginning with `__chrome_devtools_daemon__:`
 
 After a successful `bind`, the daemon stays in JSON-RPC forwarding mode on that connection: each JSON-RPC line is forwarded to the long-lived `chrome-devtools-mcp` child, and matching responses are streamed back.
 
-Control commands use independent daemon client connections and only take the session registry mutex. They respond while clients are bound. MCP forwarding goes through a single router that owns the MCP stdin/stdout pair, rewrites each client JSON-RPC id to a daemon-local numeric id, restores the original id in the response, injects the session page id for page-scoped tools, and rewrites snapshot uids to session uid tokens. If the Chrome DevTools endpoint dies or an MCP request times out, the router respawns MCP, clears in-memory sessions, and records the event in daemon health.
+Control commands use independent daemon client connections and only take the session registry mutex. They respond while clients are bound. MCP forwarding goes through a single router that owns the MCP stdin/stdout pair, rewrites each client JSON-RPC id to a daemon-local numeric id, restores the original id in the response, injects the session page id for page-scoped tools, and rewrites snapshot uids to session uid tokens. A per-request MCP timeout returns an error to the client, then the router probes MCP with a short request. Probe success keeps sessions alive. Probe failure, MCP process exit, or Chrome DevTools endpoint failure respawns MCP, clears in-memory sessions, closes daemon-created pages that remain visible through the new MCP runtime, and records the event in daemon health.
 
 ## Future direction
 
