@@ -235,7 +235,54 @@ fn client_disconnect_does_not_kill_daemon() {
 }
 
 #[test]
-#[ignore = "single-threaded accept; enable after the router redesign (M3)"]
+fn string_jsonrpc_id_roundtrips_through_daemon() {
+    let mut env = TestEnv::new("stringid");
+    env.start_daemon();
+    let session = env.create_session();
+
+    let mut stream = env.connect();
+    let bound = control_roundtrip(&mut stream, &format!("bind session={session}"));
+    assert_eq!(bound, format!("bound={session}"));
+    stream
+        .write_all(br#"{"jsonrpc":"2.0","id":"client-a","method":"tools/list","params":{}}"#)
+        .unwrap();
+    stream.write_all(b"\n").unwrap();
+    stream.flush().unwrap();
+
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    reader.read_line(&mut line).unwrap();
+    let value: serde_json::Value = serde_json::from_str(line.trim_end()).unwrap();
+    assert_eq!(value["id"], "client-a");
+    assert_eq!(value["result"]["tools"], serde_json::json!([]));
+}
+
+#[test]
+fn unbound_tool_call_is_rejected() {
+    let mut env = TestEnv::new("unbound");
+    env.start_daemon();
+
+    let mut stream = env.connect();
+    stream
+        .write_all(
+            br#"{"jsonrpc":"2.0","id":"client-a","method":"tools/call","params":{"name":"click","arguments":{}}}"#,
+        )
+        .unwrap();
+    stream.write_all(b"\n").unwrap();
+    stream.flush().unwrap();
+
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    reader.read_line(&mut line).unwrap();
+    let value: serde_json::Value = serde_json::from_str(line.trim_end()).unwrap();
+    assert_eq!(value["id"], "client-a");
+    assert_eq!(
+        value["error"]["message"],
+        "session bind required for MCP forwarding"
+    );
+}
+
+#[test]
 fn control_commands_respond_while_client_bound() {
     let mut env = TestEnv::new("busy");
     env.start_daemon();

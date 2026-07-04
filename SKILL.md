@@ -218,7 +218,7 @@ chrome-devtools profile stop --profile conao3
 
 - If `mcp call` or `mcp batch` exits with `unknown session`, the session expired (30 min idle) or the daemon restarted. Mint a new id via `session create` and retry.
 - If `mcp call` or `mcp batch` exits with `session in use`, another invocation is currently bound to that id. Wait for it to finish or mint a separate session for the new agent.
-- If a command exits with `daemon busy`, another client is holding the daemon. Retry shortly; the wait is bounded by `CHROME_DEVTOOLS_BIND_TIMEOUT_SECS` (default 120, for `mcp call` / `mcp batch` binds) and `CHROME_DEVTOOLS_CONTROL_TIMEOUT_SECS` (default 10, for `session` / `daemon status` / `mcp list`). Do not stop the daemon to recover; that destroys other agents' sessions.
+- If `mcp call` or `mcp batch` exits with `daemon busy`, another client is bound to the daemon. Retry shortly; the wait is bounded by `CHROME_DEVTOOLS_BIND_TIMEOUT_SECS` (default 120). Do not stop the daemon to recover; that destroys other agents' sessions.
 - File-writing tool arguments (`take_screenshot` `filePath` etc.) accept paths under your home directory and the OS tempdir.
 - If the CLI warns about a daemon version mismatch, the daemon predates the installed CLI. Behavior fixes in the daemon only apply after it restarts; `daemon stop` (without `--force`) is safe once `sessions=0`.
 - If `daemon status` shows `chrome=unreachable`, restart the daemon; it is attached to a Chrome endpoint that no longer answers.

@@ -43,6 +43,8 @@ npx skills add ./rust-chrome-devtools
 - Hermes-side Chrome DevTools MCP registration is not required for this workflow.
 - Snapshot `uid` values are MCP-process-local. Keep `take_snapshot -> click/fill` on the same profile daemon, or in one direct MCP process when bypassing the daemon.
 - The daemon owns one `chrome-devtools-mcp` process per profile, so multiple CLI invocations do not create competing MCP processes for the same Chrome profile.
+- The daemon accepts control commands independently of MCP forwarding, so `session create`, `session list`, `session close`, `daemon status`, and `daemon stop` respond while another client is bound.
+- The daemon rewrites client JSON-RPC ids internally and restores the original id in responses, including string ids.
 - `mcp direct-call` and `mcp direct-list` remain available as a fallback and take a per-profile lock under `~/.cache/chrome-devtools/locks`.
 - `mcp call` and `mcp batch` require an explicit `--session <id>` minted by `session create`. Sessions live in-memory on the daemon and expire after 30 minutes of inactivity. Concurrent agents must mint and use their own session ids so the daemon can serialize their `take_snapshot` -> `click/fill` flows independently.
 
@@ -73,11 +75,11 @@ chrome-devtools profile stop --profile default
 
 `session create` starts the profile daemon when needed and mints a new in-memory session id. The session expires after 30 minutes of inactivity or when the daemon stops. Output looks like `session=sess-xxxxxxxxxxxxxxxx created=<ts> last_used=<ts> owned=false`.
 
-`session list` prints one line per active session. `session close` drops the named session.
+`session list` prints one line per active session. `session close` drops the named session when it is idle.
 
 `mcp list` starts the profile daemon when needed, queries `tools/list` through that daemon, and prints the raw MCP JSON response.
 
-`mcp call` binds the given session, forwards stdin JSON-RPC lines to the daemon-owned `chrome-devtools-mcp` process, waits for the matching JSON-RPC responses, and prints them to stdout. The session is held for the lifetime of this invocation; other clients cannot bind the same session concurrently. Activity refreshes the session's idle timer.
+`mcp call` binds the given session, forwards stdin JSON-RPC lines to the daemon-owned `chrome-devtools-mcp` process, waits for the matching JSON-RPC responses, and prints them to stdout. The session is held for the lifetime of this invocation; other clients can use control commands while the bind is active, and another MCP bind waits up to `CHROME_DEVTOOLS_BIND_TIMEOUT_SECS`. Activity refreshes the session's idle timer.
 
 `mcp batch` binds the given session and reads a JSON array of steps from `--script`, running each step in order through the profile daemon. One `initialize` handshake is performed; then each `tool` step is issued as a `tools/call` and each `sleep_ms` step pauses the runner. Results are printed as a JSON array to stdout (or to `--output <path>`), so callers can inspect them programmatically without parsing line-delimited JSON-RPC. Step shapes:
 

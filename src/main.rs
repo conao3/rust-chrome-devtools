@@ -8,8 +8,8 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -50,6 +50,7 @@ struct SessionState {
 #[derive(Default)]
 struct SessionRegistry {
     sessions: HashMap<String, SessionState>,
+    bound_session: Option<String>,
 }
 
 impl SessionRegistry {
@@ -73,11 +74,14 @@ impl SessionRegistry {
     }
 
     fn close(&mut self, id: &str) -> Result<(), String> {
-        if self.sessions.remove(id).is_some() {
-            Ok(())
-        } else {
-            Err(format!("unknown session: {id}"))
+        let Some(session) = self.sessions.get(id) else {
+            return Err(format!("unknown session: {id}"));
+        };
+        if session.owned {
+            return Err(format!("session in use: {id}"));
         }
+        self.sessions.remove(id);
+        Ok(())
     }
 
     fn bind(&mut self, id: &str) -> Result<(), String> {
@@ -88,8 +92,12 @@ impl SessionRegistry {
         if session.owned {
             return Err(format!("session in use: {id}"));
         }
+        if self.bound_session.is_some() {
+            return Err("daemon busy: another session is bound".to_string());
+        }
         session.owned = true;
         session.last_used_at = SystemTime::now();
+        self.bound_session = Some(id.to_string());
         Ok(())
     }
 
@@ -97,6 +105,9 @@ impl SessionRegistry {
         if let Some(session) = self.sessions.get_mut(id) {
             session.owned = false;
             session.last_used_at = SystemTime::now();
+        }
+        if self.bound_session.as_deref() == Some(id) {
+            self.bound_session = None;
         }
     }
 
@@ -788,51 +799,39 @@ fn run_daemon(profile: &Profile) -> Result<(), String> {
         .stdout
         .take()
         .ok_or_else(|| "failed to open chrome-devtools-mcp stdout".to_string())?;
+    let mut runtime = DaemonRuntimeGuard::new(mcp, socket_path.clone(), pid_path.clone());
     let mut mcp_reader = BufReader::new(mcp_stdout);
     initialize_daemon_mcp(&mut mcp_stdin, &mut mcp_reader)?;
+    let router = RouterHandle::start(mcp_stdin, mcp_reader);
 
     fs::write(&pid_path, format!("{}\n", std::process::id()))
         .map_err(|error| format!("failed to write {}: {error}", pid_path.display()))?;
 
     let listener = UnixListener::bind(&socket_path)
         .map_err(|error| format!("failed to bind {}: {error}", socket_path.display()))?;
+    listener
+        .set_nonblocking(true)
+        .map_err(|error| format!("failed to configure {}: {error}", socket_path.display()))?;
 
-    let sessions: Arc<Mutex<SessionRegistry>> = Arc::new(Mutex::new(SessionRegistry::default()));
+    let sessions: SharedSessions =
+        Arc::new((Mutex::new(SessionRegistry::default()), Condvar::new()));
     let sessions_for_reaper = Arc::clone(&sessions);
     thread::spawn(move || loop {
         thread::sleep(SESSION_REAPER_INTERVAL);
-        if let Ok(mut registry) = sessions_for_reaper.lock() {
+        let (lock, _) = &*sessions_for_reaper;
+        if let Ok(mut registry) = lock.lock() {
             registry.reap_expired();
         }
     });
 
+    let stopping = Arc::new(AtomicBool::new(false));
+    let (stop_tx, stop_rx) = mpsc::channel();
     let mut daemon_result = Ok(());
-    for stream in listener.incoming() {
-        let mut stream = match stream {
-            Ok(stream) => stream,
-            Err(error) => {
-                eprintln!("warning: failed to accept daemon client: {error}");
-                continue;
-            }
-        };
-        match handle_daemon_client(
-            &mut stream,
-            &mut mcp_stdin,
-            &mut mcp_reader,
-            &sessions,
-            mcp_port,
-        ) {
-            Ok(false) => {}
-            Ok(true) => break,
-            Err(DaemonError::Client(message)) => {
-                eprintln!("warning: daemon client connection failed: {message}");
-            }
-            Err(DaemonError::Fatal(message)) => {
-                daemon_result = Err(message);
-                break;
-            }
+    while !stopping.load(Ordering::SeqCst) {
+        if stop_rx.try_recv().is_ok() {
+            break;
         }
-        match mcp.try_wait() {
+        match runtime.child.try_wait() {
             Ok(None) => {}
             Ok(Some(status)) => {
                 daemon_result = Err(format!("chrome-devtools-mcp exited with {status}"));
@@ -843,13 +842,67 @@ fn run_daemon(profile: &Profile) -> Result<(), String> {
                 break;
             }
         }
+        let stream = match listener.accept() {
+            Ok((stream, _)) => stream,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(25));
+                continue;
+            }
+            Err(error) => {
+                eprintln!("warning: failed to accept daemon client: {error}");
+                continue;
+            }
+        };
+        let router = router.clone();
+        let sessions = Arc::clone(&sessions);
+        let stop_tx = stop_tx.clone();
+        let stopping = Arc::clone(&stopping);
+        thread::spawn(
+            move || match handle_daemon_client(stream, router, &sessions, mcp_port) {
+                Ok(false) => {}
+                Ok(true) => {
+                    stopping.store(true, Ordering::SeqCst);
+                    let _ = stop_tx.send(());
+                }
+                Err(DaemonError::Client(message)) => {
+                    eprintln!("warning: daemon client connection failed: {message}");
+                }
+                Err(DaemonError::Fatal(message)) => {
+                    eprintln!("error: daemon client fatal error: {message}");
+                    stopping.store(true, Ordering::SeqCst);
+                    let _ = stop_tx.send(());
+                }
+            },
+        );
     }
 
-    terminate_child(&mut mcp);
-    let _ = fs::remove_file(&socket_path);
-    let _ = fs::remove_file(&pid_path);
+    drop(runtime);
     record_daemon_exit(profile, &daemon_result);
     daemon_result
+}
+
+struct DaemonRuntimeGuard {
+    child: Child,
+    socket_path: PathBuf,
+    pid_path: PathBuf,
+}
+
+impl DaemonRuntimeGuard {
+    fn new(child: Child, socket_path: PathBuf, pid_path: PathBuf) -> Self {
+        Self {
+            child,
+            socket_path,
+            pid_path,
+        }
+    }
+}
+
+impl Drop for DaemonRuntimeGuard {
+    fn drop(&mut self) {
+        terminate_child(&mut self.child);
+        let _ = fs::remove_file(&self.socket_path);
+        let _ = fs::remove_file(&self.pid_path);
+    }
 }
 
 fn initialize_daemon_mcp(
@@ -873,14 +926,86 @@ enum DaemonError {
     Fatal(String),
 }
 
+type SharedSessions = Arc<(Mutex<SessionRegistry>, Condvar)>;
+
+#[derive(Clone)]
+struct RouterHandle {
+    sender: mpsc::Sender<RouterRequest>,
+}
+
+struct RouterRequest {
+    line: String,
+    response: mpsc::Sender<Result<Vec<String>, String>>,
+}
+
+impl RouterHandle {
+    fn start(
+        mut mcp_stdin: impl Write + Send + 'static,
+        mut mcp_reader: impl BufRead + Send + 'static,
+    ) -> Self {
+        let (sender, receiver) = mpsc::channel::<RouterRequest>();
+        thread::spawn(move || {
+            let mut next_id: u64 = 10_000;
+            for request in receiver {
+                let result =
+                    route_mcp_request(&mut mcp_stdin, &mut mcp_reader, &request.line, &mut next_id);
+                let _ = request.response.send(result);
+            }
+        });
+        Self { sender }
+    }
+
+    fn forward(&self, line: &str) -> Result<Vec<String>, DaemonError> {
+        let (response_tx, response_rx) = mpsc::channel();
+        self.sender
+            .send(RouterRequest {
+                line: line.to_string(),
+                response: response_tx,
+            })
+            .map_err(|error| DaemonError::Fatal(format!("failed to queue MCP request: {error}")))?;
+        response_rx
+            .recv()
+            .map_err(|error| {
+                DaemonError::Fatal(format!("failed to receive MCP response: {error}"))
+            })?
+            .map_err(DaemonError::Fatal)
+    }
+}
+
+fn route_mcp_request(
+    mcp_stdin: &mut impl Write,
+    mcp_reader: &mut impl BufRead,
+    line: &str,
+    next_id: &mut u64,
+) -> Result<Vec<String>, String> {
+    let Some(original_id) = extract_jsonrpc_id_value(line) else {
+        write_json_line(mcp_stdin, line)?;
+        return Ok(Vec::new());
+    };
+    let internal_id = *next_id;
+    *next_id = next_id.wrapping_add(1);
+    let forwarded = rewrite_jsonrpc_id(line, serde_json::json!(internal_id))?;
+    write_json_line(mcp_stdin, &forwarded)?;
+    let mut lines = Vec::new();
+    loop {
+        let response_line =
+            read_mcp_response_line(mcp_stdin, mcp_reader).map_err(|error| format!("{error:?}"))?;
+        if extract_jsonrpc_id(&response_line) == Some(internal_id) {
+            lines.push(rewrite_jsonrpc_id(&response_line, original_id.clone())?);
+            return Ok(lines);
+        }
+        lines.push(response_line);
+    }
+}
+
 struct BoundSessionGuard<'a> {
-    sessions: &'a Arc<Mutex<SessionRegistry>>,
+    sessions: &'a SharedSessions,
     id: Option<String>,
     bound_at: Instant,
 }
 
 impl<'a> BoundSessionGuard<'a> {
-    fn new(sessions: &'a Arc<Mutex<SessionRegistry>>) -> Self {
+    fn new(sessions: &'a SharedSessions) -> Self {
         Self {
             sessions,
             id: None,
@@ -901,18 +1026,19 @@ impl Drop for BoundSessionGuard<'_> {
                 "bind session={id} held_ms={}",
                 self.bound_at.elapsed().as_millis()
             );
-            if let Ok(mut registry) = self.sessions.lock() {
+            let (lock, cvar) = &**self.sessions;
+            if let Ok(mut registry) = lock.lock() {
                 registry.unbind(&id);
+                cvar.notify_all();
             }
         }
     }
 }
 
 fn handle_daemon_client(
-    stream: &mut UnixStream,
-    mcp_stdin: &mut impl Write,
-    mcp_reader: &mut impl BufRead,
-    sessions: &Arc<Mutex<SessionRegistry>>,
+    mut stream: UnixStream,
+    router: RouterHandle,
+    sessions: &SharedSessions,
     mcp_port: u16,
 ) -> Result<bool, DaemonError> {
     let mut client_reader = BufReader::new(stream.try_clone().map_err(|error| {
@@ -936,7 +1062,7 @@ fn handle_daemon_client(
         }
 
         if let Some(command) = line.strip_prefix("__chrome_devtools_daemon__:") {
-            match handle_control_command(stream, sessions, &mut bound, command, mcp_port)? {
+            match handle_control_command(&mut stream, sessions, &mut bound, command, mcp_port)? {
                 ControlOutcome::Continue => continue,
                 ControlOutcome::CloseConnection => return Ok(false),
                 ControlOutcome::StopDaemon => return Ok(true),
@@ -944,7 +1070,7 @@ fn handle_daemon_client(
         }
 
         if json_has_method(line, "initialize") {
-            if let Some(id) = extract_jsonrpc_id(line) {
+            if let Some(id) = extract_jsonrpc_id_value(line) {
                 let response = daemon_initialize_response(id);
                 stream
                     .write_all(response.as_bytes())
@@ -963,34 +1089,35 @@ fn handle_daemon_client(
         }
 
         let forwarded = sanitize_outgoing_request(line);
-        let Some(pending_id) = extract_jsonrpc_id(&forwarded) else {
-            write_json_line(mcp_stdin, &forwarded).map_err(DaemonError::Fatal)?;
+        if bound.id.is_none() && !json_has_method(&forwarded, "tools/list") {
+            if let Some(id) = extract_jsonrpc_id_value(&forwarded) {
+                let response =
+                    jsonrpc_error_response(id, -32000, "session bind required for MCP forwarding");
+                stream
+                    .write_all(response.as_bytes())
+                    .and_then(|_| stream.write_all(b"\n"))
+                    .and_then(|_| stream.flush())
+                    .map_err(|error| {
+                        DaemonError::Client(format!(
+                            "failed to write daemon client response: {error}"
+                        ))
+                    })?;
+            }
             continue;
-        };
-
-        write_json_line(mcp_stdin, &forwarded).map_err(DaemonError::Fatal)?;
-
-        loop {
-            let response_line = read_mcp_response_line(mcp_stdin, mcp_reader)?;
-
-            let write_result = stream
+        }
+        for response_line in router.forward(&forwarded)? {
+            stream
                 .write_all(response_line.as_bytes())
                 .and_then(|_| stream.write_all(b"\n"))
-                .and_then(|_| stream.flush());
-            if let Err(error) = write_result {
-                drain_pending_mcp_response(mcp_stdin, mcp_reader, pending_id, &response_line)?;
-                return Err(DaemonError::Client(format!(
-                    "failed to write daemon client response: {error}"
-                )));
-            }
-
-            if extract_jsonrpc_id(&response_line) == Some(pending_id) {
-                if let Some(id) = bound.id.as_ref() {
-                    if let Ok(mut registry) = sessions.lock() {
-                        registry.touch(id);
-                    }
+                .and_then(|_| stream.flush())
+                .map_err(|error| {
+                    DaemonError::Client(format!("failed to write daemon client response: {error}"))
+                })?;
+            if let Some(id) = bound.id.as_ref() {
+                let (lock, _) = &**sessions;
+                if let Ok(mut registry) = lock.lock() {
+                    registry.touch(id);
                 }
-                break;
             }
         }
     }
@@ -1021,6 +1148,7 @@ fn read_mcp_response_line(
     }
 }
 
+#[cfg(test)]
 fn drain_pending_mcp_response(
     mcp_stdin: &mut impl Write,
     mcp_reader: &mut impl BufRead,
@@ -1046,7 +1174,7 @@ enum ControlOutcome {
 
 fn handle_control_command(
     stream: &mut UnixStream,
-    sessions: &Arc<Mutex<SessionRegistry>>,
+    sessions: &SharedSessions,
     bound: &mut BoundSessionGuard,
     command: &str,
     mcp_port: u16,
@@ -1106,7 +1234,7 @@ fn handle_control_command(
         }
         "bind" => {
             let id = parse_session_arg(rest).map_err(DaemonError::Client)?;
-            let result = lock_sessions(sessions)?.bind(&id);
+            let result = bind_session_in_registry(sessions, &id, bind_timeout());
             match result {
                 Ok(()) => {
                     bound.mark_bound(id.clone());
@@ -1127,11 +1255,47 @@ fn handle_control_command(
 }
 
 fn lock_sessions<'a>(
-    sessions: &'a Arc<Mutex<SessionRegistry>>,
+    sessions: &'a SharedSessions,
 ) -> Result<std::sync::MutexGuard<'a, SessionRegistry>, DaemonError> {
-    sessions
-        .lock()
+    let (lock, _) = &**sessions;
+    lock.lock()
         .map_err(|_| DaemonError::Fatal("session registry poisoned".to_string()))
+}
+
+fn bind_session_in_registry(
+    sessions: &SharedSessions,
+    id: &str,
+    timeout: Duration,
+) -> Result<(), String> {
+    let started = Instant::now();
+    let (lock, cvar) = &**sessions;
+    let mut registry = lock
+        .lock()
+        .map_err(|_| "session registry poisoned".to_string())?;
+    loop {
+        match registry.bind(id) {
+            Ok(()) => return Ok(()),
+            Err(message) if message.starts_with("daemon busy") => {
+                let Some(remaining) = timeout.checked_sub(started.elapsed()) else {
+                    return Err(format!(
+                        "daemon busy: bind deadline exceeded after {}s",
+                        timeout.as_secs()
+                    ));
+                };
+                let wait = cvar
+                    .wait_timeout(registry, remaining)
+                    .map_err(|_| "session registry poisoned".to_string())?;
+                registry = wait.0;
+                if wait.1.timed_out() {
+                    return Err(format!(
+                        "daemon busy: bind deadline exceeded after {}s",
+                        timeout.as_secs()
+                    ));
+                }
+            }
+            Err(message) => return Err(message),
+        }
+    }
 }
 
 fn write_control_line(stream: &mut UnixStream, body: &str) -> Result<(), DaemonError> {
@@ -1648,7 +1812,6 @@ fn ensure_daemon(profile: &Profile) -> Result<(), String> {
         match send_daemon_control(profile, "status") {
             Ok(response) if response.contains("daemon=ready") => {
                 warn_on_version_mismatch(profile, &response);
-                ensure_chrome(profile)?;
                 return Ok(());
             }
             Err(error) if error.starts_with(DAEMON_BUSY_PREFIX) => return Ok(()),
@@ -2120,17 +2283,47 @@ fn read_response(
     }
 }
 
-fn roots_list_response(id: u64) -> String {
+fn roots_list_response(id: impl Into<serde_json::Value>) -> String {
     let home = env::var("HOME").unwrap_or_default();
-    format!(
-        r#"{{"jsonrpc":"2.0","id":{id},"result":{{"roots":[{{"uri":"file://{home}","name":"home"}}]}}}}"#
-    )
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id.into(),
+        "result": {
+            "roots": [{
+                "uri": format!("file://{home}"),
+                "name": "home"
+            }]
+        }
+    })
+    .to_string()
 }
 
-fn daemon_initialize_response(id: u64) -> String {
-    format!(
-        r#"{{"jsonrpc":"2.0","id":{id},"result":{{"protocolVersion":"2025-06-18","capabilities":{{}},"serverInfo":{{"name":"chrome-devtools-daemon","version":"0.1.0"}}}}}}"#
-    )
+fn daemon_initialize_response(id: impl Into<serde_json::Value>) -> String {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id.into(),
+        "result": {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "serverInfo": {
+                "name": "chrome-devtools-daemon",
+                "version": "0.1.0"
+            }
+        }
+    })
+    .to_string()
+}
+
+fn jsonrpc_error_response(id: impl Into<serde_json::Value>, code: i64, message: &str) -> String {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id.into(),
+        "error": {
+            "code": code,
+            "message": message
+        }
+    })
+    .to_string()
 }
 
 fn sanitize_outgoing_request(line: &str) -> String {
@@ -2188,6 +2381,23 @@ fn extract_jsonrpc_id(line: &str) -> Option<u64> {
         .ok()?
         .get("id")?
         .as_u64()
+}
+
+fn extract_jsonrpc_id_value(line: &str) -> Option<serde_json::Value> {
+    serde_json::from_str::<serde_json::Value>(line)
+        .ok()?
+        .get("id")
+        .cloned()
+}
+
+fn rewrite_jsonrpc_id(line: &str, id: serde_json::Value) -> Result<String, String> {
+    let mut value = serde_json::from_str::<serde_json::Value>(line)
+        .map_err(|error| format!("failed to parse JSON-RPC message: {error}"))?;
+    let Some(object) = value.as_object_mut() else {
+        return Err("JSON-RPC message must be an object".to_string());
+    };
+    object.insert("id".to_string(), id);
+    Ok(value.to_string())
 }
 
 fn terminate_child(child: &mut Child) {
@@ -2615,6 +2825,25 @@ mod tests {
     }
 
     #[test]
+    fn extract_jsonrpc_id_value_reads_string_id() {
+        assert_eq!(
+            extract_jsonrpc_id_value(r#"{"jsonrpc":"2.0","id":"abc","result":{}}"#),
+            Some(serde_json::json!("abc"))
+        );
+    }
+
+    #[test]
+    fn rewrite_jsonrpc_id_replaces_id_value() {
+        let output = rewrite_jsonrpc_id(
+            r#"{"jsonrpc":"2.0","id":"abc","result":{}}"#,
+            serde_json::json!(9),
+        )
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(value["id"], 9);
+    }
+
+    #[test]
     fn extract_jsonrpc_id_returns_none_when_missing() {
         assert_eq!(extract_jsonrpc_id(r#"{"result":{}}"#), None);
     }
@@ -2690,6 +2919,15 @@ mod tests {
     }
 
     #[test]
+    fn session_registry_close_rejects_owned_session() {
+        let mut registry = SessionRegistry::default();
+        let state = registry.create();
+        registry.bind(&state.id).unwrap();
+        let error = registry.close(&state.id).unwrap_err();
+        assert!(error.contains("session in use"));
+    }
+
+    #[test]
     fn session_registry_bind_marks_owned_and_rejects_second_bind() {
         let mut registry = SessionRegistry::default();
         let state = registry.create();
@@ -2704,6 +2942,16 @@ mod tests {
     }
 
     #[test]
+    fn session_registry_bind_rejects_when_another_session_is_bound() {
+        let mut registry = SessionRegistry::default();
+        let first = registry.create();
+        let second = registry.create();
+        registry.bind(&first.id).unwrap();
+        let error = registry.bind(&second.id).unwrap_err();
+        assert!(error.contains("daemon busy"));
+    }
+
+    #[test]
     fn session_registry_unbind_clears_owned() {
         let mut registry = SessionRegistry::default();
         let state = registry.create();
@@ -2711,6 +2959,7 @@ mod tests {
         registry.unbind(&state.id);
         let session = registry.sessions.get(&state.id).unwrap();
         assert!(!session.owned);
+        assert!(registry.bound_session.is_none());
     }
 
     #[test]
@@ -3018,9 +3267,12 @@ mod tests {
     fn roots_list_response_exposes_home_root() {
         let response = roots_list_response(3);
         assert!(response.contains("\"id\":3"));
-        assert!(response.contains("\"roots\":[{\"uri\":\"file://"));
         let value: serde_json::Value = serde_json::from_str(&response).unwrap();
         assert_eq!(value["result"]["roots"][0]["name"], "home");
+        assert!(value["result"]["roots"][0]["uri"]
+            .as_str()
+            .unwrap()
+            .starts_with("file://"));
     }
 
     #[test]

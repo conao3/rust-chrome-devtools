@@ -48,7 +48,7 @@ chrome-devtools session list   --profile <name>
 chrome-devtools session close  --profile <name> --session <id>
 ```
 
-`mcp call` and `mcp batch` require `--session <id>`. The CLI sends `__chrome_devtools_daemon__:bind session=<id>` as the first line on its daemon connection. The daemon validates the session, marks it owned for the lifetime of that connection, and refuses concurrent binds against the same id. JSON-RPC tool calls on a bound connection refresh the session's `last_used_at` timestamp; on disconnect, the daemon releases ownership and updates `last_used_at` one more time.
+`mcp call` and `mcp batch` require `--session <id>`. The CLI sends `__chrome_devtools_daemon__:bind session=<id>` as the first line on its daemon connection. The daemon validates the session, waits for the profile bind slot, marks the session owned for the lifetime of that connection, and returns `bound=<id>` after the bind is active. JSON-RPC tool calls on a bound connection refresh the session's `last_used_at` timestamp; on disconnect, the daemon releases ownership and updates `last_used_at` one more time.
 
 A session records:
 
@@ -73,6 +73,8 @@ Each client connection sends a line beginning with `__chrome_devtools_daemon__:`
 | `bind session=<id>`                  | `bound=<id>` or `error=<message>`                       |
 
 After a successful `bind`, the daemon stays in JSON-RPC forwarding mode on that connection: each JSON-RPC line is forwarded to the long-lived `chrome-devtools-mcp` child, and matching responses are streamed back.
+
+Control commands use independent daemon client connections and only take the session registry mutex. They respond while another client is bound. MCP forwarding goes through a single router that owns the MCP stdin/stdout pair, rewrites each client JSON-RPC id to a daemon-local numeric id, and restores the original id in the response.
 
 ## Future direction
 
