@@ -44,7 +44,7 @@ npx skills add ./rust-chrome-devtools
 - MCP JSON-RPC input and output are routed through one long-lived per-profile daemon by default.
 - Hermes-side Chrome DevTools MCP registration is not required for this workflow.
 - Daemon-routed snapshot `uid` values are session uid tokens. Keep `take_snapshot -> click/fill` on the same daemon session.
-- The daemon owns one `chrome-devtools-mcp` process per profile, so multiple CLI invocations do not create competing MCP processes for the same Chrome profile. If Chrome's DevTools endpoint or MCP stops responding, the daemon respawns MCP and drops in-memory sessions so clients can mint fresh ones.
+- The daemon owns one `chrome-devtools-mcp` process per profile, so multiple CLI invocations do not create competing MCP processes for the same Chrome profile. If Chrome's DevTools endpoint or MCP probe fails, the daemon respawns MCP and drops in-memory sessions so clients can mint fresh ones.
 - The daemon accepts control commands independently of MCP forwarding, so `session create`, `session list`, `session close`, `daemon status`, and `daemon stop` respond while clients are bound.
 - The daemon rewrites client JSON-RPC ids internally and restores the original id in responses, including string ids.
 - `mcp direct-call` and `mcp direct-list` remain available as a fallback and take a per-profile lock under `~/.cache/chrome-devtools/locks`.
@@ -56,6 +56,13 @@ npx skills add ./rust-chrome-devtools
 [[profiles]]
 name = "default"
 ```
+
+Environment overrides:
+
+- `CHROME_DEVTOOLS_MCP_MAX_OLD_SPACE_MB`: Node heap limit for the daemon-owned `chrome-devtools-mcp` process. Default: `2048`.
+- `CHROME_DEVTOOLS_CONTROL_WARN_LATENCY_MS`: control command warn threshold. Default: `1000`.
+- `CHROME_DEVTOOLS_FORWARD_WARN_LATENCY_MS`: MCP forward warn threshold. Default: `30000`.
+- `CHROME_DEVTOOLS_DIAGNOSTIC_WINDOW_SECS`: daemon status latency window. Default: `600`.
 
 ## Commands
 
@@ -82,6 +89,8 @@ chrome-devtools profile stop --profile default
 `mcp list` starts the profile daemon when needed, queries `tools/list` through that daemon, and prints the raw MCP JSON response.
 
 `mcp call` binds the given session, forwards stdin JSON-RPC lines to the daemon-owned `chrome-devtools-mcp` process, waits for the matching JSON-RPC responses, and prints them to stdout. The session is held for the lifetime of this invocation; other clients can use control commands while the bind is active, and another MCP bind waits up to `CHROME_DEVTOOLS_BIND_TIMEOUT_SECS`. Activity refreshes the session's idle timer.
+
+`daemon status` includes `queued_mcp_requests`, `max_control_latency_ms`, and `max_forward_latency_ms` for the recent diagnostic window. The default window is 600 seconds and can be changed with `CHROME_DEVTOOLS_DIAGNOSTIC_WINDOW_SECS`.
 
 `mcp batch` binds the given session and reads a JSON array of steps from `--script`, running each step in order through the profile daemon. One `initialize` handshake is performed; then each `tool` step is issued as a `tools/call` and each `sleep_ms` step pauses the runner. Results are printed as a JSON array to stdout (or to `--output <path>`), so callers can inspect them programmatically without parsing line-delimited JSON-RPC. Step shapes:
 

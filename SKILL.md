@@ -188,11 +188,11 @@ chrome-devtools mcp help
 chrome-devtools mcp batch --help
 ```
 
-Inspect daemon health (version, session count, active session count, session pages, queued MCP requests, whether the daemon-attached Chrome endpoint responds):
+Inspect daemon health (version, session count, active session count, session pages, queued MCP requests, recent latency maxima, whether the daemon-attached Chrome endpoint responds):
 
 ```sh
 chrome-devtools daemon status --profile conao3
-# profile=conao3 daemon=ready version=0.5.0 sessions=1 active_sessions=0 pages=2 queued_mcp_requests=0 chrome=ready respawns=0 port=46071 pid=... socket=...
+# profile=conao3 daemon=ready version=0.6.1 sessions=1 active_sessions=0 pages=2 queued_mcp_requests=0 max_control_latency_ms=0 max_forward_latency_ms=42 diagnostic_window_secs=600 chrome=ready port=46071 respawns=0 pid=... socket=...
 ```
 
 `respawns=<n>` counts daemon-managed MCP respawns. After a respawn, mint a new session.
@@ -223,6 +223,7 @@ chrome-devtools profile stop --profile conao3
 - If the CLI warns about a daemon version mismatch, the daemon predates the installed CLI. Behavior fixes in the daemon only apply after it restarts; `daemon stop` (without `--force`) is safe once `sessions=0`.
 - If `daemon status` shows `respawns` increased, mint a new session before continuing browser work.
 - The daemon runs `chrome-devtools-mcp` pinned to a fixed version; set `CHROME_DEVTOOLS_MCP_VERSION` (e.g. `latest`) before `daemon start` to override.
+- The daemon-owned `chrome-devtools-mcp` Node heap defaults to 2048 MB; set `CHROME_DEVTOOLS_MCP_MAX_OLD_SPACE_MB` before `daemon start` for heavier trace runs.
 - If `fill` or `click` fails with a stale or foreign uid token, take a fresh snapshot in the same session and use the new token.
 - If the page is not the expected page, run an `evaluate_script` step that returns `window.location.href` and verify before acting.
 - If the profile's Chrome is not running, `mcp call` / `mcp batch` / `mcp list` will start it on first use.

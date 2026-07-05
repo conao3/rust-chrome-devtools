@@ -382,6 +382,12 @@ fn page_ids(response: &serde_json::Value) -> Vec<u64> {
         .collect()
 }
 
+fn status_field<'a>(output: &'a str, prefix: &str) -> Option<&'a str> {
+    output
+        .split_whitespace()
+        .find_map(|field| field.strip_prefix(prefix))
+}
+
 #[test]
 fn smoke_session_create_and_batch() {
     let mut env = TestEnv::new("smoke");
@@ -1083,6 +1089,18 @@ fn daemon_status_reports_pages_and_queue() {
         "output: {output}"
     );
     assert!(output.contains("queued_mcp_requests=0"), "output: {output}");
+    assert!(
+        output.contains("max_control_latency_ms="),
+        "output: {output}"
+    );
+    assert!(
+        output.contains("max_forward_latency_ms="),
+        "output: {output}"
+    );
+    assert!(
+        output.contains("diagnostic_window_secs="),
+        "output: {output}"
+    );
 }
 
 #[test]
@@ -1117,6 +1135,13 @@ fn mcp_request_timeout_keeps_session_when_probe_succeeds() {
     let (ok, output) = env.run_cli(&["daemon", "status", "--profile", "default"]);
     assert!(ok, "status failed: {output}");
     assert!(!output.contains("respawns="), "output: {output}");
+    assert!(
+        status_field(&output, "max_forward_latency_ms=")
+            .and_then(|value| value.parse::<u128>().ok())
+            .unwrap()
+            >= 1000,
+        "output: {output}"
+    );
 }
 
 #[test]

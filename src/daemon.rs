@@ -564,6 +564,12 @@ pub(crate) fn print_daemon_status(profile: &Profile) -> Result<(), String> {
     let active_sessions = parse_status_field(&response, "active_sessions=").unwrap_or("unknown");
     let pages = parse_status_field(&response, "pages=").unwrap_or("");
     let queued = parse_status_field(&response, "queued_mcp_requests=").unwrap_or("unknown");
+    let max_control_latency =
+        parse_status_field(&response, "max_control_latency_ms=").unwrap_or("unknown");
+    let max_forward_latency =
+        parse_status_field(&response, "max_forward_latency_ms=").unwrap_or("unknown");
+    let diagnostic_window =
+        parse_status_field(&response, "diagnostic_window_secs=").unwrap_or("unknown");
     let chrome = match parse_status_field(&response, "mcp_port=")
         .and_then(|port| port.parse::<u16>().ok())
     {
@@ -572,7 +578,7 @@ pub(crate) fn print_daemon_status(profile: &Profile) -> Result<(), String> {
         None => "unknown".to_string(),
     };
     println!(
-        "profile={} daemon=ready version={version} sessions={sessions} active_sessions={active_sessions} pages={pages} queued_mcp_requests={queued} chrome={chrome} pid={pid} socket={}{health}",
+        "profile={} daemon=ready version={version} sessions={sessions} active_sessions={active_sessions} pages={pages} queued_mcp_requests={queued} max_control_latency_ms={max_control_latency} max_forward_latency_ms={max_forward_latency} diagnostic_window_secs={diagnostic_window} chrome={chrome} pid={pid} socket={}{health}",
         profile.name,
         socket_path.display()
     );
@@ -832,7 +838,7 @@ pub(crate) fn mcp_command(profile: &Profile) -> Command {
         command
     };
     let max_old_space_mb =
-        env::var("CHROME_DEVTOOLS_MCP_MAX_OLD_SPACE_MB").unwrap_or_else(|_| "1024".to_string());
+        env::var("CHROME_DEVTOOLS_MCP_MAX_OLD_SPACE_MB").unwrap_or_else(|_| "2048".to_string());
     let node_options = format!("--max-old-space-size={max_old_space_mb}");
     let merged = match env::var("NODE_OPTIONS") {
         Ok(existing) if !existing.is_empty() => format!("{existing} {node_options}"),

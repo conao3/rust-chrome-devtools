@@ -5,6 +5,7 @@ use crate::daemon::{
 };
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::collections::VecDeque;
 use std::env;
 use std::io::BufRead;
 use std::io::BufReader;
@@ -50,6 +51,36 @@ pub(crate) fn mcp_probe_timeout() -> Duration {
         .and_then(|value| value.parse::<u64>().ok())
         .map(Duration::from_secs)
         .unwrap_or(MCP_PROBE_TIMEOUT)
+}
+
+pub(crate) const DIAGNOSTIC_WINDOW: Duration = Duration::from_secs(10 * 60);
+
+pub(crate) fn diagnostic_window() -> Duration {
+    env::var("CHROME_DEVTOOLS_DIAGNOSTIC_WINDOW_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(DIAGNOSTIC_WINDOW)
+}
+
+pub(crate) const CONTROL_WARN_LATENCY: Duration = Duration::from_secs(1);
+
+pub(crate) fn control_warn_latency() -> Duration {
+    env::var("CHROME_DEVTOOLS_CONTROL_WARN_LATENCY_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(CONTROL_WARN_LATENCY)
+}
+
+pub(crate) const FORWARD_WARN_LATENCY: Duration = Duration::from_secs(30);
+
+pub(crate) fn forward_warn_latency() -> Duration {
+    env::var("CHROME_DEVTOOLS_FORWARD_WARN_LATENCY_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(FORWARD_WARN_LATENCY)
 }
 
 pub(crate) fn session_idle_ttl() -> Duration {
@@ -498,18 +529,139 @@ fn ensure_runtime_ready(
 pub(crate) struct RouterHandle {
     sender: mpsc::Sender<RouterRequest>,
     queued: Arc<AtomicUsize>,
+    diagnostics: Arc<Mutex<Diagnostics>>,
 }
 
 pub(crate) enum RouterRequest {
     Forward {
         line: String,
         session_id: Option<String>,
+        enqueued_at: Instant,
+        queued_at_enqueue: usize,
         response: mpsc::Sender<Result<Vec<String>, String>>,
     },
     ClosePages {
         pages: Vec<PageCleanup>,
         response: mpsc::Sender<Result<(), String>>,
     },
+}
+
+#[derive(Default)]
+struct Diagnostics {
+    control: VecDeque<(Instant, Duration)>,
+    forward: VecDeque<(Instant, Duration)>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct DiagnosticsSnapshot {
+    pub(crate) window_secs: u64,
+    pub(crate) max_control_latency_ms: u128,
+    pub(crate) max_forward_latency_ms: u128,
+}
+
+impl Diagnostics {
+    fn record_control(&mut self, elapsed: Duration, window: Duration) -> u128 {
+        self.control.push_back((Instant::now(), elapsed));
+        self.prune(window);
+        self.max_control_latency_ms(window)
+    }
+
+    fn record_forward(&mut self, elapsed: Duration, window: Duration) -> u128 {
+        self.forward.push_back((Instant::now(), elapsed));
+        self.prune(window);
+        self.max_forward_latency_ms(window)
+    }
+
+    fn snapshot(&mut self, window: Duration) -> DiagnosticsSnapshot {
+        self.prune(window);
+        DiagnosticsSnapshot {
+            window_secs: window.as_secs(),
+            max_control_latency_ms: self.max_control_latency_ms(window),
+            max_forward_latency_ms: self.max_forward_latency_ms(window),
+        }
+    }
+
+    fn prune(&mut self, window: Duration) {
+        let now = Instant::now();
+        let cutoff = now.checked_sub(window).unwrap_or(now);
+        while self
+            .control
+            .front()
+            .map(|(recorded_at, _)| *recorded_at < cutoff)
+            == Some(true)
+        {
+            self.control.pop_front();
+        }
+        while self
+            .forward
+            .front()
+            .map(|(recorded_at, _)| *recorded_at < cutoff)
+            == Some(true)
+        {
+            self.forward.pop_front();
+        }
+    }
+
+    fn max_control_latency_ms(&self, window: Duration) -> u128 {
+        Self::max_latency_ms(&self.control, window)
+    }
+
+    fn max_forward_latency_ms(&self, window: Duration) -> u128 {
+        Self::max_latency_ms(&self.forward, window)
+    }
+
+    fn max_latency_ms(records: &VecDeque<(Instant, Duration)>, window: Duration) -> u128 {
+        let now = Instant::now();
+        let cutoff = now.checked_sub(window).unwrap_or(now);
+        records
+            .iter()
+            .filter(|(recorded_at, _)| *recorded_at >= cutoff)
+            .map(|(_, elapsed)| elapsed.as_millis())
+            .max()
+            .unwrap_or(0)
+    }
+}
+
+fn record_forward_diagnostic(
+    diagnostics: &Arc<Mutex<Diagnostics>>,
+    session_id: Option<&str>,
+    line: &str,
+    queue_wait: Duration,
+    total: Duration,
+    queued_at_enqueue: usize,
+    queued_after_done: usize,
+) {
+    let max_ms = diagnostics
+        .lock()
+        .map(|mut diagnostics| diagnostics.record_forward(total, diagnostic_window()))
+        .unwrap_or(0);
+    if total >= forward_warn_latency() {
+        let (method, tool) = request_label(line);
+        eprintln!(
+            "warning: slow forward method={method} tool={tool} session={} queue_wait_ms={} total_ms={} queued_at_enqueue={queued_at_enqueue} queued_after_done={queued_after_done} max_forward_latency_ms={max_ms}",
+            session_id.unwrap_or(""),
+            queue_wait.as_millis(),
+            total.as_millis()
+        );
+    }
+}
+
+fn request_label(line: &str) -> (String, String) {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+        return ("invalid".to_string(), String::new());
+    };
+    let method = value
+        .get("method")
+        .and_then(|method| method.as_str())
+        .unwrap_or("")
+        .to_string();
+    let tool = value
+        .get("params")
+        .and_then(|params| params.get("name"))
+        .and_then(|name| name.as_str())
+        .unwrap_or("")
+        .to_string();
+    (method, tool)
 }
 
 impl RouterHandle {
@@ -521,6 +673,8 @@ impl RouterHandle {
         let (sender, receiver) = mpsc::channel::<RouterRequest>();
         let queued = Arc::new(AtomicUsize::new(0));
         let queued_for_router = Arc::clone(&queued);
+        let diagnostics = Arc::new(Mutex::new(Diagnostics::default()));
+        let diagnostics_for_router = Arc::clone(&diagnostics);
         thread::spawn(move || {
             let mut next_id: u64 = 10_000;
             let mut abandoned_ids = HashSet::new();
@@ -539,8 +693,11 @@ impl RouterHandle {
                     RouterRequest::Forward {
                         line,
                         session_id,
+                        enqueued_at,
+                        queued_at_enqueue,
                         response,
                     } => {
+                        let started_at = Instant::now();
                         let result = route_request(
                             &mut runtime.stdin,
                             &mut runtime.reader,
@@ -580,6 +737,17 @@ impl RouterHandle {
                                 let _ = response.send(Ok(error_response_for_line(&line, &message)));
                             }
                         }
+                        let total = enqueued_at.elapsed();
+                        let queue_wait = started_at.duration_since(enqueued_at);
+                        record_forward_diagnostic(
+                            &diagnostics_for_router,
+                            session_id.as_deref(),
+                            &line,
+                            queue_wait,
+                            total,
+                            queued_at_enqueue,
+                            queued_for_router.load(Ordering::SeqCst),
+                        );
                     }
                     RouterRequest::ClosePages { pages, response } => {
                         let result = close_daemon_pages(
@@ -594,7 +762,11 @@ impl RouterHandle {
                 }
             }
         });
-        Self { sender, queued }
+        Self {
+            sender,
+            queued,
+            diagnostics,
+        }
     }
 
     pub(crate) fn forward(
@@ -603,10 +775,13 @@ impl RouterHandle {
         line: &str,
     ) -> Result<Vec<String>, DaemonError> {
         let (response_tx, response_rx) = mpsc::channel();
-        self.queued.fetch_add(1, Ordering::SeqCst);
+        let enqueued_at = Instant::now();
+        let queued_at_enqueue = self.queued.fetch_add(1, Ordering::SeqCst) + 1;
         if let Err(error) = self.sender.send(RouterRequest::Forward {
             line: line.to_string(),
             session_id: session_id.map(|id| id.to_string()),
+            enqueued_at,
+            queued_at_enqueue,
             response: response_tx,
         }) {
             self.queued.fetch_sub(1, Ordering::SeqCst);
@@ -649,6 +824,32 @@ impl RouterHandle {
 
     pub(crate) fn queued_requests(&self) -> usize {
         self.queued.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn record_control_latency(&self, name: &str, elapsed: Duration) {
+        let max_ms = self
+            .diagnostics
+            .lock()
+            .map(|mut diagnostics| diagnostics.record_control(elapsed, diagnostic_window()))
+            .unwrap_or(0);
+        if elapsed >= control_warn_latency() {
+            eprintln!(
+                "warning: slow control command={} elapsed_ms={} max_control_latency_ms={max_ms}",
+                name,
+                elapsed.as_millis()
+            );
+        }
+    }
+
+    pub(crate) fn diagnostics_snapshot(&self) -> DiagnosticsSnapshot {
+        self.diagnostics
+            .lock()
+            .map(|mut diagnostics| diagnostics.snapshot(diagnostic_window()))
+            .unwrap_or(DiagnosticsSnapshot {
+                window_secs: diagnostic_window().as_secs(),
+                max_control_latency_ms: 0,
+                max_forward_latency_ms: 0,
+            })
     }
 }
 
@@ -1686,14 +1887,18 @@ pub(crate) fn handle_daemon_client(
         }
 
         if let Some(command) = line.strip_prefix("__chrome_devtools_daemon__:") {
-            match handle_control_command(
+            let started_at = Instant::now();
+            let name = control_label(command);
+            let outcome = handle_control_command(
                 &mut stream,
                 &router,
                 sessions,
                 &mut bound,
                 command,
                 profile,
-            )? {
+            );
+            router.record_control_latency(&name, started_at.elapsed());
+            match outcome? {
                 ControlOutcome::Continue => continue,
                 ControlOutcome::CloseConnection => return Ok(false),
                 ControlOutcome::StopDaemon => return Ok(true),
@@ -1850,6 +2055,10 @@ pub(crate) enum ControlOutcome {
     StopDaemon,
 }
 
+fn control_label(command: &str) -> String {
+    command.split_whitespace().next().unwrap_or("").to_string()
+}
+
 pub(crate) fn handle_control_command(
     stream: &mut UnixStream,
     router: &RouterHandle,
@@ -1865,6 +2074,7 @@ pub(crate) fn handle_control_command(
     match head {
         "status" => {
             let snapshot = lock_sessions(sessions)?.list();
+            let diagnostics = router.diagnostics_snapshot();
             let count = snapshot.len();
             let active = snapshot.iter().filter(|session| session.owned).count();
             let pages = snapshot
@@ -1875,9 +2085,12 @@ pub(crate) fn handle_control_command(
             write_control_line(
                 stream,
                 &format!(
-                    "daemon=ready version={} sessions={count} active_sessions={active} pages={pages} queued_mcp_requests={} mcp_port={mcp_port}",
+                    "daemon=ready version={} sessions={count} active_sessions={active} pages={pages} queued_mcp_requests={} max_control_latency_ms={} max_forward_latency_ms={} diagnostic_window_secs={} mcp_port={mcp_port}",
                     env!("CARGO_PKG_VERSION"),
                     router.queued_requests(),
+                    diagnostics.max_control_latency_ms,
+                    diagnostics.max_forward_latency_ms,
+                    diagnostics.window_secs,
                     mcp_port = current_port(profile).unwrap_or_default()
                 ),
             )?;

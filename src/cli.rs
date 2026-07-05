@@ -786,7 +786,7 @@ pub(crate) fn print_daemon_status_help() {
             &[
                 "Print whether the per-profile daemon is ready or stopped. Ready output:",
                 "",
-                "  profile=<p> daemon=ready version=<v> sessions=<n> active_sessions=<n> pages=<ids> queued_mcp_requests=<n> chrome=<state> respawns=<n> pid=<pid> socket=<path>",
+                "  profile=<p> daemon=ready version=<v> sessions=<n> active_sessions=<n> pages=<ids> queued_mcp_requests=<n> max_control_latency_ms=<n> max_forward_latency_ms=<n> diagnostic_window_secs=<n> chrome=<state> respawns=<n> pid=<pid> socket=<path>",
                 "",
                 "chrome=ready means the DevTools endpoint currently responds.",
                 "respawns=<n> counts daemon-managed MCP respawns; mint a new session after it changes.",
