@@ -64,6 +64,9 @@ Environment overrides:
 - `CHROME_DEVTOOLS_FORWARD_WARN_LATENCY_MS`: MCP forward warn threshold. Default: `30000`.
 - `CHROME_DEVTOOLS_DIAGNOSTIC_WINDOW_SECS`: daemon status latency window. Default: `600`.
 - `CHROME_DEVTOOLS_CHROME_EXTRA_ARGS`: extra whitespace-separated flags appended to the Chrome command line at launch.
+- `CHROME_DEVTOOLS_MCP_HEAVY_REQUEST_TIMEOUT_SECS`: request timeout for heavy tools (`take_snapshot`, `take_screenshot`, `performance_*`). Default: `300`.
+
+Heavy-tool note: Chrome's `Accessibility.getFullAXTree` (used by `take_snapshot`) scales super-linearly with DOM size — pages with 100k+ nodes can take minutes. Timing out early does not help: chrome-devtools-mcp does not abort a cancelled tool call and holds its internal tool mutex until the call finishes, so subsequent tools of the same daemon queue behind it anyway. That is why heavy tools get a longer deadline. On very large pages prefer `evaluate_script` for targeted inspection over full snapshots.
 
 Chrome is always launched with `--disable-features=PasswordLeakDetection`: the native "Change your password" dialog is invisible to MCP snapshots and blocks page input, which makes automated actions appear to hang. Chrome flags only apply when the daemon starts a new Chrome process — an already-running Chrome for the profile is reused as-is, so after upgrading run `chrome-devtools daemon stop --profile <name>` followed by `chrome-devtools profile stop --profile <name>` (kills Chrome) once.
 

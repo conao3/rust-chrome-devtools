@@ -19,6 +19,7 @@ Use `chrome-devtools` when you need browser automation through Chrome DevTools M
 - `take_snapshot` result `uid` values are session uid tokens. Reuse them only in the same session and after the latest snapshot.
 - Do not use `mcp direct-call` for a split `take_snapshot` then `click`/`fill` workflow; direct mode starts a separate MCP process and the snapshot cache is lost.
 - Take a fresh snapshot before using `click`, `fill`, or other uid-based actions if the page may have changed.
+- On very large pages (huge DOM, e.g. big GitHub PR file views) `take_snapshot` can take minutes: Chrome's full accessibility-tree dump scales super-linearly with node count. Heavy tools (`take_snapshot`, `take_screenshot`, `performance_*`) get a 300s deadline (others 120s). If a heavy call times out it usually still completed in the background and blocks the next tool call until done — prefer targeted `evaluate_script` over full snapshots on such pages.
 - Do not start or kill the user's regular Chrome unless explicitly asked.
 - If a browser login is required, open the page and ask the user to complete the login manually.
 - The daemon and its Chrome are shared with other agents. `daemon stop` refuses while sessions are active and `profile stop` refuses while the daemon is running; only pass `--force` when the user explicitly asks to tear them down.

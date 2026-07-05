@@ -57,6 +57,39 @@ pub(crate) fn mcp_request_timeout() -> Duration {
         .unwrap_or(MCP_REQUEST_TIMEOUT)
 }
 
+pub(crate) const MCP_HEAVY_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
+
+pub(crate) fn mcp_heavy_request_timeout() -> Duration {
+    env::var("CHROME_DEVTOOLS_MCP_HEAVY_REQUEST_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(MCP_HEAVY_REQUEST_TIMEOUT)
+}
+
+// Chrome の Accessibility.getFullAXTree は DOM ノード数に対し超線形 (~O(n^2)) で、
+// 巨大ページでは分単位かかる。timeout で見放しても MCP は処理を中断しないため
+// (単一 tool mutex も保持したまま)、これらの tool は長い deadline で待つ方が損が少ない。
+pub(crate) fn is_heavy_mcp_tool(tool: &str) -> bool {
+    matches!(
+        tool,
+        "take_snapshot"
+            | "take_screenshot"
+            | "performance_start_trace"
+            | "performance_stop_trace"
+            | "performance_analyze_insight"
+    )
+}
+
+pub(crate) fn request_timeout_for_line(line: &str) -> Duration {
+    let (_, tool) = request_label(line);
+    if is_heavy_mcp_tool(&tool) {
+        mcp_heavy_request_timeout().max(mcp_request_timeout())
+    } else {
+        mcp_request_timeout()
+    }
+}
+
 pub(crate) const MCP_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub(crate) fn mcp_probe_timeout() -> Duration {
@@ -945,7 +978,7 @@ pub(crate) fn forward_line(
     let forwarded = rewrite_jsonrpc_id(line, serde_json::json!(internal_id))?;
     write_json_line(mcp_stdin, &forwarded)?;
     let mut lines = Vec::new();
-    let deadline = Instant::now() + mcp_request_timeout();
+    let deadline = Instant::now() + request_timeout_for_line(line);
     loop {
         let response_line = read_mcp_response_line_until_ignoring(
             mcp_stdin,
@@ -963,6 +996,12 @@ pub(crate) fn forward_line(
         if extract_jsonrpc_id(&response_line) == Some(internal_id) {
             lines.push(rewrite_jsonrpc_id(&response_line, original_id.clone())?);
             return Ok(lines);
+        }
+        // MCP server 発の notification (notifications/cancelled 等) は daemon⇔MCP 間の
+        // 制御情報であり、クライアントの JSON-RPC ストリームに混ぜると誤解を生む。
+        if json_method_starts_with(&response_line, "notifications/") {
+            eprintln!("mcp_notification dropped={response_line}");
+            continue;
         }
         lines.push(response_line);
     }
@@ -2170,8 +2209,10 @@ pub(crate) fn read_mcp_response_line_until(
     mcp_reader: &mut impl BufRead,
     deadline: Instant,
 ) -> Result<String, DaemonError> {
+    // 応答行 (数 MB になりうる) は複数回の read に跨る。WouldBlock を跨いでも
+    // 読みかけの部分行を失わないよう、バッファは retry ループの外で保持する。
+    let mut response_line = String::new();
     loop {
-        let mut response_line = String::new();
         let bytes = match mcp_reader.read_line(&mut response_line) {
             Ok(bytes) => bytes,
             Err(error)
@@ -2197,14 +2238,19 @@ pub(crate) fn read_mcp_response_line_until(
                 "chrome-devtools-mcp closed stdout before responding".to_string(),
             ));
         }
-        let response_line = response_line.trim_end().to_string();
-        if json_has_method(&response_line, "roots/list") {
-            if let Some(id) = extract_jsonrpc_id(&response_line) {
+        if !response_line.ends_with('\n') {
+            // 改行なしで Ok が返るのは EOF 直前のみ。次の read で EOF (bytes == 0) を検出する。
+            continue;
+        }
+        let line = response_line.trim_end().to_string();
+        response_line.clear();
+        if json_has_method(&line, "roots/list") {
+            if let Some(id) = extract_jsonrpc_id(&line) {
                 write_json_line(mcp_stdin, &roots_list_response(id)).map_err(DaemonError::Fatal)?;
             }
             continue;
         }
-        return Ok(response_line);
+        return Ok(line);
     }
 }
 
@@ -2568,6 +2614,18 @@ pub(crate) fn sanitize_outgoing_request(line: &str) -> String {
         "warning: stripped 'isolatedContext' from new_page; isolated browser contexts disable extensions"
     );
     serde_json::to_string(&value).unwrap_or_else(|_| line.to_string())
+}
+
+pub(crate) fn json_method_starts_with(line: &str, prefix: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(line)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("method")
+                .and_then(|found| found.as_str())
+                .map(|found| found.starts_with(prefix))
+        })
+        .unwrap_or(false)
 }
 
 pub(crate) fn json_has_method(line: &str, method: &str) -> bool {

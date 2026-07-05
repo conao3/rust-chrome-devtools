@@ -151,6 +151,11 @@ impl TestEnv {
                 "CHROME_DEVTOOLS_MCP_REQUEST_TIMEOUT_SECS",
                 value.to_string(),
             );
+            // heavy tool (take_snapshot 等) の timeout も同値に下げ、timeout 再現テストを成立させる
+            command.env(
+                "CHROME_DEVTOOLS_MCP_HEAVY_REQUEST_TIMEOUT_SECS",
+                value.to_string(),
+            );
         }
         if let Some(value) = self.mcp_probe_timeout_secs {
             command.env("CHROME_DEVTOOLS_MCP_PROBE_TIMEOUT_SECS", value.to_string());

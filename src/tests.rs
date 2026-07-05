@@ -4,11 +4,12 @@ use crate::config::*;
 use crate::daemon::*;
 use crate::lock::*;
 use crate::router::*;
+use std::collections::HashMap;
 use std::env;
 use std::io::BufRead;
 use std::path::PathBuf;
 use std::process::Command;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 fn args(values: &[&str]) -> Vec<String> {
     values.iter().map(|value| value.to_string()).collect()
@@ -120,6 +121,99 @@ fn parse_lock_pid_extracts_pid_line() {
 #[test]
 fn parse_lock_pid_returns_none_without_pid() {
     assert_eq!(parse_lock_pid("profile=default\n"), None);
+}
+
+#[test]
+fn heavy_mcp_tools_get_longer_timeout() {
+    assert!(is_heavy_mcp_tool("take_snapshot"));
+    assert!(is_heavy_mcp_tool("take_screenshot"));
+    assert!(!is_heavy_mcp_tool("click"));
+    let heavy = request_timeout_for_line(
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"take_snapshot","arguments":{}}}"#,
+    );
+    let normal = request_timeout_for_line(
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"click","arguments":{}}}"#,
+    );
+    assert!(heavy >= MCP_HEAVY_REQUEST_TIMEOUT);
+    assert_eq!(normal, mcp_request_timeout());
+}
+
+#[test]
+fn json_method_starts_with_matches_notifications() {
+    assert!(json_method_starts_with(
+        r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{}}"#,
+        "notifications/"
+    ));
+    assert!(!json_method_starts_with(
+        r#"{"jsonrpc":"2.0","id":1,"result":{}}"#,
+        "notifications/"
+    ));
+}
+
+#[test]
+fn forward_line_drops_server_notifications_from_client_stream() {
+    let input = concat!(
+        r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":9}}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","id":10000,"result":{"content":[]}}"#,
+        "\n",
+    );
+    let mut reader = std::io::BufReader::new(std::io::Cursor::new(input));
+    let mut written: Vec<u8> = Vec::new();
+    let mut next_id = 10_000;
+    let mut abandoned = HashMap::new();
+    let lines = forward_line(
+        &mut written,
+        &mut reader,
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"click","arguments":{}}}"#,
+        &mut next_id,
+        &mut abandoned,
+    )
+    .unwrap();
+    assert_eq!(lines.len(), 1);
+    assert!(lines[0].contains("\"id\":1"));
+}
+
+#[test]
+fn read_mcp_response_line_keeps_partial_line_across_would_block() {
+    struct ChunkedReader {
+        chunks: Vec<Vec<u8>>,
+        blocked: bool,
+    }
+    impl std::io::Read for ChunkedReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if !self.blocked {
+                self.blocked = true;
+                return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
+            }
+            self.blocked = false;
+            let Some(chunk) = self.chunks.first_mut() else {
+                return Ok(0);
+            };
+            let n = chunk.len().min(buf.len());
+            buf[..n].copy_from_slice(&chunk[..n]);
+            chunk.drain(..n);
+            if chunk.is_empty() {
+                self.chunks.remove(0);
+            }
+            Ok(n)
+        }
+    }
+    let payload = r#"{"jsonrpc":"2.0","id":42,"result":{}}"#;
+    let (head, tail) = payload.split_at(20);
+    let reader = ChunkedReader {
+        chunks: vec![head.as_bytes().to_vec(), format!("{tail}\n").into_bytes()],
+        blocked: false,
+    };
+    let mut buf_reader = std::io::BufReader::new(reader);
+    let mut written: Vec<u8> = Vec::new();
+    let line = read_mcp_response_line_until(
+        &mut written,
+        &mut buf_reader,
+        Instant::now() + Duration::from_secs(5),
+    )
+    .unwrap();
+    assert_eq!(line, payload);
 }
 
 #[test]
