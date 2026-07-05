@@ -1,3 +1,4 @@
+use crate::cdp;
 use crate::config::Profile;
 use crate::daemon::{
     current_port, daemon_mcp_command, ensure_chrome, initialize_daemon_mcp, is_devtools_ready,
@@ -28,6 +29,19 @@ use std::time::Duration;
 use std::time::Instant;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
+
+unsafe extern "C" {
+    fn poll(fds: *mut PollFd, nfds: usize, timeout: i32) -> i32;
+}
+
+#[repr(C)]
+struct PollFd {
+    fd: i32,
+    events: i16,
+    revents: i16,
+}
+
+const POLLHUP: i16 = 0x10;
 
 pub(crate) const SESSION_IDLE_TTL: Duration = Duration::from_secs(30 * 60);
 
@@ -162,7 +176,12 @@ impl SessionRegistry {
         if session.owned {
             return Err(format!("session in use: {id}"));
         }
-        Ok(self.sessions.remove(id).and_then(page_cleanup_for_session))
+        let session = self
+            .sessions
+            .remove(id)
+            .ok_or_else(|| format!("unknown session: {id}"))?;
+        log_session_removed("session_close", &session);
+        Ok(page_cleanup_for_session(session))
     }
 
     pub(crate) fn bind(&mut self, id: &str) -> Result<(), String> {
@@ -203,6 +222,7 @@ impl SessionRegistry {
                 Err(_) => true,
             };
             if !keep {
+                log_session_removed("idle_reap", session);
                 if let Some(page) = page_cleanup_for_session(session.clone()) {
                     cleanup.push(page);
                 }
@@ -249,7 +269,10 @@ impl SessionRegistry {
         }
     }
 
-    pub(crate) fn clear_sessions(&mut self) {
+    pub(crate) fn clear_sessions(&mut self, reason: &str) {
+        for session in self.sessions.values() {
+            log_session_removed(reason, session);
+        }
         self.sessions.clear();
     }
 
@@ -336,6 +359,20 @@ fn page_cleanup_for_session(session: SessionState) -> Option<PageCleanup> {
     } else {
         None
     }
+}
+
+fn log_session_removed(reason: &str, session: &SessionState) {
+    eprintln!(
+        "session_removed reason={reason} session={} owned={} page={} page_created_by_daemon={} last_used={}",
+        session.id,
+        session.owned,
+        session
+            .page_id
+            .map(|page_id| page_id.to_string())
+            .unwrap_or_default(),
+        session.page_created_by_daemon,
+        unix_secs(session.last_used_at)
+    );
 }
 
 pub(crate) fn generate_session_id() -> String {
@@ -442,10 +479,10 @@ impl Drop for McpRuntime {
     }
 }
 
-fn clear_sessions(sessions: &SharedSessions) {
+fn clear_sessions(sessions: &SharedSessions, reason: &str) {
     let (lock, cvar) = &**sessions;
     if let Ok(mut registry) = lock.lock() {
-        registry.clear_sessions();
+        registry.clear_sessions(reason);
         cvar.notify_all();
     }
 }
@@ -485,7 +522,7 @@ fn respawn_runtime(
     ) {
         eprintln!("warning: failed to clean daemon-created pages after MCP respawn: {error}");
     }
-    clear_sessions(sessions);
+    clear_sessions(sessions, reason);
     record_daemon_respawn(profile, reason);
     Ok(())
 }
@@ -701,6 +738,7 @@ impl RouterHandle {
                         let result = route_request(
                             &mut runtime.stdin,
                             &mut runtime.reader,
+                            &profile,
                             &sessions,
                             session_id.as_deref(),
                             &line,
@@ -712,25 +750,33 @@ impl RouterHandle {
                                 let _ = response.send(Ok(lines));
                             }
                             Err(message) if message.contains("MCP request timed out") => {
-                                let _ = response.send(Ok(error_response_for_line(&line, &message)));
-                                if let Err(error) = probe_mcp_runtime(
-                                    &mut runtime.stdin,
-                                    &mut runtime.reader,
-                                    &mut next_id,
-                                    &mut abandoned_ids,
-                                ) {
-                                    eprintln!(
-                                        "warning: MCP probe failed after request timeout: {error}"
-                                    );
-                                    let _ = respawn_runtime(
-                                        &profile,
-                                        &mut runtime,
-                                        &sessions,
+                                if response
+                                    .send(Ok(error_response_for_line(&line, &message)))
+                                    .is_ok()
+                                {
+                                    if let Err(error) = probe_mcp_runtime(
+                                        &mut runtime.stdin,
+                                        &mut runtime.reader,
                                         &mut next_id,
                                         &mut abandoned_ids,
-                                        "mcp probe failed after request timeout",
+                                    ) {
+                                        eprintln!(
+                                            "warning: MCP probe failed after request timeout: {error}"
+                                        );
+                                        let _ = respawn_runtime(
+                                            &profile,
+                                            &mut runtime,
+                                            &sessions,
+                                            &mut next_id,
+                                            &mut abandoned_ids,
+                                            "mcp probe failed after request timeout",
+                                        );
+                                        abandoned_ids.clear();
+                                    }
+                                } else {
+                                    eprintln!(
+                                        "warning: skipped MCP timeout probe because client disconnected"
                                     );
-                                    abandoned_ids.clear();
                                 }
                             }
                             Err(message) => {
@@ -769,11 +815,11 @@ impl RouterHandle {
         }
     }
 
-    pub(crate) fn forward(
+    pub(crate) fn enqueue_forward(
         &self,
         session_id: Option<&str>,
         line: &str,
-    ) -> Result<Vec<String>, DaemonError> {
+    ) -> Result<mpsc::Receiver<Result<Vec<String>, String>>, DaemonError> {
         let (response_tx, response_rx) = mpsc::channel();
         let enqueued_at = Instant::now();
         let queued_at_enqueue = self.queued.fetch_add(1, Ordering::SeqCst) + 1;
@@ -789,12 +835,7 @@ impl RouterHandle {
                 "failed to queue MCP request: {error}"
             )));
         }
-        response_rx
-            .recv()
-            .map_err(|error| {
-                DaemonError::Fatal(format!("failed to receive MCP response: {error}"))
-            })?
-            .map_err(DaemonError::Fatal)
+        Ok(response_rx)
     }
 
     pub(crate) fn close_pages(&self, pages: Vec<PageCleanup>) -> Result<(), DaemonError> {
@@ -1268,6 +1309,14 @@ fn session_page_created_by_daemon(sessions: &SharedSessions, session_id: &str) -
         .unwrap_or(false)
 }
 
+fn session_page_url(sessions: &SharedSessions, session_id: &str) -> Option<String> {
+    let (lock, _) = &**sessions;
+    lock.lock()
+        .ok()
+        .and_then(|registry| registry.sessions.get(session_id).cloned())
+        .and_then(|session| session.page_url)
+}
+
 fn record_session_page(
     sessions: &SharedSessions,
     session_id: &str,
@@ -1555,10 +1604,73 @@ fn error_response_for_line(line: &str, message: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+fn upload_file_needs_fallback(line: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+        return false;
+    };
+    let text = value
+        .get("result")
+        .and_then(|result| result.get("content"))
+        .and_then(|content| content.as_array())
+        .and_then(|content| content.first())
+        .and_then(|item| item.get("text"))
+        .and_then(|text| text.as_str())
+        .unwrap_or("");
+    value
+        .get("result")
+        .and_then(|result| result.get("isError"))
+        .and_then(|is_error| is_error.as_bool())
+        == Some(true)
+        && text.contains("could not accept the file directly")
+        && text.contains("clicking it did not trigger a file chooser")
+}
+
+fn upload_file_paths(arguments: &serde_json::Value) -> Vec<String> {
+    let mut paths = Vec::new();
+    for key in ["filePath", "path"] {
+        if let Some(path) = arguments.get(key).and_then(|value| value.as_str()) {
+            paths.push(path.to_string());
+        }
+    }
+    for key in ["filePaths", "files"] {
+        if let Some(items) = arguments.get(key).and_then(|value| value.as_array()) {
+            paths.extend(
+                items
+                    .iter()
+                    .filter_map(|item| item.as_str())
+                    .map(|item| item.to_string()),
+            );
+        }
+    }
+    paths
+}
+
+fn upload_file_fallback_response(line: &str) -> Vec<String> {
+    serde_json::from_str::<serde_json::Value>(line)
+        .ok()
+        .and_then(|value| value.get("id").cloned())
+        .map(|id| {
+            vec![serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {
+                    "content": [{
+                        "type": "text",
+                        "text": "uploaded file via CDP fallback"
+                    }],
+                    "structuredContent": {}
+                }
+            })
+            .to_string()]
+        })
+        .unwrap_or_default()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn route_request(
     mcp_stdin: &mut impl Write,
     mcp_reader: &mut impl BufRead,
+    profile: &Profile,
     sessions: &SharedSessions,
     session_id: Option<&str>,
     line: &str,
@@ -1634,6 +1746,15 @@ fn route_request(
                 abandoned_ids,
             )?;
             let mut forwarded = value;
+            let upload_paths = if other == "upload_file" {
+                forwarded
+                    .get("params")
+                    .and_then(|params| params.get("arguments"))
+                    .map(upload_file_paths)
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
             inject_page_id(&mut forwarded, page_id);
             if let Some(arguments) = forwarded
                 .get_mut("params")
@@ -1661,6 +1782,35 @@ fn route_request(
                 next_id,
                 abandoned_ids,
             )?;
+            let lines = if other == "upload_file"
+                && lines.last().map(|line| upload_file_needs_fallback(line)) == Some(true)
+            {
+                match current_port(profile)
+                    .ok_or_else(|| "missing DevTools port".to_string())
+                    .and_then(|port| {
+                        cdp::set_file_input_files(
+                            port,
+                            session_page_url(sessions, session_id).as_deref(),
+                            &upload_paths,
+                        )
+                    }) {
+                    Ok(()) => {
+                        eprintln!("upload_file_fallback session={session_id} page={page_id}");
+                        lines
+                            .last()
+                            .map(|line| upload_file_fallback_response(line))
+                            .unwrap_or_default()
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "warning: upload_file_fallback_failed session={session_id} page={page_id} error={error}"
+                        );
+                        lines
+                    }
+                }
+            } else {
+                lines
+            };
             if let Some(url) = navigated_url {
                 let errored = lines
                     .last()
@@ -1860,6 +2010,46 @@ impl Drop for BoundSessionGuard<'_> {
     }
 }
 
+fn client_disconnected(stream: &UnixStream) -> Result<bool, DaemonError> {
+    let mut fd = PollFd {
+        fd: stream.as_raw_fd(),
+        events: 0,
+        revents: 0,
+    };
+    let ready = unsafe { poll(&mut fd, 1, 0) };
+    if ready < 0 {
+        let error = std::io::Error::last_os_error();
+        Err(DaemonError::Client(format!(
+            "failed to inspect daemon client connection: {error}"
+        )))
+    } else {
+        Ok(fd.revents & POLLHUP != 0)
+    }
+}
+
+fn wait_forward_response(
+    stream: &UnixStream,
+    response: mpsc::Receiver<Result<Vec<String>, String>>,
+) -> Result<Vec<String>, DaemonError> {
+    loop {
+        match response.recv_timeout(Duration::from_millis(50)) {
+            Ok(result) => return result.map_err(DaemonError::Fatal),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if client_disconnected(stream)? {
+                    return Err(DaemonError::Client(
+                        "daemon client disconnected during MCP forward".to_string(),
+                    ));
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(DaemonError::Fatal(
+                    "failed to receive MCP response: channel disconnected".to_string(),
+                ));
+            }
+        }
+    }
+}
+
 pub(crate) fn handle_daemon_client(
     mut stream: UnixStream,
     router: RouterHandle,
@@ -1941,7 +2131,8 @@ pub(crate) fn handle_daemon_client(
             }
             continue;
         }
-        for response_line in router.forward(bound.id.as_deref(), &forwarded)? {
+        let response = router.enqueue_forward(bound.id.as_deref(), &forwarded)?;
+        for response_line in wait_forward_response(&stream, response)? {
             stream
                 .write_all(response_line.as_bytes())
                 .and_then(|_| stream.write_all(b"\n"))

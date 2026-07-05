@@ -1,4 +1,5 @@
 mod batch;
+mod cdp;
 mod cli;
 mod config;
 mod daemon;

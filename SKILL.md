@@ -220,6 +220,7 @@ chrome-devtools profile stop --profile conao3
 - If `mcp call` or `mcp batch` exits with `unknown session`, the session expired (30 min idle) or the daemon restarted. Mint a new id via `session create` and retry.
 - If `mcp call` or `mcp batch` exits with `session in use`, another invocation is currently bound to that id. Wait for it to finish or mint a separate session for the new agent.
 - File-writing tool arguments (`take_screenshot` `filePath` etc.) accept paths under your home directory and the OS tempdir.
+- `upload_file` falls back to Chrome DevTools Protocol when MCP cannot trigger the file chooser; check daemon logs for `upload_file_fallback` or `upload_file_fallback_failed`.
 - If the CLI warns about a daemon version mismatch, the daemon predates the installed CLI. Behavior fixes in the daemon only apply after it restarts; `daemon stop` (without `--force`) is safe once `sessions=0`.
 - If `daemon status` shows `respawns` increased, mint a new session before continuing browser work.
 - The daemon runs `chrome-devtools-mcp` pinned to a fixed version; set `CHROME_DEVTOOLS_MCP_VERSION` (e.g. `latest`) before `daemon start` to override.

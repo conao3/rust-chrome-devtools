@@ -251,6 +251,21 @@ impl TestEnv {
         }
     }
 
+    fn wait_session_contains(&self, session: &str, expected: &str) -> String {
+        let started = Instant::now();
+        loop {
+            let (ok, output) = self.run_cli(&["session", "list", "--profile", "default"]);
+            assert!(ok, "session list failed: {output}");
+            if output.contains(session) && output.contains(expected) {
+                return output;
+            }
+            if started.elapsed() >= Duration::from_secs(5) {
+                panic!("session {session} did not contain {expected}: {output}");
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+
     fn create_session(&self) -> String {
         let (ok, output) = self.run_cli(&["session", "create", "--profile", "default"]);
         assert!(ok, "session create failed: {output}");
@@ -299,10 +314,29 @@ fn spawn_fake_devtools() -> FakeDevTools {
                 continue;
             };
             let mut buffer = [0u8; 1024];
-            let _ = stream.read(&mut buffer);
-            let _ = stream.write_all(
-                b"HTTP/1.1 200 OK\r\nContent-Length: 18\r\nConnection: close\r\n\r\n{\"Browser\":\"fake\"}",
-            );
+            let bytes = stream.read(&mut buffer).unwrap_or(0);
+            let request = String::from_utf8_lossy(&buffer[..bytes]);
+            if request.starts_with("GET /json ") {
+                let body = format!(
+                    r#"[{{"type":"page","url":"about:blank","webSocketDebuggerUrl":"ws://127.0.0.1:{port}/devtools/page/1"}}]"#
+                );
+                let _ = stream.write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                );
+            } else if request.contains("Upgrade: websocket") {
+                let _ = stream.write_all(
+                    b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: fake\r\n\r\n",
+                );
+                handle_fake_cdp(stream);
+            } else {
+                let _ = stream.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 18\r\nConnection: close\r\n\r\n{\"Browser\":\"fake\"}",
+                );
+            }
         }
     });
     FakeDevTools {
@@ -310,6 +344,96 @@ fn spawn_fake_devtools() -> FakeDevTools {
         stop,
         handle: Some(handle),
     }
+}
+
+fn handle_fake_cdp(mut stream: TcpStream) {
+    while let Ok(text) = read_fake_ws_text(&mut stream) {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+            continue;
+        };
+        let id = value["id"].clone();
+        let response = match value["method"].as_str().unwrap_or("") {
+            "DOM.getDocument" => serde_json::json!({
+                "id": id,
+                "result": {
+                    "root": {
+                        "nodeId": 1
+                    }
+                }
+            }),
+            "DOM.querySelector" => serde_json::json!({
+                "id": id,
+                "result": {
+                    "nodeId": 7
+                }
+            }),
+            "DOM.setFileInputFiles" => serde_json::json!({
+                "id": id,
+                "result": {}
+            }),
+            _ => serde_json::json!({
+                "id": id,
+                "result": {}
+            }),
+        };
+        let _ = write_fake_ws_text(&mut stream, &response.to_string());
+    }
+}
+
+fn read_fake_ws_text(stream: &mut TcpStream) -> Result<String, String> {
+    let mut head = [0_u8; 2];
+    stream
+        .read_exact(&mut head)
+        .map_err(|error| error.to_string())?;
+    let opcode = head[0] & 0x0f;
+    if opcode == 0x8 {
+        return Err("closed".to_string());
+    }
+    let masked = head[1] & 0x80 != 0;
+    let mut len = (head[1] & 0x7f) as u64;
+    if len == 126 {
+        let mut extended = [0_u8; 2];
+        stream
+            .read_exact(&mut extended)
+            .map_err(|error| error.to_string())?;
+        len = u16::from_be_bytes(extended) as u64;
+    } else if len == 127 {
+        let mut extended = [0_u8; 8];
+        stream
+            .read_exact(&mut extended)
+            .map_err(|error| error.to_string())?;
+        len = u64::from_be_bytes(extended);
+    }
+    let mut mask = [0_u8; 4];
+    if masked {
+        stream
+            .read_exact(&mut mask)
+            .map_err(|error| error.to_string())?;
+    }
+    let mut payload = vec![0_u8; len as usize];
+    stream
+        .read_exact(&mut payload)
+        .map_err(|error| error.to_string())?;
+    if masked {
+        for (index, byte) in payload.iter_mut().enumerate() {
+            *byte ^= mask[index % 4];
+        }
+    }
+    String::from_utf8(payload).map_err(|error| error.to_string())
+}
+
+fn write_fake_ws_text(stream: &mut TcpStream, text: &str) -> Result<(), String> {
+    let payload = text.as_bytes();
+    let mut frame = Vec::new();
+    frame.push(0x81);
+    if payload.len() < 126 {
+        frame.push(payload.len() as u8);
+    } else {
+        frame.push(126);
+        frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+    }
+    frame.extend_from_slice(payload);
+    stream.write_all(&frame).map_err(|error| error.to_string())
 }
 
 fn control_roundtrip(stream: &mut UnixStream, command: &str) -> String {
@@ -500,6 +624,35 @@ fn client_disconnect_does_not_kill_daemon() {
         output.contains(&session),
         "session lost after another client's disconnect: {output}"
     );
+}
+
+#[test]
+fn client_kill_during_bound_tool_keeps_session() {
+    let mut env = TestEnv::new_with_mcp_timeout("killcall", 1, "take_snapshot");
+    env.start_daemon();
+    let session = env.create_session();
+
+    {
+        let mut stream = env.connect();
+        let bound = control_roundtrip(&mut stream, &format!("bind session={session}"));
+        assert_eq!(bound, format!("bound={session}"));
+        stream
+            .write_all(
+                br#"{"jsonrpc":"2.0","id":171,"method":"tools/call","params":{"name":"take_snapshot","arguments":{}}}"#,
+            )
+            .unwrap();
+        stream.write_all(b"\n").unwrap();
+        stream.flush().unwrap();
+    }
+
+    let output = env.wait_session_contains(&session, "owned=false");
+    assert!(output.contains(&session), "output: {output}");
+    thread::sleep(Duration::from_secs(2));
+    let (ok, output) = env.run_cli(&["daemon", "status", "--profile", "default"]);
+    assert!(ok, "status failed: {output}");
+    assert!(!output.contains("respawns="), "output: {output}");
+    let output = env.wait_session_contains(&session, "owned=false");
+    assert!(output.contains(&session), "output: {output}");
 }
 
 #[test]
@@ -930,6 +1083,30 @@ fn evaluate_script_and_nested_uid_fields_translate_tokens() {
         content_text(&drag),
         format!("dragged page={page} from={page}_button to={page}_after")
     );
+}
+
+#[test]
+fn upload_file_error_falls_back_to_cdp() {
+    let mut env = TestEnv::new("uploadfb");
+    env.start_daemon();
+    let session = env.create_session();
+    let file = env.home.join("upload.png");
+    fs::write(&file, b"png").unwrap();
+    let mut stream = env.connect();
+    bind_stream(&mut stream, &session);
+    let token = uid_token(&tool_call(
+        &mut stream,
+        85,
+        "take_snapshot",
+        serde_json::json!({}),
+    ));
+    let upload = tool_call(
+        &mut stream,
+        86,
+        "upload_file",
+        serde_json::json!({"uid": token, "filePath": file.to_str().unwrap()}),
+    );
+    assert_eq!(content_text(&upload), "uploaded file via CDP fallback");
 }
 
 #[test]

@@ -92,6 +92,8 @@ chrome-devtools profile stop --profile default
 
 `daemon status` includes `queued_mcp_requests`, `max_control_latency_ms`, and `max_forward_latency_ms` for the recent diagnostic window. The default window is 600 seconds and can be changed with `CHROME_DEVTOOLS_DIAGNOSTIC_WINDOW_SECS`.
 
+`upload_file` first uses `chrome-devtools-mcp`. When MCP reports that direct upload and file chooser triggering both failed, the daemon sets the page's `input[type=file]` through Chrome DevTools Protocol as a fallback and logs `upload_file_fallback`.
+
 `mcp batch` binds the given session and reads a JSON array of steps from `--script`, running each step in order through the profile daemon. One `initialize` handshake is performed; then each `tool` step is issued as a `tools/call` and each `sleep_ms` step pauses the runner. Results are printed as a JSON array to stdout (or to `--output <path>`), so callers can inspect them programmatically without parsing line-delimited JSON-RPC. Step shapes:
 
 ```json
