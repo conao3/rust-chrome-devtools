@@ -505,7 +505,7 @@ fn respawn_runtime(
     runtime: &mut McpRuntime,
     sessions: &SharedSessions,
     next_id: &mut u64,
-    abandoned_ids: &mut HashSet<u64>,
+    abandoned_ids: &mut HashMap<u64, Instant>,
     reason: &str,
 ) -> Result<(), String> {
     let pages = daemon_page_cleanups(sessions);
@@ -532,7 +532,7 @@ fn ensure_runtime_ready(
     runtime: &mut McpRuntime,
     sessions: &SharedSessions,
     next_id: &mut u64,
-    abandoned_ids: &mut HashSet<u64>,
+    abandoned_ids: &mut HashMap<u64, Instant>,
 ) -> Result<(), String> {
     if runtime
         .child
@@ -714,7 +714,7 @@ impl RouterHandle {
         let diagnostics_for_router = Arc::clone(&diagnostics);
         thread::spawn(move || {
             let mut next_id: u64 = 10_000;
-            let mut abandoned_ids = HashSet::new();
+            let mut abandoned_ids = HashMap::new();
             for request in receiver {
                 queued_for_router.fetch_sub(1, Ordering::SeqCst);
                 if let Err(error) = ensure_runtime_ready(
@@ -750,8 +750,11 @@ impl RouterHandle {
                                 let _ = response.send(Ok(lines));
                             }
                             Err(message) if message.contains("MCP request timed out") => {
+                                let client_message = format!(
+                                    "{message}; the tool may still have completed in the background (e.g. screenshot files may still be written) — its late result is discarded"
+                                );
                                 if response
-                                    .send(Ok(error_response_for_line(&line, &message)))
+                                    .send(Ok(error_response_for_line(&line, &client_message)))
                                     .is_ok()
                                 {
                                     if let Err(error) = probe_mcp_runtime(
@@ -931,7 +934,7 @@ pub(crate) fn forward_line(
     mcp_reader: &mut impl BufRead,
     line: &str,
     next_id: &mut u64,
-    abandoned_ids: &mut HashSet<u64>,
+    abandoned_ids: &mut HashMap<u64, Instant>,
 ) -> Result<Vec<String>, String> {
     let Some(original_id) = extract_jsonrpc_id_value(line) else {
         write_json_line(mcp_stdin, line)?;
@@ -953,7 +956,7 @@ pub(crate) fn forward_line(
         .map_err(|error| {
             if matches!(error, DaemonError::Fatal(ref message) if message == "MCP request timed out")
             {
-                abandoned_ids.insert(internal_id);
+                abandoned_ids.insert(internal_id, Instant::now());
             }
             format!("{error:?}")
         })?;
@@ -969,7 +972,7 @@ fn mcp_call(
     mcp_stdin: &mut impl Write,
     mcp_reader: &mut impl BufRead,
     next_id: &mut u64,
-    abandoned_ids: &mut HashSet<u64>,
+    abandoned_ids: &mut HashMap<u64, Instant>,
     request: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
     mcp_call_until(
@@ -986,7 +989,7 @@ fn mcp_call_until(
     mcp_stdin: &mut impl Write,
     mcp_reader: &mut impl BufRead,
     next_id: &mut u64,
-    abandoned_ids: &mut HashSet<u64>,
+    abandoned_ids: &mut HashMap<u64, Instant>,
     mut request: serde_json::Value,
     deadline: Instant,
 ) -> Result<serde_json::Value, String> {
@@ -1005,7 +1008,7 @@ fn mcp_call_until(
         .map_err(|error| {
             if matches!(error, DaemonError::Fatal(ref message) if message == "MCP request timed out")
             {
-                abandoned_ids.insert(internal_id);
+                abandoned_ids.insert(internal_id, Instant::now());
             }
             format!("{error:?}")
         })?;
@@ -1020,7 +1023,7 @@ fn probe_mcp_runtime(
     mcp_stdin: &mut impl Write,
     mcp_reader: &mut impl BufRead,
     next_id: &mut u64,
-    abandoned_ids: &mut HashSet<u64>,
+    abandoned_ids: &mut HashMap<u64, Instant>,
 ) -> Result<(), String> {
     let _ = mcp_call_until(
         mcp_stdin,
@@ -1098,7 +1101,7 @@ fn list_page_ids(
     mcp_stdin: &mut impl Write,
     mcp_reader: &mut impl BufRead,
     next_id: &mut u64,
-    abandoned_ids: &mut HashSet<u64>,
+    abandoned_ids: &mut HashMap<u64, Instant>,
 ) -> Result<Vec<u64>, String> {
     let response = mcp_call(
         mcp_stdin,
@@ -1120,7 +1123,7 @@ fn close_respawned_daemon_pages(
     mcp_stdin: &mut impl Write,
     mcp_reader: &mut impl BufRead,
     next_id: &mut u64,
-    abandoned_ids: &mut HashSet<u64>,
+    abandoned_ids: &mut HashMap<u64, Instant>,
     pages: Vec<PageCleanup>,
 ) -> Result<(), String> {
     if pages.is_empty() {
@@ -1225,7 +1228,7 @@ fn close_daemon_pages(
     mcp_stdin: &mut impl Write,
     mcp_reader: &mut impl BufRead,
     next_id: &mut u64,
-    abandoned_ids: &mut HashSet<u64>,
+    abandoned_ids: &mut HashMap<u64, Instant>,
     pages: Vec<PageCleanup>,
 ) -> Result<(), String> {
     for page in pages {
@@ -1256,7 +1259,7 @@ fn ensure_session_page(
     sessions: &SharedSessions,
     session_id: &str,
     next_id: &mut u64,
-    abandoned_ids: &mut HashSet<u64>,
+    abandoned_ids: &mut HashMap<u64, Instant>,
 ) -> Result<u64, String> {
     {
         let (lock, _) = &**sessions;
@@ -1675,7 +1678,7 @@ fn route_request(
     session_id: Option<&str>,
     line: &str,
     next_id: &mut u64,
-    abandoned_ids: &mut HashSet<u64>,
+    abandoned_ids: &mut HashMap<u64, Instant>,
 ) -> Result<Vec<String>, String> {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
         return forward_line(mcp_stdin, mcp_reader, line, next_id, abandoned_ids);
@@ -1854,7 +1857,7 @@ fn route_new_page(
     session_id: Option<&str>,
     value: serde_json::Value,
     next_id: &mut u64,
-    abandoned_ids: &mut HashSet<u64>,
+    abandoned_ids: &mut HashMap<u64, Instant>,
 ) -> Result<Vec<String>, String> {
     let mut forwarded = value;
     let url = forwarded
@@ -1903,7 +1906,7 @@ fn route_select_page(
     value: &serde_json::Value,
     line: &str,
     next_id: &mut u64,
-    abandoned_ids: &mut HashSet<u64>,
+    abandoned_ids: &mut HashMap<u64, Instant>,
 ) -> Result<Vec<String>, String> {
     let requested = value
         .get("params")
@@ -1931,7 +1934,7 @@ fn route_close_page(
     session_id: Option<&str>,
     value: &serde_json::Value,
     next_id: &mut u64,
-    abandoned_ids: &mut HashSet<u64>,
+    abandoned_ids: &mut HashMap<u64, Instant>,
 ) -> Result<Vec<String>, String> {
     let mut forwarded = value.clone();
     let requested = forwarded
@@ -2209,12 +2212,18 @@ fn read_mcp_response_line_until_ignoring(
     mcp_stdin: &mut impl Write,
     mcp_reader: &mut impl BufRead,
     deadline: Instant,
-    abandoned_ids: &mut HashSet<u64>,
+    abandoned_ids: &mut HashMap<u64, Instant>,
 ) -> Result<String, DaemonError> {
     loop {
         let response_line = read_mcp_response_line_until(mcp_stdin, mcp_reader, deadline)?;
         if let Some(id) = extract_jsonrpc_id(&response_line) {
-            if abandoned_ids.remove(&id) {
+            if let Some(abandoned_at) = abandoned_ids.remove(&id) {
+                eprintln!(
+                    "abandoned_response internal_id={id} arrived_after_timeout_ms={} is_error={}",
+                    abandoned_at.elapsed().as_millis(),
+                    response_line.contains("\"isError\":true")
+                        || response_line.contains("\"error\"")
+                );
                 continue;
             }
         }
