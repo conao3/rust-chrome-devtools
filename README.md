@@ -63,6 +63,9 @@ Environment overrides:
 - `CHROME_DEVTOOLS_CONTROL_WARN_LATENCY_MS`: control command warn threshold. Default: `1000`.
 - `CHROME_DEVTOOLS_FORWARD_WARN_LATENCY_MS`: MCP forward warn threshold. Default: `30000`.
 - `CHROME_DEVTOOLS_DIAGNOSTIC_WINDOW_SECS`: daemon status latency window. Default: `600`.
+- `CHROME_DEVTOOLS_CHROME_EXTRA_ARGS`: extra whitespace-separated flags appended to the Chrome command line at launch.
+
+Chrome is always launched with `--disable-features=PasswordLeakDetection`: the native "Change your password" dialog is invisible to MCP snapshots and blocks page input, which makes automated actions appear to hang. Chrome flags only apply when the daemon starts a new Chrome process — an already-running Chrome for the profile is reused as-is, so after upgrading run `chrome-devtools daemon stop --profile <name>` followed by `chrome-devtools profile stop --profile <name>` (kills Chrome) once.
 
 ## Commands
 

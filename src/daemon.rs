@@ -726,6 +726,16 @@ pub(crate) fn default_chrome_binary() -> String {
     "google-chrome-stable".to_string()
 }
 
+pub(crate) fn chrome_extra_args(raw: Option<&str>) -> Vec<String> {
+    raw.map(|value| {
+        value
+            .split_whitespace()
+            .map(|arg| arg.to_string())
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
 pub(crate) fn ensure_chrome(profile: &Profile) -> Result<(), String> {
     if let Some(port) = read_runtime_port(profile) {
         if is_devtools_ready(port) {
@@ -750,6 +760,12 @@ pub(crate) fn ensure_chrome(profile: &Profile) -> Result<(), String> {
         .arg(format!("--user-data-dir={}", user_data_dir.display()))
         .arg("--no-first-run")
         .arg("--no-default-browser-check")
+        .arg("--disable-features=PasswordLeakDetection")
+        .args(chrome_extra_args(
+            env::var("CHROME_DEVTOOLS_CHROME_EXTRA_ARGS")
+                .ok()
+                .as_deref(),
+        ))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())

@@ -486,6 +486,20 @@ fn unix_secs_returns_zero_for_unix_epoch() {
 }
 
 #[test]
+fn chrome_extra_args_splits_on_whitespace() {
+    assert_eq!(
+        chrome_extra_args(Some("--disable-gpu  --lang=ja")),
+        vec!["--disable-gpu".to_string(), "--lang=ja".to_string()]
+    );
+}
+
+#[test]
+fn chrome_extra_args_is_empty_without_value() {
+    assert!(chrome_extra_args(None).is_empty());
+    assert!(chrome_extra_args(Some("  ")).is_empty());
+}
+
+#[test]
 fn extract_remote_debugging_port_reads_port_number() {
     let cmd = "/path/chrome --foo --remote-debugging-port=39277 --user-data-dir=/x";
     assert_eq!(extract_remote_debugging_port(cmd), Some(39277));
