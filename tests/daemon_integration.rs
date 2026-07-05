@@ -232,6 +232,25 @@ impl TestEnv {
         (output.status.success(), combined)
     }
 
+    fn wait_status_field_at_least(&self, prefix: &str, expected: u128) -> String {
+        let started = Instant::now();
+        loop {
+            let (ok, output) = self.run_cli(&["daemon", "status", "--profile", "default"]);
+            assert!(ok, "status failed: {output}");
+            if status_field(&output, prefix)
+                .and_then(|value| value.parse::<u128>().ok())
+                .map(|value| value >= expected)
+                == Some(true)
+            {
+                return output;
+            }
+            if started.elapsed() >= Duration::from_secs(5) {
+                panic!("{prefix} did not reach {expected}: {output}");
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+
     fn create_session(&self) -> String {
         let (ok, output) = self.run_cli(&["session", "create", "--profile", "default"]);
         assert!(ok, "session create failed: {output}");
@@ -1132,16 +1151,8 @@ fn mcp_request_timeout_keeps_session_when_probe_succeeds() {
     );
     assert!(content_text(&eval).contains("evaluated page="));
 
-    let (ok, output) = env.run_cli(&["daemon", "status", "--profile", "default"]);
-    assert!(ok, "status failed: {output}");
+    let output = env.wait_status_field_at_least("max_forward_latency_ms=", 1000);
     assert!(!output.contains("respawns="), "output: {output}");
-    assert!(
-        status_field(&output, "max_forward_latency_ms=")
-            .and_then(|value| value.parse::<u128>().ok())
-            .unwrap()
-            >= 1000,
-        "output: {output}"
-    );
 }
 
 #[test]
