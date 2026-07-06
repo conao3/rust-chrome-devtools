@@ -702,7 +702,7 @@ fn find_profile_error_lists_available_profiles() {
 }
 
 #[test]
-fn roots_list_response_exposes_home_root() {
+fn roots_list_response_exposes_home_and_tmp_roots() {
     let response = roots_list_response(3);
     assert!(response.contains("\"id\":3"));
     let value: serde_json::Value = serde_json::from_str(&response).unwrap();
@@ -711,6 +711,8 @@ fn roots_list_response_exposes_home_root() {
         .as_str()
         .unwrap()
         .starts_with("file://"));
+    assert_eq!(value["result"]["roots"][1]["name"], "tmp");
+    assert_eq!(value["result"]["roots"][1]["uri"], "file:///tmp");
 }
 
 #[test]

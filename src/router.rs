@@ -2537,10 +2537,16 @@ pub(crate) fn roots_list_response(id: impl Into<serde_json::Value>) -> String {
         "jsonrpc": "2.0",
         "id": id.into(),
         "result": {
-            "roots": [{
-                "uri": format!("file://{home}"),
-                "name": "home"
-            }]
+            "roots": [
+                {
+                    "uri": format!("file://{home}"),
+                    "name": "home"
+                },
+                {
+                    "uri": "file:///tmp",
+                    "name": "tmp"
+                }
+            ]
         }
     })
     .to_string()
