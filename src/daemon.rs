@@ -249,6 +249,10 @@ pub(crate) fn run_daemon(profile: &Profile) -> Result<(), String> {
                 continue;
             }
         };
+        if let Err(error) = stream.set_nonblocking(false) {
+            eprintln!("warning: failed to configure daemon client stream: {error}");
+            continue;
+        }
         let router = router.clone();
         let sessions = Arc::clone(&sessions);
         let profile = profile.clone();
