@@ -34,6 +34,15 @@ Use `chrome-devtools` when you need browser automation through Chrome DevTools M
 - File-writing arguments (`take_screenshot` `filePath` etc.) accept paths under the home directory and the OS tempdir.
 - `get_network_request --responseFilePath <path>` saves the body with a `.network-response` extension appended to the given path.
 
+## Daemon-Native Tools (no snapshot required)
+
+The daemon adds four tools of its own on top of the MCP tool set (they appear in `tools/list` and are called like any other tool). They run over CDP directly on the session's page, bypassing the MCP process — they work even while a heavy MCP tool is still running, and they never trigger an accessibility snapshot, so they are the right choice on huge-DOM pages where `take_snapshot` is impractical.
+
+- `wait_for_js {expression | selector, timeout?, interval?}` — poll a JS expression (or CSS selector) until truthy. Use instead of fixed `sleep_ms` waits for SPA rendering. Defaults: timeout 30000ms (max 120000), interval 500ms. A throwing/invalid expression fails immediately rather than polling.
+- `click_selector {selector}` — scroll the first matching element into view and click its center.
+- `click_at {x, y}` — raw left click at viewport coordinates.
+- `dispatch_key {key, modifiers?}` — single key press (`Escape`, `Enter`, `Tab`, `ArrowDown`, single characters, ...). Modifiers bitmask: Alt=1, Ctrl=2, Meta=4, Shift=8.
+
 ## Profile Setup
 
 Profiles are configured in `~/.config/chrome-devtools/config.toml`.

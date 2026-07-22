@@ -376,6 +376,24 @@ fn handle_fake_cdp(mut stream: TcpStream) {
                 "id": id,
                 "result": {}
             }),
+            "Runtime.evaluate" => {
+                let expression = value["params"]["expression"].as_str().unwrap_or("");
+                let result_value = if expression.contains("getBoundingClientRect") {
+                    serde_json::json!({"x": 100.0, "y": 200.0})
+                } else if expression.contains("__ready") {
+                    serde_json::json!(true)
+                } else {
+                    serde_json::json!(false)
+                };
+                serde_json::json!({
+                    "id": id,
+                    "result": {
+                        "result": {
+                            "value": result_value
+                        }
+                    }
+                })
+            }
             _ => serde_json::json!({
                 "id": id,
                 "result": {}
@@ -1112,6 +1130,91 @@ fn upload_file_error_falls_back_to_cdp() {
         serde_json::json!({"uid": token, "filePath": file.to_str().unwrap()}),
     );
     assert_eq!(content_text(&upload), "uploaded file via CDP fallback");
+}
+
+#[test]
+fn native_tools_run_via_cdp_without_mcp() {
+    let mut env = TestEnv::new("nativetools");
+    env.start_daemon();
+    let session = env.create_session();
+    let mut stream = env.connect();
+    bind_stream(&mut stream, &session);
+
+    let ready = tool_call(
+        &mut stream,
+        200,
+        "wait_for_js",
+        serde_json::json!({"expression": "window.__ready", "interval": 50}),
+    );
+    assert!(
+        content_text(&ready).contains("condition became truthy"),
+        "response: {ready}"
+    );
+
+    let timeout = tool_call(
+        &mut stream,
+        201,
+        "wait_for_js",
+        serde_json::json!({"expression": "window.__never", "timeout": 300, "interval": 50}),
+    );
+    assert_eq!(timeout["result"]["isError"], serde_json::json!(true));
+    assert!(
+        content_text(&timeout).contains("timed out"),
+        "response: {timeout}"
+    );
+
+    let clicked = tool_call(
+        &mut stream,
+        202,
+        "click_selector",
+        serde_json::json!({"selector": "#btn"}),
+    );
+    assert!(
+        content_text(&clicked).contains("clicked #btn at (100, 200)"),
+        "response: {clicked}"
+    );
+
+    let clicked_at = tool_call(
+        &mut stream,
+        203,
+        "click_at",
+        serde_json::json!({"x": 10, "y": 20}),
+    );
+    assert!(
+        content_text(&clicked_at).contains("clicked at (10, 20)"),
+        "response: {clicked_at}"
+    );
+
+    let key = tool_call(
+        &mut stream,
+        204,
+        "dispatch_key",
+        serde_json::json!({"key": "Escape"}),
+    );
+    assert!(
+        content_text(&key).contains("dispatched key Escape"),
+        "response: {key}"
+    );
+}
+
+#[test]
+fn tools_list_includes_native_tools() {
+    let mut env = TestEnv::new("nativelist");
+    env.start_daemon();
+    let mut stream = env.connect();
+    let response = json_roundtrip(
+        &mut stream,
+        serde_json::json!({"jsonrpc": "2.0", "id": 210, "method": "tools/list", "params": {}}),
+    );
+    let names: Vec<&str> = response["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|tool| tool["name"].as_str())
+        .collect();
+    for native in ["wait_for_js", "click_at", "click_selector", "dispatch_key"] {
+        assert!(names.contains(&native), "missing {native} in {names:?}");
+    }
 }
 
 #[test]

@@ -1389,6 +1389,208 @@ fn inject_page_id(value: &mut serde_json::Value, page_id: u64) {
     }
 }
 
+pub(crate) fn is_native_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "wait_for_js" | "click_at" | "click_selector" | "dispatch_key"
+    )
+}
+
+fn native_tool_defs() -> Vec<serde_json::Value> {
+    vec![
+        serde_json::json!({
+            "name": "wait_for_js",
+            "description": "Daemon-native: poll a JavaScript expression (or CSS selector) on the session page until it becomes truthy. Lightweight (no snapshot). Prefer this over fixed sleeps for SPA rendering waits.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "expression": {"type": "string", "description": "JS expression evaluated on the page; resolves when truthy"},
+                    "selector": {"type": "string", "description": "CSS selector; resolves when it matches an element (alternative to expression)"},
+                    "timeout": {"type": "number", "description": "max wait in ms (default 30000, max 120000)"},
+                    "interval": {"type": "number", "description": "poll interval in ms (default 500)"}
+                }
+            }
+        }),
+        serde_json::json!({
+            "name": "click_at",
+            "description": "Daemon-native: dispatch a raw left click at viewport coordinates via CDP Input.dispatchMouseEvent. Works without a snapshot (use on pages too large for take_snapshot).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "x": {"type": "number"},
+                    "y": {"type": "number"}
+                },
+                "required": ["x", "y"]
+            }
+        }),
+        serde_json::json!({
+            "name": "click_selector",
+            "description": "Daemon-native: scroll the first element matching a CSS selector into view and click its center via CDP. Works without a snapshot.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "selector": {"type": "string"}
+                },
+                "required": ["selector"]
+            }
+        }),
+        serde_json::json!({
+            "name": "dispatch_key",
+            "description": "Daemon-native: dispatch a single key press (e.g. Escape, Enter, ArrowDown, Tab, or a single character) via CDP Input.dispatchKeyEvent.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "key": {"type": "string"},
+                    "modifiers": {"type": "number", "description": "bitmask: Alt=1, Ctrl=2, Meta=4, Shift=8"}
+                },
+                "required": ["key"]
+            }
+        }),
+    ]
+}
+
+fn inject_native_tool_defs(line: &str) -> String {
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(line) else {
+        return line.to_string();
+    };
+    let Some(tools) = value
+        .get_mut("result")
+        .and_then(|result| result.get_mut("tools"))
+        .and_then(|tools| tools.as_array_mut())
+    else {
+        return line.to_string();
+    };
+    tools.extend(native_tool_defs());
+    value.to_string()
+}
+
+fn native_tool_response(id: serde_json::Value, text: String, is_error: bool) -> Vec<String> {
+    let mut result = serde_json::json!({
+        "content": [{"type": "text", "text": text}]
+    });
+    if is_error {
+        result["isError"] = serde_json::json!(true);
+    }
+    vec![serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": result
+    })
+    .to_string()]
+}
+
+fn run_native_tool(
+    profile: &Profile,
+    page_url: Option<&str>,
+    name: &str,
+    arguments: &serde_json::Value,
+) -> Result<String, String> {
+    let port = current_port(profile).ok_or_else(|| "missing DevTools port".to_string())?;
+    match name {
+        "wait_for_js" => {
+            let expression = match (
+                arguments.get("expression").and_then(|value| value.as_str()),
+                arguments.get("selector").and_then(|value| value.as_str()),
+            ) {
+                (Some(expression), _) => expression.to_string(),
+                (None, Some(selector)) => {
+                    format!("document.querySelector({})", serde_json::json!(selector))
+                }
+                (None, None) => {
+                    return Err("wait_for_js requires 'expression' or 'selector'".to_string());
+                }
+            };
+            let timeout = arguments
+                .get("timeout")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(30_000)
+                .clamp(100, 120_000);
+            let interval = arguments
+                .get("interval")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(500)
+                .clamp(50, 10_000);
+            let elapsed = cdp::wait_for_js(
+                port,
+                page_url,
+                &expression,
+                Duration::from_millis(timeout),
+                Duration::from_millis(interval),
+            )?;
+            Ok(format!(
+                "condition became truthy after {}ms",
+                elapsed.as_millis()
+            ))
+        }
+        "click_at" => {
+            let x = arguments
+                .get("x")
+                .and_then(|value| value.as_f64())
+                .ok_or_else(|| "click_at requires numeric 'x'".to_string())?;
+            let y = arguments
+                .get("y")
+                .and_then(|value| value.as_f64())
+                .ok_or_else(|| "click_at requires numeric 'y'".to_string())?;
+            cdp::click_at(port, page_url, x, y)?;
+            Ok(format!("clicked at ({x}, {y})"))
+        }
+        "click_selector" => {
+            let selector = arguments
+                .get("selector")
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| "click_selector requires 'selector'".to_string())?;
+            let (x, y) = cdp::click_selector(port, page_url, selector)?;
+            Ok(format!("clicked {selector} at ({x:.0}, {y:.0})"))
+        }
+        "dispatch_key" => {
+            let key = arguments
+                .get("key")
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| "dispatch_key requires 'key'".to_string())?;
+            let modifiers = arguments
+                .get("modifiers")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(0);
+            cdp::dispatch_key(port, page_url, key, modifiers)?;
+            Ok(format!("dispatched key {key}"))
+        }
+        other => Err(format!("unknown native tool: {other}")),
+    }
+}
+
+pub(crate) fn try_native_tool(
+    profile: &Profile,
+    sessions: &SharedSessions,
+    session_id: Option<&str>,
+    line: &str,
+) -> Option<Vec<String>> {
+    let value = serde_json::from_str::<serde_json::Value>(line).ok()?;
+    if value.get("method").and_then(|method| method.as_str()) != Some("tools/call") {
+        return None;
+    }
+    let name = value
+        .get("params")
+        .and_then(|params| params.get("name"))
+        .and_then(|name| name.as_str())?
+        .to_string();
+    if !is_native_tool(&name) {
+        return None;
+    }
+    let id = value.get("id").cloned().unwrap_or(serde_json::Value::Null);
+    let empty_args = serde_json::json!({});
+    let arguments = value
+        .get("params")
+        .and_then(|params| params.get("arguments"))
+        .unwrap_or(&empty_args);
+    let page_url = session_id.and_then(|id| session_page_url(sessions, id));
+    Some(
+        match run_native_tool(profile, page_url.as_deref(), &name, arguments) {
+            Ok(text) => native_tool_response(id, text, false),
+            Err(message) => native_tool_response(id, format!("{name} failed: {message}"), true),
+        },
+    )
+}
+
 fn strip_page_id_schema(line: &str) -> String {
     let Ok(mut value) = serde_json::from_str::<serde_json::Value>(line) else {
         return line.to_string();
@@ -1727,6 +1929,7 @@ fn route_request(
         let mut lines = forward_line(mcp_stdin, mcp_reader, line, next_id, abandoned_ids)?;
         if let Some(last) = lines.last_mut() {
             *last = strip_page_id_schema(last);
+            *last = inject_native_tool_defs(last);
         }
         return Ok(lines);
     }
@@ -2173,6 +2376,29 @@ pub(crate) fn handle_daemon_client(
             }
             continue;
         }
+        // daemon-native tool は MCP を経由せず接続スレッド上で CDP 直実行する。
+        // 重い tool が MCP の直列キューを塞いでいても native tool は並行して動く。
+        if let Some(lines) = try_native_tool(profile, sessions, bound.id.as_deref(), &forwarded) {
+            for response_line in lines {
+                stream
+                    .write_all(response_line.as_bytes())
+                    .and_then(|_| stream.write_all(b"\n"))
+                    .and_then(|_| stream.flush())
+                    .map_err(|error| {
+                        DaemonError::Client(format!(
+                            "failed to write daemon client response: {error}"
+                        ))
+                    })?;
+            }
+            if let Some(id) = bound.id.as_ref() {
+                let (lock, _) = &**sessions;
+                if let Ok(mut registry) = lock.lock() {
+                    registry.touch(id);
+                }
+            }
+            continue;
+        }
+
         let response = router.enqueue_forward(bound.id.as_deref(), &forwarded)?;
         for response_line in wait_forward_response(&stream, response)? {
             stream

@@ -4,11 +4,196 @@ use std::io::BufReader;
 use std::io::Read;
 use std::io::Write;
 use std::net::TcpStream;
+use std::thread;
 use std::time::Duration;
+use std::time::Instant;
 
 struct PageTarget {
     url: String,
     websocket_path: String,
+}
+
+fn connect_page_client(port: u16, page_url: Option<&str>) -> Result<CdpClient, String> {
+    let targets = list_page_targets(port)?;
+    let target = page_url
+        .and_then(|url| targets.iter().find(|target| target.url == url))
+        .or_else(|| targets.first())
+        .ok_or_else(|| "no page target available".to_string())?;
+    CdpClient::connect(port, &target.websocket_path)
+}
+
+fn evaluate_value(client: &mut CdpClient, expression: &str) -> Result<Value, String> {
+    let response = client.call(serde_json::json!({
+        "method": "Runtime.evaluate",
+        "params": {
+            "expression": expression,
+            "returnByValue": true
+        }
+    }))?;
+    let result = response
+        .get("result")
+        .ok_or_else(|| "Runtime.evaluate returned no result".to_string())?;
+    if let Some(details) = result.get("exceptionDetails") {
+        let text = details
+            .get("exception")
+            .and_then(|exception| exception.get("description"))
+            .and_then(|description| description.as_str())
+            .or_else(|| details.get("text").and_then(|text| text.as_str()))
+            .unwrap_or("unknown evaluation error");
+        return Err(format!("expression threw: {text}"));
+    }
+    Ok(result
+        .get("result")
+        .and_then(|inner| inner.get("value"))
+        .cloned()
+        .unwrap_or(Value::Null))
+}
+
+pub(crate) fn wait_for_js(
+    port: u16,
+    page_url: Option<&str>,
+    expression: &str,
+    timeout: Duration,
+    interval: Duration,
+) -> Result<Duration, String> {
+    let mut client = connect_page_client(port, page_url)?;
+    // 式は毎回 !!() で bool に潰す。syntax error / throw は poll せず即エラーにする。
+    let wrapped = format!("!!({expression})");
+    let started = Instant::now();
+    loop {
+        let value = evaluate_value(&mut client, &wrapped)?;
+        if value.as_bool() == Some(true) {
+            return Ok(started.elapsed());
+        }
+        if started.elapsed() >= timeout {
+            return Err(format!(
+                "wait_for_js timed out after {}ms: {expression}",
+                timeout.as_millis()
+            ));
+        }
+        thread::sleep(interval);
+    }
+}
+
+fn dispatch_click(client: &mut CdpClient, x: f64, y: f64) -> Result<(), String> {
+    for event_type in ["mousePressed", "mouseReleased"] {
+        client.call(serde_json::json!({
+            "method": "Input.dispatchMouseEvent",
+            "params": {
+                "type": event_type,
+                "x": x,
+                "y": y,
+                "button": "left",
+                "clickCount": 1
+            }
+        }))?;
+    }
+    Ok(())
+}
+
+pub(crate) fn click_at(port: u16, page_url: Option<&str>, x: f64, y: f64) -> Result<(), String> {
+    let mut client = connect_page_client(port, page_url)?;
+    dispatch_click(&mut client, x, y)
+}
+
+pub(crate) fn click_selector(
+    port: u16,
+    page_url: Option<&str>,
+    selector: &str,
+) -> Result<(f64, f64), String> {
+    let mut client = connect_page_client(port, page_url)?;
+    let selector_json = serde_json::json!(selector).to_string();
+    let expression = format!(
+        "(() => {{ const el = document.querySelector({selector_json}); if (!el) return null; el.scrollIntoView({{block: 'center', inline: 'center'}}); const r = el.getBoundingClientRect(); return {{x: r.x + r.width / 2, y: r.y + r.height / 2}}; }})()"
+    );
+    let value = evaluate_value(&mut client, &expression)?;
+    if value.is_null() {
+        return Err(format!("no element matches selector: {selector}"));
+    }
+    let x = value
+        .get("x")
+        .and_then(|x| x.as_f64())
+        .ok_or_else(|| "selector center has no x".to_string())?;
+    let y = value
+        .get("y")
+        .and_then(|y| y.as_f64())
+        .ok_or_else(|| "selector center has no y".to_string())?;
+    dispatch_click(&mut client, x, y)?;
+    Ok((x, y))
+}
+
+fn key_info(key: &str) -> (String, i64, Option<String>) {
+    // (code, windowsVirtualKeyCode, text) の対応。text は文字入力を伴うキーのみ。
+    match key {
+        "Enter" => ("Enter".to_string(), 13, Some("\r".to_string())),
+        "Escape" => ("Escape".to_string(), 27, None),
+        "Tab" => ("Tab".to_string(), 9, None),
+        "Backspace" => ("Backspace".to_string(), 8, None),
+        "Delete" => ("Delete".to_string(), 46, None),
+        "ArrowUp" => ("ArrowUp".to_string(), 38, None),
+        "ArrowDown" => ("ArrowDown".to_string(), 40, None),
+        "ArrowLeft" => ("ArrowLeft".to_string(), 37, None),
+        "ArrowRight" => ("ArrowRight".to_string(), 39, None),
+        "Home" => ("Home".to_string(), 36, None),
+        "End" => ("End".to_string(), 35, None),
+        "PageUp" => ("PageUp".to_string(), 33, None),
+        "PageDown" => ("PageDown".to_string(), 34, None),
+        " " | "Space" => ("Space".to_string(), 32, Some(" ".to_string())),
+        other if other.chars().count() == 1 => {
+            let ch = other.chars().next().unwrap();
+            let code = if ch.is_ascii_alphabetic() {
+                format!("Key{}", ch.to_ascii_uppercase())
+            } else if ch.is_ascii_digit() {
+                format!("Digit{ch}")
+            } else {
+                String::new()
+            };
+            (
+                code,
+                ch.to_ascii_uppercase() as i64,
+                Some(other.to_string()),
+            )
+        }
+        other => (other.to_string(), 0, None),
+    }
+}
+
+pub(crate) fn dispatch_key(
+    port: u16,
+    page_url: Option<&str>,
+    key: &str,
+    modifiers: u64,
+) -> Result<(), String> {
+    let mut client = connect_page_client(port, page_url)?;
+    let (code, virtual_key_code, text) = key_info(key);
+    let mut down = serde_json::json!({
+        "method": "Input.dispatchKeyEvent",
+        "params": {
+            "type": if text.is_some() { "keyDown" } else { "rawKeyDown" },
+            "key": key,
+            "code": code,
+            "windowsVirtualKeyCode": virtual_key_code,
+            "nativeVirtualKeyCode": virtual_key_code,
+            "modifiers": modifiers
+        }
+    });
+    if let Some(text) = &text {
+        down["params"]["text"] = serde_json::json!(text);
+        down["params"]["unmodifiedText"] = serde_json::json!(text);
+    }
+    client.call(down)?;
+    client.call(serde_json::json!({
+        "method": "Input.dispatchKeyEvent",
+        "params": {
+            "type": "keyUp",
+            "key": key,
+            "code": code,
+            "windowsVirtualKeyCode": virtual_key_code,
+            "nativeVirtualKeyCode": virtual_key_code,
+            "modifiers": modifiers
+        }
+    }))?;
+    Ok(())
 }
 
 pub(crate) fn set_file_input_files(

@@ -70,6 +70,15 @@ Heavy-tool note: Chrome's `Accessibility.getFullAXTree` (used by `take_snapshot`
 
 Chrome is always launched with `--disable-features=PasswordLeakDetection`: the native "Change your password" dialog is invisible to MCP snapshots and blocks page input, which makes automated actions appear to hang. Chrome flags only apply when the daemon starts a new Chrome process — an already-running Chrome for the profile is reused as-is, so after upgrading run `chrome-devtools daemon stop --profile <name>` followed by `chrome-devtools profile stop --profile <name>` (kills Chrome) once.
 
+## Daemon-native tools
+
+Besides forwarding the chrome-devtools-mcp tool set, the daemon implements four tools of its own directly over CDP (they are listed in `tools/list` and called like any MCP tool). They run on the session's page without the MCP process, so they keep working while a heavy MCP tool is in flight and never trigger an accessibility snapshot:
+
+- `wait_for_js {expression | selector, timeout?, interval?}`: poll a JS expression (or CSS selector) until truthy — replaces fixed sleeps for SPA waits.
+- `click_selector {selector}`: scroll the first match into view and click its center.
+- `click_at {x, y}`: raw left click at viewport coordinates.
+- `dispatch_key {key, modifiers?}`: single key press (Escape, Enter, arrows, single characters; modifiers bitmask Alt=1 Ctrl=2 Meta=4 Shift=8).
+
 ## Commands
 
 ```sh
