@@ -56,14 +56,43 @@ pub(crate) fn wait_for_js(
     timeout: Duration,
     interval: Duration,
 ) -> Result<Duration, String> {
-    let mut client = connect_page_client(port, page_url)?;
     // 式は毎回 !!() で bool に潰す。syntax error / throw は poll せず即エラーにする。
     let wrapped = format!("!!({expression})");
     let started = Instant::now();
+    // クリック起点のページ遷移中は CDP 接続が応答しない/壊れることがあるため、
+    // poll ごとの read timeout を短くし、接続系エラーは deadline 内で再接続して続行する。
+    let poll_read_timeout = Duration::from_secs(3);
+    let mut client: Option<CdpClient> = None;
     loop {
-        let value = evaluate_value(&mut client, &wrapped)?;
-        if value.as_bool() == Some(true) {
-            return Ok(started.elapsed());
+        if client.is_none() {
+            match connect_page_client(port, page_url) {
+                Ok(new_client) => {
+                    let _ = new_client.set_read_timeout(poll_read_timeout);
+                    client = Some(new_client);
+                }
+                Err(error) => {
+                    if started.elapsed() >= timeout {
+                        return Err(format!(
+                            "wait_for_js timed out after {}ms (page not reachable: {error}): {expression}",
+                            timeout.as_millis()
+                        ));
+                    }
+                    thread::sleep(interval);
+                    continue;
+                }
+            }
+        }
+        match evaluate_value(client.as_mut().unwrap(), &wrapped) {
+            Ok(value) => {
+                if value.as_bool() == Some(true) {
+                    return Ok(started.elapsed());
+                }
+            }
+            Err(error) if error.starts_with("expression threw:") => return Err(error),
+            Err(_) => {
+                // 遷移などによる接続断: 次のループで張り直す。
+                client = None;
+            }
         }
         if started.elapsed() >= timeout {
             return Err(format!(
@@ -354,6 +383,12 @@ struct CdpClient {
 }
 
 impl CdpClient {
+    fn set_read_timeout(&self, timeout: Duration) -> Result<(), String> {
+        self.stream
+            .set_read_timeout(Some(timeout))
+            .map_err(|error| format!("failed to configure DevTools WebSocket timeout: {error}"))
+    }
+
     fn connect(port: u16, path: &str) -> Result<Self, String> {
         let mut stream = TcpStream::connect(("127.0.0.1", port))
             .map_err(|error| format!("failed to connect DevTools WebSocket: {error}"))?;
