@@ -298,20 +298,54 @@ fn http_get(port: u16, path: &str) -> Result<String, String> {
                 .as_bytes(),
         )
         .map_err(|error| format!("failed to request DevTools HTTP: {error}"))?;
-    let mut response = String::new();
-    stream
-        .read_to_string(&mut response)
-        .map_err(|error| format!("failed to read DevTools HTTP response: {error}"))?;
-    let Some((head, body)) = response.split_once("\r\n\r\n") else {
-        return Err("invalid DevTools HTTP response".to_string());
-    };
-    if !head.starts_with("HTTP/1.1 200") && !head.starts_with("HTTP/1.0 200") {
-        return Err(format!(
-            "DevTools HTTP returned {}",
-            head.lines().next().unwrap_or("unknown status")
-        ));
+    // Chrome は Connection: close を送っても接続を維持することがあり、EOF 依存の
+    // read_to_string は read timeout (EAGAIN) で死ぬ。Content-Length を読んで
+    // その分だけ body を読む。
+    let mut reader = BufReader::new(&mut stream);
+    let mut status = String::new();
+    reader
+        .read_line(&mut status)
+        .map_err(|error| format!("failed to read DevTools HTTP status: {error}"))?;
+    if !status.starts_with("HTTP/1.1 200") && !status.starts_with("HTTP/1.0 200") {
+        return Err(format!("DevTools HTTP returned {}", status.trim_end()));
     }
-    Ok(body.to_string())
+    let mut content_length: Option<usize> = None;
+    loop {
+        let mut line = String::new();
+        reader
+            .read_line(&mut line)
+            .map_err(|error| format!("failed to read DevTools HTTP headers: {error}"))?;
+        let trimmed = line.trim_end();
+        if trimmed.is_empty() {
+            break;
+        }
+        if let Some(value) = trimmed
+            .to_ascii_lowercase()
+            .strip_prefix("content-length:")
+            .map(str::trim)
+            .and_then(|value| value.parse::<usize>().ok())
+        {
+            content_length = Some(value);
+        }
+    }
+    match content_length {
+        Some(length) => {
+            let mut body = vec![0_u8; length];
+            reader
+                .read_exact(&mut body)
+                .map_err(|error| format!("failed to read DevTools HTTP body: {error}"))?;
+            String::from_utf8(body)
+                .map_err(|error| format!("DevTools HTTP body is not UTF-8: {error}"))
+        }
+        None => {
+            // Content-Length なし (chunked 等は DevTools では想定外): EOF まで読む。
+            let mut body = String::new();
+            reader
+                .read_to_string(&mut body)
+                .map_err(|error| format!("failed to read DevTools HTTP body: {error}"))?;
+            Ok(body)
+        }
+    }
 }
 
 struct CdpClient {
