@@ -19,6 +19,10 @@ stdenvNoCC.mkDerivation rec {
 
   nativeBuildInputs = [ makeWrapper ];
 
+  # Upstream leaves Puppeteer's protocolTimeout at 180 seconds. A shared Chrome
+  # can exceed that while another session runs a heavy CDP command, so align the
+  # default with the broker's 300-second heavy-tool timeout. The environment
+  # variable remains available for callers that need a different value.
   postPatch = ''
     substituteInPlace build/src/browser.js \
       --replace-fail 'const connectOptions = {' \
