@@ -72,8 +72,10 @@ Chrome is always launched with `--disable-features=PasswordLeakDetection`: the n
 
 ## Daemon-native tools
 
-Besides forwarding the chrome-devtools-mcp tool set, the daemon implements four tools of its own directly over CDP (they are listed in `tools/list` and called like any MCP tool). They run on the session's page without the MCP process, so they keep working while a heavy MCP tool is in flight and never trigger an accessibility snapshot:
+Besides forwarding the chrome-devtools-mcp tool set, the daemon implements six tools of its own directly over CDP (they are listed in `tools/list` and called like any MCP tool). They run on the session's page without the MCP process, so they keep working while a heavy MCP tool is in flight and never trigger an accessibility snapshot:
 
+- `goto {url, waitSelector?, waitExpression?, timeout?, interval?}`: navigate the session page without foregrounding Chrome and wait in the same call. With no explicit wait condition it waits for `document.readyState === 'complete'`.
+- `screenshot_quiet {filePath, format?, quality?}`: capture the visible viewport directly with `Page.captureScreenshot`, bypassing the MCP queue and leaving the user's active tab alone. `filePath` must be absolute and under `$HOME` or the OS temp directory.
 - `wait_for_js {expression | selector, timeout?, interval?}`: poll a JS expression (or CSS selector) until truthy — replaces fixed sleeps for SPA waits.
 - `click_selector {selector}`: scroll the first match into view and click its center.
 - `click_at {x, y}`: raw left click at viewport coordinates.

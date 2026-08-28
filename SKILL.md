@@ -36,8 +36,10 @@ Use `chrome-devtools` when you need browser automation through Chrome DevTools M
 
 ## Daemon-Native Tools (no snapshot required)
 
-The daemon adds four tools of its own on top of the MCP tool set (they appear in `tools/list` and are called like any other tool). They run over CDP directly on the session's page, bypassing the MCP process — they work even while a heavy MCP tool is still running, and they never trigger an accessibility snapshot, so they are the right choice on huge-DOM pages where `take_snapshot` is impractical.
+The daemon adds six tools of its own on top of the MCP tool set (they appear in `tools/list` and are called like any other tool). They run over CDP directly on the session's page, bypassing the MCP process — they work even while a heavy MCP tool is still running, and they never trigger an accessibility snapshot, so they are the right choice on huge-DOM pages where `take_snapshot` is impractical.
 
+- `goto {url, waitSelector?, waitExpression?, timeout?, interval?}` — navigate the session page without foregrounding Chrome, then wait in the same tool call. `waitSelector` and `waitExpression` are mutually exclusive; without either it waits for `document.readyState === 'complete'`.
+- `screenshot_quiet {filePath, format?, quality?}` — save a visible-viewport screenshot directly through CDP without selecting the page or entering the MCP queue. Use this for Slack/image viewers. `filePath` must be absolute and under `$HOME` or the OS temp directory.
 - `wait_for_js {expression | selector, timeout?, interval?}` — poll a JS expression (or CSS selector) until truthy. Use instead of fixed `sleep_ms` waits for SPA rendering. Defaults: timeout 30000ms (max 120000), interval 500ms. A throwing/invalid expression fails immediately rather than polling.
 - `click_selector {selector}` — scroll the first matching element into view and click its center.
 - `click_at {x, y}` — raw left click at viewport coordinates.

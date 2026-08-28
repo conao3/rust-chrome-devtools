@@ -1,9 +1,13 @@
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::Engine;
 use serde_json::Value;
+use std::fs;
 use std::io::BufRead;
 use std::io::BufReader;
 use std::io::Read;
 use std::io::Write;
 use std::net::TcpStream;
+use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
 use std::time::Instant;
@@ -47,6 +51,156 @@ fn evaluate_value(client: &mut CdpClient, expression: &str) -> Result<Value, Str
         .and_then(|inner| inner.get("value"))
         .cloned()
         .unwrap_or(Value::Null))
+}
+
+fn is_transient_navigation_error(error: &str) -> bool {
+    [
+        "Cannot find context with specified id",
+        "Execution context was destroyed",
+        "Inspected target navigated or closed",
+    ]
+    .iter()
+    .any(|message| error.contains(message))
+}
+
+pub(crate) fn goto(
+    port: u16,
+    page_url: Option<&str>,
+    url: &str,
+    wait_expression: &str,
+    timeout: Duration,
+    interval: Duration,
+) -> Result<(Duration, String), String> {
+    let mut client = connect_page_client(port, page_url)?;
+    client.set_read_timeout(Duration::from_secs(3))?;
+    let response = client.call(serde_json::json!({
+        "method": "Page.navigate",
+        "params": {"url": url}
+    }))?;
+    if let Some(error_text) = response
+        .get("result")
+        .and_then(|result| result.get("errorText"))
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty())
+    {
+        return Err(format!("Page.navigate failed: {error_text}"));
+    }
+
+    let wrapped = format!("!!({wait_expression})");
+    let started = Instant::now();
+    loop {
+        match evaluate_value(&mut client, &wrapped) {
+            Ok(value) if value.as_bool() == Some(true) => {
+                match evaluate_value(&mut client, "location.href") {
+                    Ok(value) => {
+                        let final_url = value.as_str().unwrap_or(url).to_string();
+                        return Ok((started.elapsed(), final_url));
+                    }
+                    Err(error) if is_transient_navigation_error(&error) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            Ok(_) => {}
+            Err(error) if is_transient_navigation_error(&error) => {}
+            Err(error) if error.starts_with("expression threw:") => return Err(error),
+            Err(error) => {
+                if started.elapsed() >= timeout {
+                    return Err(format!(
+                        "goto timed out after {}ms while waiting for {wait_expression}: {error}",
+                        timeout.as_millis()
+                    ));
+                }
+            }
+        }
+        if started.elapsed() >= timeout {
+            return Err(format!(
+                "goto timed out after {}ms while waiting for {wait_expression}",
+                timeout.as_millis()
+            ));
+        }
+        thread::sleep(interval);
+    }
+}
+
+fn allowed_output_path(path: &Path) -> Result<PathBuf, String> {
+    if !path.is_absolute() {
+        return Err("screenshot_quiet filePath must be absolute".to_string());
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| "screenshot_quiet filePath has no parent".to_string())?;
+    let parent = parent
+        .canonicalize()
+        .map_err(|error| format!("failed to resolve screenshot parent: {error}"))?;
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| "screenshot_quiet filePath has no file name".to_string())?;
+
+    let mut roots = vec![std::env::temp_dir()];
+    if let Some(home) = std::env::var_os("HOME") {
+        roots.push(PathBuf::from(home));
+    }
+    let allowed = roots
+        .into_iter()
+        .filter_map(|root| root.canonicalize().ok())
+        .any(|root| parent.starts_with(root));
+    if !allowed {
+        return Err("screenshot_quiet filePath must be under HOME or the OS temp directory".into());
+    }
+    Ok(parent.join(file_name))
+}
+
+pub(crate) fn screenshot_quiet(
+    port: u16,
+    page_url: Option<&str>,
+    file_path: &Path,
+    format: &str,
+    quality: Option<u64>,
+) -> Result<PathBuf, String> {
+    let output = allowed_output_path(file_path)?;
+    let mut params = serde_json::json!({
+        "format": format,
+        "fromSurface": true,
+        "captureBeyondViewport": false
+    });
+    if matches!(format, "jpeg" | "webp") {
+        if let Some(quality) = quality {
+            params["quality"] = serde_json::json!(quality.clamp(0, 100));
+        }
+    }
+    // A newly-created background target can briefly accept CDP connections but
+    // delay its first paint. Retry transport failures without activating the tab.
+    let started = Instant::now();
+    let response = loop {
+        let attempt = connect_page_client(port, page_url).and_then(|mut client| {
+            client.set_read_timeout(Duration::from_secs(5))?;
+            client.call(serde_json::json!({
+                "method": "Page.captureScreenshot",
+                "params": params.clone()
+            }))
+        });
+        match attempt {
+            Ok(response) => break response,
+            Err(error)
+                if started.elapsed() < Duration::from_secs(30)
+                    && (error.contains("WebSocket") || error.contains("DevTools HTTP")) =>
+            {
+                thread::sleep(Duration::from_millis(250));
+            }
+            Err(error) => return Err(error),
+        }
+    };
+    let encoded = response
+        .get("result")
+        .and_then(|result| result.get("data"))
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| "Page.captureScreenshot returned no data".to_string())?;
+    let bytes = BASE64_STANDARD
+        .decode(encoded)
+        .map_err(|error| format!("invalid screenshot base64: {error}"))?;
+    fs::write(&output, bytes)
+        .map_err(|error| format!("failed to write {}: {error}", output.display()))?;
+    Ok(output)
 }
 
 pub(crate) fn wait_for_js(

@@ -5,7 +5,7 @@ use std::net::TcpStream;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::thread::JoinHandle;
@@ -29,6 +29,8 @@ struct FakeDevTools {
     stop: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
 }
+
+static NEXT_TEST_ENV_ID: AtomicU64 = AtomicU64::new(1);
 
 impl TestEnv {
     fn new(tag: &str) -> Self {
@@ -97,9 +99,9 @@ impl TestEnv {
         fake_mcp_hang_secs: Option<u64>,
     ) -> Self {
         let home = std::env::temp_dir().join(format!(
-            "cdt-{}-{}",
-            tag.chars().take(6).collect::<String>(),
-            std::process::id()
+            "cdt-{tag}-{}-{}",
+            std::process::id(),
+            NEXT_TEST_ENV_ID.fetch_add(1, Ordering::Relaxed)
         ));
         let _ = fs::remove_dir_all(&home);
         fs::create_dir_all(home.join(".config/chrome-devtools")).unwrap();
@@ -380,6 +382,8 @@ fn handle_fake_cdp(mut stream: TcpStream) {
                 let expression = value["params"]["expression"].as_str().unwrap_or("");
                 let result_value = if expression.contains("getBoundingClientRect") {
                     serde_json::json!({"x": 100.0, "y": 200.0})
+                } else if expression == "location.href" {
+                    serde_json::json!("https://navigated.test/")
                 } else if expression.contains("__ready") {
                     serde_json::json!(true)
                 } else {
@@ -394,6 +398,14 @@ fn handle_fake_cdp(mut stream: TcpStream) {
                     }
                 })
             }
+            "Page.navigate" => serde_json::json!({
+                "id": id,
+                "result": {"frameId": "fake-frame"}
+            }),
+            "Page.captureScreenshot" => serde_json::json!({
+                "id": id,
+                "result": {"data": "aGVsbG8="}
+            }),
             _ => serde_json::json!({
                 "id": id,
                 "result": {}
@@ -1140,6 +1152,43 @@ fn native_tools_run_via_cdp_without_mcp() {
     let mut stream = env.connect();
     bind_stream(&mut stream, &session);
 
+    let navigated = tool_call(
+        &mut stream,
+        198,
+        "goto",
+        serde_json::json!({
+            "url": "https://navigated.test/",
+            "waitExpression": "window.__ready",
+            "interval": 50
+        }),
+    );
+    assert!(
+        content_text(&navigated).contains("navigated to https://navigated.test/"),
+        "response: {navigated}"
+    );
+    let session_state = env.wait_session_contains(&session, "page=2");
+    assert!(
+        session_state.contains("page_created_by_daemon=true"),
+        "fresh native call did not allocate a session page: {session_state}"
+    );
+    assert!(
+        session_state.contains("page_url=https://navigated.test/"),
+        "native navigation URL was not recorded: {session_state}"
+    );
+
+    let screenshot_path = env.home.join("quiet.png");
+    let screenshot = tool_call(
+        &mut stream,
+        199,
+        "screenshot_quiet",
+        serde_json::json!({"filePath": screenshot_path.to_str().unwrap()}),
+    );
+    assert!(
+        content_text(&screenshot).contains("saved screenshot"),
+        "response: {screenshot}"
+    );
+    assert_eq!(fs::read(&screenshot_path).unwrap(), b"hello");
+
     let ready = tool_call(
         &mut stream,
         200,
@@ -1212,7 +1261,14 @@ fn tools_list_includes_native_tools() {
         .iter()
         .filter_map(|tool| tool["name"].as_str())
         .collect();
-    for native in ["wait_for_js", "click_at", "click_selector", "dispatch_key"] {
+    for native in [
+        "goto",
+        "screenshot_quiet",
+        "wait_for_js",
+        "click_at",
+        "click_selector",
+        "dispatch_key",
+    ] {
         assert!(names.contains(&native), "missing {native} in {names:?}");
     }
 }

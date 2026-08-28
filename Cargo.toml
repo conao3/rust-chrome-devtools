@@ -11,4 +11,5 @@ name = "chrome-devtools"
 path = "src/main.rs"
 
 [dependencies]
+base64 = "0.22"
 serde_json = "1"

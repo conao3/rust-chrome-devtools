@@ -1392,12 +1392,45 @@ fn inject_page_id(value: &mut serde_json::Value, page_id: u64) {
 pub(crate) fn is_native_tool(name: &str) -> bool {
     matches!(
         name,
-        "wait_for_js" | "click_at" | "click_selector" | "dispatch_key"
+        "goto"
+            | "screenshot_quiet"
+            | "wait_for_js"
+            | "click_at"
+            | "click_selector"
+            | "dispatch_key"
     )
 }
 
 fn native_tool_defs() -> Vec<serde_json::Value> {
     vec![
+        serde_json::json!({
+            "name": "goto",
+            "description": "Daemon-native: navigate the session page with CDP without bringing Chrome to the front, then wait for page readiness, a selector, or a JavaScript expression.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string"},
+                    "waitSelector": {"type": "string", "description": "CSS selector to wait for after navigation"},
+                    "waitExpression": {"type": "string", "description": "JS expression to wait for after navigation; mutually exclusive with waitSelector"},
+                    "timeout": {"type": "number", "description": "max wait in ms (default 30000, max 120000)"},
+                    "interval": {"type": "number", "description": "poll interval in ms (default 250)"}
+                },
+                "required": ["url"]
+            }
+        }),
+        serde_json::json!({
+            "name": "screenshot_quiet",
+            "description": "Daemon-native: capture the visible viewport of the session page directly with CDP, without selecting or foregrounding the page and without entering the MCP tool queue.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "filePath": {"type": "string", "description": "absolute output path under HOME or the OS temp directory"},
+                    "format": {"type": "string", "enum": ["png", "jpeg", "webp"], "description": "default png"},
+                    "quality": {"type": "number", "description": "JPEG/WebP quality from 0 to 100"}
+                },
+                "required": ["filePath"]
+            }
+        }),
         serde_json::json!({
             "name": "wait_for_js",
             "description": "Daemon-native: poll a JavaScript expression (or CSS selector) on the session page until it becomes truthy. Lightweight (no snapshot). Prefer this over fixed sleeps for SPA rendering waits.",
@@ -1481,12 +1514,92 @@ fn native_tool_response(id: serde_json::Value, text: String, is_error: bool) -> 
 
 fn run_native_tool(
     profile: &Profile,
+    sessions: &SharedSessions,
+    session_id: Option<&str>,
     page_url: Option<&str>,
     name: &str,
     arguments: &serde_json::Value,
 ) -> Result<String, String> {
     let port = current_port(profile).ok_or_else(|| "missing DevTools port".to_string())?;
     match name {
+        "goto" => {
+            let url = arguments
+                .get("url")
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| "goto requires 'url'".to_string())?;
+            let selector = arguments
+                .get("waitSelector")
+                .and_then(|value| value.as_str());
+            let expression = arguments
+                .get("waitExpression")
+                .and_then(|value| value.as_str());
+            if selector.is_some() && expression.is_some() {
+                return Err("goto accepts only one of waitSelector or waitExpression".into());
+            }
+            let wait_expression = match (selector, expression) {
+                (Some(selector), None) => {
+                    format!("document.querySelector({})", serde_json::json!(selector))
+                }
+                (None, Some(expression)) => expression.to_string(),
+                (None, None) => "document.readyState === 'complete'".to_string(),
+                _ => unreachable!(),
+            };
+            let timeout = arguments
+                .get("timeout")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(30_000)
+                .clamp(100, 120_000);
+            let interval = arguments
+                .get("interval")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(250)
+                .clamp(50, 10_000);
+            let (elapsed, final_url) = cdp::goto(
+                port,
+                page_url,
+                url,
+                &wait_expression,
+                Duration::from_millis(timeout),
+                Duration::from_millis(interval),
+            )?;
+            if let Some(session_id) = session_id {
+                if let Some(page_id) = session_page(sessions, session_id) {
+                    let _ = record_session_page(
+                        sessions,
+                        session_id,
+                        page_id,
+                        session_page_created_by_daemon(sessions, session_id),
+                        Some(final_url.clone()),
+                    );
+                }
+            }
+            Ok(format!(
+                "navigated to {final_url}; condition became truthy after {}ms",
+                elapsed.as_millis()
+            ))
+        }
+        "screenshot_quiet" => {
+            let file_path = arguments
+                .get("filePath")
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| "screenshot_quiet requires 'filePath'".to_string())?;
+            let format = arguments
+                .get("format")
+                .and_then(|value| value.as_str())
+                .unwrap_or("png");
+            if !matches!(format, "png" | "jpeg" | "webp") {
+                return Err("screenshot_quiet format must be png, jpeg, or webp".into());
+            }
+            let quality = arguments.get("quality").and_then(|value| value.as_u64());
+            let output = cdp::screenshot_quiet(
+                port,
+                page_url,
+                std::path::Path::new(file_path),
+                format,
+                quality,
+            )?;
+            Ok(format!("saved screenshot to {}", output.display()))
+        }
         "wait_for_js" => {
             let expression = match (
                 arguments.get("expression").and_then(|value| value.as_str()),
@@ -1576,15 +1689,26 @@ pub(crate) fn try_native_tool(
     if !is_native_tool(&name) {
         return None;
     }
+    // A fresh session has no MCP page id yet. Let the router allocate and record
+    // one once; after that, native tools can keep bypassing the MCP queue.
+    let session_id = session_id?;
+    session_page(sessions, session_id)?;
     let id = value.get("id").cloned().unwrap_or(serde_json::Value::Null);
     let empty_args = serde_json::json!({});
     let arguments = value
         .get("params")
         .and_then(|params| params.get("arguments"))
         .unwrap_or(&empty_args);
-    let page_url = session_id.and_then(|id| session_page_url(sessions, id));
+    let page_url = session_page_url(sessions, session_id);
     Some(
-        match run_native_tool(profile, page_url.as_deref(), &name, arguments) {
+        match run_native_tool(
+            profile,
+            sessions,
+            Some(session_id),
+            page_url.as_deref(),
+            &name,
+            arguments,
+        ) {
             Ok(text) => native_tool_response(id, text, false),
             Err(message) => native_tool_response(id, format!("{name} failed: {message}"), true),
         },
@@ -1978,6 +2102,21 @@ fn route_request(
             next_id,
             abandoned_ids,
         ),
+        other if is_native_tool(other) => {
+            let Some(session_id) = session_id else {
+                return Err("native tool requires a bound session".to_string());
+            };
+            ensure_session_page(
+                mcp_stdin,
+                mcp_reader,
+                sessions,
+                session_id,
+                next_id,
+                abandoned_ids,
+            )?;
+            try_native_tool(profile, sessions, Some(session_id), line)
+                .ok_or_else(|| format!("failed to route native tool: {other}"))
+        }
         other if is_page_scoped_tool(other) => {
             let Some(session_id) = session_id else {
                 return Err("page-scoped tool requires a bound session".to_string());
