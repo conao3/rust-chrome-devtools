@@ -20,12 +20,12 @@ use std::path::PathBuf;
 use std::process::Child;
 use std::process::Command;
 use std::process::Stdio;
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::Ordering;
-use std::sync::mpsc;
 use std::sync::Arc;
 use std::sync::Condvar;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
+use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 use std::time::Instant;
@@ -220,15 +220,17 @@ pub(crate) fn run_daemon(profile: &Profile) -> Result<(), String> {
 
     let sessions_for_reaper = Arc::clone(&sessions);
     let router_for_reaper = router.clone();
-    thread::spawn(move || loop {
-        thread::sleep(session_reaper_interval());
-        let cleanup = {
-            let (lock, _) = &*sessions_for_reaper;
-            lock.lock()
-                .map(|mut registry| registry.reap_expired(session_idle_ttl()))
-                .unwrap_or_default()
-        };
-        let _ = router_for_reaper.close_pages(cleanup);
+    thread::spawn(move || {
+        loop {
+            thread::sleep(session_reaper_interval());
+            let cleanup = {
+                let (lock, _) = &*sessions_for_reaper;
+                lock.lock()
+                    .map(|mut registry| registry.reap_expired(session_idle_ttl()))
+                    .unwrap_or_default()
+            };
+            let _ = router_for_reaper.close_pages(cleanup);
+        }
     });
 
     let stopping = Arc::new(AtomicBool::new(false));

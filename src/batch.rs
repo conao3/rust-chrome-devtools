@@ -175,7 +175,7 @@ pub(crate) fn execute_batch(
             other => {
                 return Err(format!(
                     "unknown step type: {other}: expected {STEP_SHAPE_HINT}"
-                ))
+                ));
             }
         }
     }

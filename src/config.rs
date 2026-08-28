@@ -97,7 +97,7 @@ pub(crate) fn parse_config(content: &str) -> Result<Config, String> {
             unknown => {
                 return Err(format!(
                     "line {line_number}: unknown profile key: {unknown}"
-                ))
+                ));
             }
         }
     }

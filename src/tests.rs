@@ -362,11 +362,13 @@ fn session_registry_bind_marks_owned_and_rejects_second_bind() {
     let mut registry = SessionRegistry::default();
     let state = registry.create();
     assert!(registry.bind(&state.id).is_ok());
-    assert!(registry
-        .sessions
-        .get(&state.id)
-        .map(|session| session.owned)
-        .unwrap_or(false));
+    assert!(
+        registry
+            .sessions
+            .get(&state.id)
+            .map(|session| session.owned)
+            .unwrap_or(false)
+    );
     let error = registry.bind(&state.id).unwrap_err();
     assert!(error.contains("session in use"));
 }
@@ -621,9 +623,11 @@ fn sanitize_outgoing_request_strips_isolated_context_from_new_page() {
     let input = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"new_page","arguments":{"url":"https://example.com","isolatedContext":"foo"}}}"#;
     let output = sanitize_outgoing_request(input);
     let value: serde_json::Value = serde_json::from_str(&output).unwrap();
-    assert!(value["params"]["arguments"]
-        .get("isolatedContext")
-        .is_none());
+    assert!(
+        value["params"]["arguments"]
+            .get("isolatedContext")
+            .is_none()
+    );
     assert_eq!(value["params"]["arguments"]["url"], "https://example.com");
 }
 
@@ -707,10 +711,12 @@ fn roots_list_response_exposes_home_and_tmp_roots() {
     assert!(response.contains("\"id\":3"));
     let value: serde_json::Value = serde_json::from_str(&response).unwrap();
     assert_eq!(value["result"]["roots"][0]["name"], "home");
-    assert!(value["result"]["roots"][0]["uri"]
-        .as_str()
-        .unwrap()
-        .starts_with("file://"));
+    assert!(
+        value["result"]["roots"][0]["uri"]
+            .as_str()
+            .unwrap()
+            .starts_with("file://")
+    );
     assert_eq!(value["result"]["roots"][1]["name"], "tmp");
     assert_eq!(value["result"]["roots"][1]["uri"], "file:///tmp");
 }

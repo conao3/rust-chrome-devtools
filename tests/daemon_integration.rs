@@ -5,8 +5,8 @@ use std::net::TcpStream;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -620,10 +620,12 @@ fn batch_failure_emits_json_error_on_stdout() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let parsed: serde_json::Value = serde_json::from_str(&stdout).expect("stdout is JSON");
     assert_eq!(parsed[0]["type"], "error");
-    assert!(parsed[0]["error"]
-        .as_str()
-        .unwrap()
-        .contains("unknown session"));
+    assert!(
+        parsed[0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("unknown session")
+    );
 }
 
 #[test]

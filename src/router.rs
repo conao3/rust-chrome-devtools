@@ -17,13 +17,13 @@ use std::process::Child;
 use std::process::ChildStdin;
 use std::process::ChildStdout;
 use std::process::Stdio;
+use std::sync::Arc;
+use std::sync::Condvar;
+use std::sync::Mutex;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
-use std::sync::Arc;
-use std::sync::Condvar;
-use std::sync::Mutex;
 use std::thread;
 use std::time::Duration;
 use std::time::Instant;
@@ -1504,12 +1504,14 @@ fn native_tool_response(id: serde_json::Value, text: String, is_error: bool) -> 
     if is_error {
         result["isError"] = serde_json::json!(true);
     }
-    vec![serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": id,
-        "result": result
-    })
-    .to_string()]
+    vec![
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": result
+        })
+        .to_string(),
+    ]
 }
 
 fn run_native_tool(
@@ -2018,18 +2020,20 @@ fn upload_file_fallback_response(line: &str) -> Vec<String> {
         .ok()
         .and_then(|value| value.get("id").cloned())
         .map(|id| {
-            vec![serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "result": {
-                    "content": [{
-                        "type": "text",
-                        "text": "uploaded file via CDP fallback"
-                    }],
-                    "structuredContent": {}
-                }
-            })
-            .to_string()]
+            vec![
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {
+                        "content": [{
+                            "type": "text",
+                            "text": "uploaded file via CDP fallback"
+                        }],
+                        "structuredContent": {}
+                    }
+                })
+                .to_string(),
+            ]
         })
         .unwrap_or_default()
 }

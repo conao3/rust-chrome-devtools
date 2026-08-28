@@ -1,0 +1,60 @@
+name: Bump chrome-devtools-mcp
+
+on:
+  schedule:
+    - cron: "0 21 * * 0"
+  workflow_dispatch:
+
+jobs:
+  bump:
+    name: Bump chrome-devtools-mcp pin
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            accept-flake-config = true
+
+      - name: Check latest version
+        id: check
+        run: |
+          current=$(sed -n 's/^  version = "\(.*\)";$/\1/p' nix/chrome-devtools-mcp.nix)
+          latest=$(curl -fsSL https://registry.npmjs.org/chrome-devtools-mcp/latest | jq -r .version)
+          echo "current=$current" >> "$GITHUB_OUTPUT"
+          echo "latest=$latest" >> "$GITHUB_OUTPUT"
+          echo "chrome-devtools-mcp: current=$current latest=$latest"
+
+      - name: Update pin
+        if: steps.check.outputs.current != steps.check.outputs.latest
+        run: |
+          latest='${{ steps.check.outputs.latest }}'
+          hash=$(nix store prefetch-file --unpack --hash-type sha256 --json \
+            "https://registry.npmjs.org/chrome-devtools-mcp/-/chrome-devtools-mcp-${latest}.tgz" | jq -r .hash)
+          sed -i "s|^  version = \".*\";$|  version = \"$latest\";|" nix/chrome-devtools-mcp.nix
+          sed -i "s|hash = \"sha256-[^\"]*\";|hash = \"$hash\";|" nix/chrome-devtools-mcp.nix
+
+      - name: Build updated packages
+        if: steps.check.outputs.current != steps.check.outputs.latest
+        run: nix build .#chrome-devtools-mcp .#default
+
+      - name: Create pull request
+        if: steps.check.outputs.current != steps.check.outputs.latest
+        uses: peter-evans/create-pull-request@v7
+        with:
+          branch: bump-chrome-devtools-mcp
+          title: "chrome-devtools-mcp: ${{ steps.check.outputs.current }} -> ${{ steps.check.outputs.latest }}"
+          commit-message: "chrome-devtools-mcp: ${{ steps.check.outputs.current }} -> ${{ steps.check.outputs.latest }}"
+          body: |
+            Automated pin bump for chrome-devtools-mcp.
+
+            - upstream: https://github.com/ChromeDevTools/chrome-devtools-mcp/releases
+            - Both the MCP package and wrapped chrome-devtools package build successfully.
+          delete-branch: true
