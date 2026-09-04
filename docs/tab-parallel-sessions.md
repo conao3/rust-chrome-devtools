@@ -54,8 +54,15 @@ Extend `SessionState` with page ownership fields:
 page_id=<mcp page id or empty>
 page_created_by_daemon=<true|false>
 page_url=<last observed url or empty>
+target_id=<cdp target id or empty>
 snapshot_epoch=<u64>
 ```
+
+`page_id` is the MCP page id, which `McpContext.createPagesSnapshot()` re-issues from `#nextPageId++`, so it shifts when other tabs open or close. `target_id` is the CDP target id from `/json`, which stays the same for the life of the tab. Daemon-native tools resolve their connection through `target_id` and treat `page_url` as diagnostic state.
+
+The daemon learns the target id by diffing `/json` page target ids around the `new_page` call in `ensure_session_page`. A session that has a page but no target id (after an MCP respawn, say) resolves it once from `page_url`, and only when exactly one target carries that url.
+
+`connect_page_client` never falls back to another target. A missing target returns `session page target <id> is gone; create a new session`, and an ambiguous url returns `url <url> matches multiple page targets`. Falling back to `targets.first()` sends input to whatever tab happens to be first, which on a shared profile is another agent'"'"'s page.
 
 A session can get a page in 3 ways.
 

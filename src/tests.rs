@@ -309,6 +309,7 @@ fn format_session_line_renders_all_fields() {
         page_id: Some(7),
         page_created_by_daemon: true,
         page_url: Some("about:blank".to_string()),
+        target_id: Some("TARGET1".to_string()),
         snapshot_epoch: 0,
         uid_bindings: std::collections::HashMap::new(),
     };
@@ -317,6 +318,68 @@ fn format_session_line_renders_all_fields() {
     assert!(line.contains(" owned=true"));
     assert!(line.contains(" created="));
     assert!(line.contains(" last_used="));
+    assert!(line.contains(" target_id=TARGET1"));
+}
+
+#[test]
+fn set_page_drops_target_id_when_the_page_changes() {
+    let mut registry = SessionRegistry::default();
+    let session = registry.create();
+    registry
+        .set_page(&session.id, 1, true, Some("about:blank".to_string()))
+        .unwrap();
+    registry.set_target_id(&session.id, Some("TARGET1".to_string()));
+    assert_eq!(
+        registry.sessions[&session.id].target_id.as_deref(),
+        Some("TARGET1")
+    );
+
+    // 同じ page への再記録では target id を保つ (goto でページ内遷移しただけのケース)。
+    registry
+        .set_page(
+            &session.id,
+            1,
+            true,
+            Some("https://example.com/".to_string()),
+        )
+        .unwrap();
+    assert_eq!(
+        registry.sessions[&session.id].target_id.as_deref(),
+        Some("TARGET1")
+    );
+
+    // 別 page に移ったら target id は無効になる。
+    registry.set_page(&session.id, 2, false, None).unwrap();
+    assert_eq!(registry.sessions[&session.id].target_id, None);
+}
+
+#[test]
+fn clear_page_drops_target_id() {
+    let mut registry = SessionRegistry::default();
+    let session = registry.create();
+    registry
+        .set_page(&session.id, 1, true, Some("about:blank".to_string()))
+        .unwrap();
+    registry.set_target_id(&session.id, Some("TARGET1".to_string()));
+    registry.clear_page(&session.id);
+    assert_eq!(registry.sessions[&session.id].target_id, None);
+}
+
+#[test]
+fn allowed_input_path_requires_an_existing_file_under_home_or_temp() {
+    let dir = std::env::temp_dir().join(format!("cdt-input-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("resume.pdf");
+    std::fs::write(&file, b"%PDF-1.7\n").unwrap();
+
+    let resolved = crate::cdp::allowed_input_path(&file).unwrap();
+    assert!(resolved.is_absolute());
+
+    assert!(crate::cdp::allowed_input_path(std::path::Path::new("resume.pdf")).is_err());
+    assert!(crate::cdp::allowed_input_path(&dir).is_err());
+    assert!(crate::cdp::allowed_input_path(std::path::Path::new("/etc/hosts")).is_err());
+
+    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]

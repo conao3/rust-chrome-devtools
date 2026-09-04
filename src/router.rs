@@ -168,6 +168,9 @@ pub(crate) struct SessionState {
     pub(crate) page_id: Option<u64>,
     pub(crate) page_created_by_daemon: bool,
     pub(crate) page_url: Option<String>,
+    /// CDP の target id。タブの寿命の間ずっと変わらないので、daemon-native tool は
+    /// URL ではなくこれで接続先を決める (URL は遷移で変わり、他タブと衝突する)。
+    pub(crate) target_id: Option<String>,
     pub(crate) snapshot_epoch: u64,
     pub(crate) uid_bindings: HashMap<String, UidBinding>,
 }
@@ -189,6 +192,7 @@ impl SessionRegistry {
             page_id: None,
             page_created_by_daemon: false,
             page_url: None,
+            target_id: None,
             snapshot_epoch: 0,
             uid_bindings: HashMap::new(),
         };
@@ -283,6 +287,8 @@ impl SessionRegistry {
         if session.page_id != Some(page_id) {
             session.snapshot_epoch = session.snapshot_epoch.wrapping_add(1);
             session.uid_bindings.clear();
+            // 別ページに移ったら target id は無効。次の native call で解決し直す。
+            session.target_id = None;
         }
         session.page_id = Some(page_id);
         session.page_created_by_daemon = page_created_by_daemon;
@@ -291,11 +297,18 @@ impl SessionRegistry {
         Ok(())
     }
 
+    pub(crate) fn set_target_id(&mut self, id: &str, target_id: Option<String>) {
+        if let Some(session) = self.sessions.get_mut(id) {
+            session.target_id = target_id;
+        }
+    }
+
     pub(crate) fn clear_page(&mut self, id: &str) {
         if let Some(session) = self.sessions.get_mut(id) {
             session.page_id = None;
             session.page_created_by_daemon = false;
             session.page_url = None;
+            session.target_id = None;
             session.snapshot_epoch = session.snapshot_epoch.wrapping_add(1);
             session.uid_bindings.clear();
             session.last_used_at = SystemTime::now();
@@ -1297,6 +1310,7 @@ fn ensure_session_page(
     mcp_reader: &mut impl BufRead,
     sessions: &SharedSessions,
     session_id: &str,
+    port: Option<u16>,
     next_id: &mut u64,
     abandoned_ids: &mut HashMap<u64, Instant>,
 ) -> Result<u64, String> {
@@ -1312,6 +1326,11 @@ fn ensure_session_page(
             return Ok(page_id);
         }
     }
+    // new_page の前後で CDP target を差分し、割り当てられたタブの target id を確定する。
+    // about:blank のタブは複数並びうるので URL 一致では特定できない。
+    let before = port
+        .and_then(|port| cdp::page_target_ids(port).ok())
+        .unwrap_or_default();
     let response = mcp_call(
         mcp_stdin,
         mcp_reader,
@@ -1327,11 +1346,19 @@ fn ensure_session_page(
     )?;
     let page_id = selected_page_id(&response)
         .ok_or_else(|| "failed to determine the allocated page id".to_string())?;
+    let target_id = port.and_then(|port| {
+        let after = cdp::page_target_ids(port).ok()?;
+        let mut added = after.into_iter().filter(|id| !before.contains(id));
+        let first = added.next()?;
+        // 同時に複数タブが増えたら、どれが自分のものか決められない。
+        added.next().is_none().then_some(first)
+    });
     let (lock, _) = &**sessions;
     let mut registry = lock
         .lock()
         .map_err(|_| "session registry poisoned".to_string())?;
     registry.set_page(session_id, page_id, true, Some("about:blank".to_string()))?;
+    registry.set_target_id(session_id, target_id);
     Ok(page_id)
 }
 
@@ -1357,6 +1384,21 @@ fn session_page_url(sessions: &SharedSessions, session_id: &str) -> Option<Strin
         .ok()
         .and_then(|registry| registry.sessions.get(session_id).cloned())
         .and_then(|session| session.page_url)
+}
+
+fn session_target_id(sessions: &SharedSessions, session_id: &str) -> Option<String> {
+    let (lock, _) = &**sessions;
+    lock.lock()
+        .ok()
+        .and_then(|registry| registry.sessions.get(session_id).cloned())
+        .and_then(|session| session.target_id)
+}
+
+fn set_session_target_id(sessions: &SharedSessions, session_id: &str, target_id: Option<String>) {
+    let (lock, _) = &**sessions;
+    if let Ok(mut registry) = lock.lock() {
+        registry.set_target_id(session_id, target_id);
+    }
 }
 
 fn record_session_page(
@@ -1398,6 +1440,8 @@ pub(crate) fn is_native_tool(name: &str) -> bool {
             | "click_at"
             | "click_selector"
             | "dispatch_key"
+            | "set_file_input"
+            | "type_into"
     )
 }
 
@@ -1479,6 +1523,35 @@ fn native_tool_defs() -> Vec<serde_json::Value> {
                 "required": ["key"]
             }
         }),
+        serde_json::json!({
+            "name": "set_file_input",
+            "description": "Daemon-native: attach files to the input[type=file] matched by a CSS selector via CDP DOM.setFileInputFiles. No snapshot and no file chooser, so it stays inside the session page and picks the exact input on pages that have several.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "selector": {"type": "string", "description": "CSS selector for an input[type=file] on the session page"},
+                    "filePaths": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "absolute paths under $HOME or the OS temp directory"
+                    }
+                },
+                "required": ["selector", "filePaths"]
+            }
+        }),
+        serde_json::json!({
+            "name": "type_into",
+            "description": "Daemon-native: focus the element matched by a CSS selector and insert text with CDP Input.insertText. Use when a native value setter plus an input event does not reach the framework state (some React-based ATS forms).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "selector": {"type": "string"},
+                    "text": {"type": "string"},
+                    "clear": {"type": "boolean", "description": "select all and delete before inserting (default false)"}
+                },
+                "required": ["selector", "text"]
+            }
+        }),
     ]
 }
 
@@ -1518,7 +1591,7 @@ fn run_native_tool(
     profile: &Profile,
     sessions: &SharedSessions,
     session_id: Option<&str>,
-    page_url: Option<&str>,
+    page: cdp::PageRef<'_>,
     name: &str,
     arguments: &serde_json::Value,
 ) -> Result<String, String> {
@@ -1558,7 +1631,7 @@ fn run_native_tool(
                 .clamp(50, 10_000);
             let (elapsed, final_url) = cdp::goto(
                 port,
-                page_url,
+                page,
                 url,
                 &wait_expression,
                 Duration::from_millis(timeout),
@@ -1595,7 +1668,7 @@ fn run_native_tool(
             let quality = arguments.get("quality").and_then(|value| value.as_u64());
             let output = cdp::screenshot_quiet(
                 port,
-                page_url,
+                page,
                 std::path::Path::new(file_path),
                 format,
                 quality,
@@ -1627,7 +1700,7 @@ fn run_native_tool(
                 .clamp(50, 10_000);
             let elapsed = cdp::wait_for_js(
                 port,
-                page_url,
+                page,
                 &expression,
                 Duration::from_millis(timeout),
                 Duration::from_millis(interval),
@@ -1646,7 +1719,7 @@ fn run_native_tool(
                 .get("y")
                 .and_then(|value| value.as_f64())
                 .ok_or_else(|| "click_at requires numeric 'y'".to_string())?;
-            cdp::click_at(port, page_url, x, y)?;
+            cdp::click_at(port, page, x, y)?;
             Ok(format!("clicked at ({x}, {y})"))
         }
         "click_selector" => {
@@ -1654,7 +1727,7 @@ fn run_native_tool(
                 .get("selector")
                 .and_then(|value| value.as_str())
                 .ok_or_else(|| "click_selector requires 'selector'".to_string())?;
-            let (x, y) = cdp::click_selector(port, page_url, selector)?;
+            let (x, y) = cdp::click_selector(port, page, selector)?;
             Ok(format!("clicked {selector} at ({x:.0}, {y:.0})"))
         }
         "dispatch_key" => {
@@ -1666,8 +1739,55 @@ fn run_native_tool(
                 .get("modifiers")
                 .and_then(|value| value.as_u64())
                 .unwrap_or(0);
-            cdp::dispatch_key(port, page_url, key, modifiers)?;
+            cdp::dispatch_key(port, page, key, modifiers)?;
             Ok(format!("dispatched key {key}"))
+        }
+        "set_file_input" => {
+            let selector = arguments
+                .get("selector")
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| "set_file_input requires 'selector'".to_string())?;
+            let files = arguments
+                .get("filePaths")
+                .and_then(|value| value.as_array())
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(|value| value.as_str().map(|path| path.to_string()))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            if files.is_empty() {
+                return Err("set_file_input requires a non-empty 'filePaths' array".to_string());
+            }
+            let files = files
+                .iter()
+                .map(|path| {
+                    cdp::allowed_input_path(std::path::Path::new(path))
+                        .map(|resolved| resolved.to_string_lossy().into_owned())
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            cdp::set_file_input(port, page, selector, &files)?;
+            Ok(format!("attached {} file(s) to {selector}", files.len()))
+        }
+        "type_into" => {
+            let selector = arguments
+                .get("selector")
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| "type_into requires 'selector'".to_string())?;
+            let text = arguments
+                .get("text")
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| "type_into requires 'text'".to_string())?;
+            let clear = arguments
+                .get("clear")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false);
+            cdp::type_into(port, page, selector, text, clear)?;
+            Ok(format!(
+                "typed {} char(s) into {selector}",
+                text.chars().count()
+            ))
         }
         other => Err(format!("unknown native tool: {other}")),
     }
@@ -1702,15 +1822,20 @@ pub(crate) fn try_native_tool(
         .and_then(|params| params.get("arguments"))
         .unwrap_or(&empty_args);
     let page_url = session_page_url(sessions, session_id);
+    // target id が未解決のセッション (daemon respawn 後など) は、URL が一意に定まる
+    // ときだけ 1 回解決して固定する。以後は URL が変わっても同じタブを掴み続ける。
+    let mut target_id = session_target_id(sessions, session_id);
+    if target_id.is_none() {
+        if let (Some(port), Some(url)) = (current_port(profile), page_url.as_deref()) {
+            if let Ok(Some(resolved)) = cdp::resolve_unique_target_id(port, url) {
+                set_session_target_id(sessions, session_id, Some(resolved.clone()));
+                target_id = Some(resolved);
+            }
+        }
+    }
+    let page = cdp::PageRef::new(target_id.as_deref(), page_url.as_deref());
     Some(
-        match run_native_tool(
-            profile,
-            sessions,
-            Some(session_id),
-            page_url.as_deref(),
-            &name,
-            arguments,
-        ) {
+        match run_native_tool(profile, sessions, Some(session_id), page, &name, arguments) {
             Ok(text) => native_tool_response(id, text, false),
             Err(message) => native_tool_response(id, format!("{name} failed: {message}"), true),
         },
@@ -2115,6 +2240,7 @@ fn route_request(
                 mcp_reader,
                 sessions,
                 session_id,
+                current_port(profile),
                 next_id,
                 abandoned_ids,
             )?;
@@ -2130,6 +2256,7 @@ fn route_request(
                 mcp_reader,
                 sessions,
                 session_id,
+                current_port(profile),
                 next_id,
                 abandoned_ids,
             )?;
@@ -2176,9 +2303,13 @@ fn route_request(
                 match current_port(profile)
                     .ok_or_else(|| "missing DevTools port".to_string())
                     .and_then(|port| {
+                        // fallback も session のタブに固定する。target id が取れない
+                        // ときは別タブへ渡さず失敗させる (projects メモの session 境界要件)。
+                        let url = session_page_url(sessions, session_id);
+                        let target_id = session_target_id(sessions, session_id);
                         cdp::set_file_input_files(
                             port,
-                            session_page_url(sessions, session_id).as_deref(),
+                            cdp::PageRef::new(target_id.as_deref(), url.as_deref()),
                             &upload_paths,
                         )
                     }) {
@@ -2335,6 +2466,7 @@ fn route_close_page(
                 mcp_reader,
                 sessions,
                 session_id,
+                None,
                 next_id,
                 abandoned_ids,
             )?;
@@ -2828,8 +2960,9 @@ pub(crate) fn format_session_line(state: &SessionState) -> String {
         .map(|page_id| page_id.to_string())
         .unwrap_or_default();
     let page_url = state.page_url.as_deref().unwrap_or("");
+    let target_id = state.target_id.as_deref().unwrap_or("");
     format!(
-        "session={} created={} last_used={} owned={} page={} page_created_by_daemon={} page_url={} snapshot_epoch={}",
+        "session={} created={} last_used={} owned={} page={} page_created_by_daemon={} page_url={} target_id={} snapshot_epoch={}",
         state.id,
         unix_secs(state.created_at),
         unix_secs(state.last_used_at),
@@ -2837,6 +2970,7 @@ pub(crate) fn format_session_line(state: &SessionState) -> String {
         page,
         state.page_created_by_daemon,
         page_url,
+        target_id,
         state.snapshot_epoch
     )
 }

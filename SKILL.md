@@ -36,7 +36,9 @@ Use `chrome-devtools` when you need browser automation through Chrome DevTools M
 
 ## Daemon-Native Tools (no snapshot required)
 
-The daemon adds six tools of its own on top of the MCP tool set (they appear in `tools/list` and are called like any other tool). They run over CDP directly on the session's page, bypassing the MCP process — they work even while a heavy MCP tool is still running, and they never trigger an accessibility snapshot, so they are the right choice on huge-DOM pages where `take_snapshot` is impractical.
+The daemon adds eight tools of its own on top of the MCP tool set (they appear in `tools/list` and are called like any other tool). They run over CDP directly on the session's page, bypassing the MCP process — they work even while a heavy MCP tool is still running, and they never trigger an accessibility snapshot, so they are the right choice on huge-DOM pages where `take_snapshot` is impractical.
+
+Each session is pinned to the CDP target id of its tab. Navigation changes the URL but not the target, and these tools never fall back to another tab: when the session's tab is gone they fail with `session page target <id> is gone; create a new session`. Several agents can therefore drive one Chrome profile at the same time without stealing each other's tabs.
 
 - `goto {url, waitSelector?, waitExpression?, timeout?, interval?}` — navigate the session page without foregrounding Chrome, then wait in the same tool call. `waitSelector` and `waitExpression` are mutually exclusive; without either it waits for `document.readyState === 'complete'`.
 - `screenshot_quiet {filePath, format?, quality?}` — save a visible-viewport screenshot directly through CDP without selecting the page or entering the MCP queue. Use this for Slack/image viewers. `filePath` must be absolute and under `$HOME` or the OS temp directory.
@@ -44,6 +46,8 @@ The daemon adds six tools of its own on top of the MCP tool set (they appear in 
 - `click_selector {selector}` — scroll the first matching element into view and click its center.
 - `click_at {x, y}` — raw left click at viewport coordinates.
 - `dispatch_key {key, modifiers?}` — single key press (`Escape`, `Enter`, `Tab`, `ArrowDown`, single characters, ...). Modifiers bitmask: Alt=1, Ctrl=2, Meta=4, Shift=8.
+- `set_file_input {selector, filePaths}` — attach files to the `input[type=file]` matched by the selector via `DOM.setFileInputFiles`. Prefer it over `upload_file` when a page has several file inputs (a cover letter field and a resume field, say) or when no visible button opens a chooser. Paths must be absolute and under `$HOME` or the OS temp directory.
+- `type_into {selector, text, clear?}` — focus the matched element and insert the text with `Input.insertText`. Use it when `evaluate_script` with a native value setter plus an `input` event leaves the framework state unchanged. `clear: true` selects all and deletes first.
 
 ## Profile Setup
 

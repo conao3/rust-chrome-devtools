@@ -13,17 +13,77 @@ use std::time::Duration;
 use std::time::Instant;
 
 struct PageTarget {
+    id: String,
     url: String,
     websocket_path: String,
 }
 
-fn connect_page_client(port: u16, page_url: Option<&str>) -> Result<CdpClient, String> {
+/// セッションが所有するタブの指し方。`target_id` は CDP の target id で、タブの寿命の
+/// 間ずっと変わらない。`url` は診断用と、target id 未解決時の 1 回きりの解決に使う。
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct PageRef<'a> {
+    pub(crate) target_id: Option<&'a str>,
+    pub(crate) url: Option<&'a str>,
+}
+
+impl<'a> PageRef<'a> {
+    pub(crate) fn new(target_id: Option<&'a str>, url: Option<&'a str>) -> Self {
+        Self { target_id, url }
+    }
+}
+
+/// セッションのタブだけに接続する。**他のタブへフォールバックしない。**
+/// 共有 Chrome では別エージェントのタブが並んでいるので、取り違えると相手のフォームを
+/// 操作してしまう。対象が見つからないときは黙って別のタブを掴まずエラーにする。
+fn connect_page_client(port: u16, page: PageRef<'_>) -> Result<CdpClient, String> {
     let targets = list_page_targets(port)?;
-    let target = page_url
-        .and_then(|url| targets.iter().find(|target| target.url == url))
-        .or_else(|| targets.first())
-        .ok_or_else(|| "no page target available".to_string())?;
+    let target = match page.target_id {
+        Some(target_id) => targets
+            .iter()
+            .find(|target| target.id == target_id)
+            .ok_or_else(|| {
+                format!("session page target {target_id} is gone; create a new session")
+            })?,
+        None => {
+            let url = page
+                .url
+                .ok_or_else(|| "session has no page target".to_string())?;
+            let mut matches = targets.iter().filter(|target| target.url == url);
+            let first = matches
+                .next()
+                .ok_or_else(|| format!("no page target for url {url}"))?;
+            if matches.next().is_some() {
+                return Err(format!(
+                    "url {url} matches multiple page targets; cannot pick the session tab"
+                ));
+            }
+            first
+        }
+    };
     CdpClient::connect(port, &target.websocket_path)
+}
+
+/// `/json` の page target id を列挙する。`new_page` の前後で差分を取り、
+/// セッションに割り当てられたタブの target id を確定するのに使う。
+pub(crate) fn page_target_ids(port: u16) -> Result<Vec<String>, String> {
+    Ok(list_page_targets(port)?
+        .into_iter()
+        .map(|target| target.id)
+        .collect())
+}
+
+/// url がちょうど 1 つの target に一致するときだけ target id を返す。
+/// 0 件・複数件では `None` を返し、呼び出し側は解決を諦める。
+pub(crate) fn resolve_unique_target_id(port: u16, url: &str) -> Result<Option<String>, String> {
+    let targets = list_page_targets(port)?;
+    let mut matches = targets.iter().filter(|target| target.url == url);
+    let Some(first) = matches.next() else {
+        return Ok(None);
+    };
+    if matches.next().is_some() {
+        return Ok(None);
+    }
+    Ok(Some(first.id.clone()))
 }
 
 fn evaluate_value(client: &mut CdpClient, expression: &str) -> Result<Value, String> {
@@ -65,13 +125,13 @@ fn is_transient_navigation_error(error: &str) -> bool {
 
 pub(crate) fn goto(
     port: u16,
-    page_url: Option<&str>,
+    page: PageRef<'_>,
     url: &str,
     wait_expression: &str,
     timeout: Duration,
     interval: Duration,
 ) -> Result<(Duration, String), String> {
-    let mut client = connect_page_client(port, page_url)?;
+    let mut client = connect_page_client(port, page)?;
     client.set_read_timeout(Duration::from_secs(3))?;
     let response = client.call(serde_json::json!({
         "method": "Page.navigate",
@@ -150,9 +210,38 @@ fn allowed_output_path(path: &Path) -> Result<PathBuf, String> {
     Ok(parent.join(file_name))
 }
 
+/// アップロード対象のパスを検証する。MCP の roots と同じ範囲 ($HOME と OS の temp)
+/// に制限し、実在するファイルだけを通す。
+pub(crate) fn allowed_input_path(path: &Path) -> Result<PathBuf, String> {
+    if !path.is_absolute() {
+        return Err(format!("file path must be absolute: {}", path.display()));
+    }
+    let resolved = path
+        .canonicalize()
+        .map_err(|error| format!("failed to resolve {}: {error}", path.display()))?;
+    if !resolved.is_file() {
+        return Err(format!("not a file: {}", resolved.display()));
+    }
+    let mut roots = vec![std::env::temp_dir()];
+    if let Some(home) = std::env::var_os("HOME") {
+        roots.push(PathBuf::from(home));
+    }
+    let allowed = roots
+        .into_iter()
+        .filter_map(|root| root.canonicalize().ok())
+        .any(|root| resolved.starts_with(root));
+    if !allowed {
+        return Err(format!(
+            "file path must be under HOME or the OS temp directory: {}",
+            resolved.display()
+        ));
+    }
+    Ok(resolved)
+}
+
 pub(crate) fn screenshot_quiet(
     port: u16,
-    page_url: Option<&str>,
+    page: PageRef<'_>,
     file_path: &Path,
     format: &str,
     quality: Option<u64>,
@@ -172,7 +261,7 @@ pub(crate) fn screenshot_quiet(
     // delay its first paint. Retry transport failures without activating the tab.
     let started = Instant::now();
     let response = loop {
-        let attempt = connect_page_client(port, page_url).and_then(|mut client| {
+        let attempt = connect_page_client(port, page).and_then(|mut client| {
             client.set_read_timeout(Duration::from_secs(5))?;
             client.call(serde_json::json!({
                 "method": "Page.captureScreenshot",
@@ -205,7 +294,7 @@ pub(crate) fn screenshot_quiet(
 
 pub(crate) fn wait_for_js(
     port: u16,
-    page_url: Option<&str>,
+    page: PageRef<'_>,
     expression: &str,
     timeout: Duration,
     interval: Duration,
@@ -219,7 +308,7 @@ pub(crate) fn wait_for_js(
     let mut client: Option<CdpClient> = None;
     loop {
         if client.is_none() {
-            match connect_page_client(port, page_url) {
+            match connect_page_client(port, page) {
                 Ok(new_client) => {
                     let _ = new_client.set_read_timeout(poll_read_timeout);
                     client = Some(new_client);
@@ -274,17 +363,17 @@ fn dispatch_click(client: &mut CdpClient, x: f64, y: f64) -> Result<(), String> 
     Ok(())
 }
 
-pub(crate) fn click_at(port: u16, page_url: Option<&str>, x: f64, y: f64) -> Result<(), String> {
-    let mut client = connect_page_client(port, page_url)?;
+pub(crate) fn click_at(port: u16, page: PageRef<'_>, x: f64, y: f64) -> Result<(), String> {
+    let mut client = connect_page_client(port, page)?;
     dispatch_click(&mut client, x, y)
 }
 
 pub(crate) fn click_selector(
     port: u16,
-    page_url: Option<&str>,
+    page: PageRef<'_>,
     selector: &str,
 ) -> Result<(f64, f64), String> {
-    let mut client = connect_page_client(port, page_url)?;
+    let mut client = connect_page_client(port, page)?;
     let selector_json = serde_json::json!(selector).to_string();
     let expression = format!(
         "(() => {{ const el = document.querySelector({selector_json}); if (!el) return null; el.scrollIntoView({{block: 'center', inline: 'center'}}); const r = el.getBoundingClientRect(); return {{x: r.x + r.width / 2, y: r.y + r.height / 2}}; }})()"
@@ -343,11 +432,11 @@ fn key_info(key: &str) -> (String, i64, Option<String>) {
 
 pub(crate) fn dispatch_key(
     port: u16,
-    page_url: Option<&str>,
+    page: PageRef<'_>,
     key: &str,
     modifiers: u64,
 ) -> Result<(), String> {
-    let mut client = connect_page_client(port, page_url)?;
+    let mut client = connect_page_client(port, page)?;
     let (code, virtual_key_code, text) = key_info(key);
     let mut down = serde_json::json!({
         "method": "Input.dispatchKeyEvent",
@@ -381,31 +470,14 @@ pub(crate) fn dispatch_key(
 
 pub(crate) fn set_file_input_files(
     port: u16,
-    page_url: Option<&str>,
+    page: PageRef<'_>,
     files: &[String],
 ) -> Result<(), String> {
     if files.is_empty() {
         return Err("upload_file fallback requires at least one file".to_string());
     }
-    let targets = list_page_targets(port)?;
-    let target = page_url
-        .and_then(|url| targets.iter().find(|target| target.url == url))
-        .or_else(|| targets.first())
-        .ok_or_else(|| "no page target for upload_file fallback".to_string())?;
-    let mut client = CdpClient::connect(port, &target.websocket_path)?;
-    let document = client.call(serde_json::json!({
-        "method": "DOM.getDocument",
-        "params": {
-            "depth": -1,
-            "pierce": true
-        }
-    }))?;
-    let root_node_id = document
-        .get("result")
-        .and_then(|result| result.get("root"))
-        .and_then(|root| root.get("nodeId"))
-        .and_then(|node_id| node_id.as_i64())
-        .ok_or_else(|| "DOM.getDocument did not return root nodeId".to_string())?;
+    let mut client = connect_page_client(port, page)?;
+    let root_node_id = document_root_node_id(&mut client)?;
     let node_id = query_file_input(&mut client, root_node_id)?;
     let _ = client.call(serde_json::json!({
         "method": "DOM.setFileInputFiles",
@@ -413,6 +485,135 @@ pub(crate) fn set_file_input_files(
             "nodeId": node_id,
             "files": files
         }
+    }))?;
+    Ok(())
+}
+
+fn document_root_node_id(client: &mut CdpClient) -> Result<i64, String> {
+    let document = client.call(serde_json::json!({
+        "method": "DOM.getDocument",
+        "params": {
+            "depth": -1,
+            "pierce": true
+        }
+    }))?;
+    document
+        .get("result")
+        .and_then(|result| result.get("root"))
+        .and_then(|root| root.get("nodeId"))
+        .and_then(|node_id| node_id.as_i64())
+        .ok_or_else(|| "DOM.getDocument did not return root nodeId".to_string())
+}
+
+/// セレクタで指定した `input[type=file]` にファイルを渡す。file chooser を使わないので
+/// 他 session の chooser を横取りする余地がなく、file input が複数あるページでも
+/// どれに添付するかを呼び出し側が決められる。
+pub(crate) fn set_file_input(
+    port: u16,
+    page: PageRef<'_>,
+    selector: &str,
+    files: &[String],
+) -> Result<(), String> {
+    if files.is_empty() {
+        return Err("set_file_input requires at least one file".to_string());
+    }
+    let mut client = connect_page_client(port, page)?;
+    let selector_json = serde_json::json!(selector).to_string();
+    let kind = evaluate_value(
+        &mut client,
+        &format!(
+            "(() => {{ const el = document.querySelector({selector_json}); if (!el) return 'missing'; if (el.tagName !== 'INPUT' || el.type !== 'file') return 'not-file'; return 'ok'; }})()"
+        ),
+    )?;
+    match kind.as_str() {
+        Some("ok") => {}
+        Some("missing") => return Err(format!("no element matches selector: {selector}")),
+        _ => return Err(format!("selector is not an input[type=file]: {selector}")),
+    }
+    let root_node_id = document_root_node_id(&mut client)?;
+    let response = client.call(serde_json::json!({
+        "method": "DOM.querySelector",
+        "params": {
+            "nodeId": root_node_id,
+            "selector": selector
+        }
+    }))?;
+    let node_id = response
+        .get("result")
+        .and_then(|result| result.get("nodeId"))
+        .and_then(|node_id| node_id.as_i64())
+        .filter(|node_id| *node_id != 0)
+        .ok_or_else(|| format!("DOM.querySelector found no node for {selector}"))?;
+    let _ = client.call(serde_json::json!({
+        "method": "DOM.setFileInputFiles",
+        "params": {
+            "nodeId": node_id,
+            "files": files
+        }
+    }))?;
+    Ok(())
+}
+
+/// セレクタの要素に実フォーカスを当て、`Input.insertText` で文字列を入れる。
+/// native value setter + `input` イベントでは state が更新されないフレームワーク
+/// (React 系の一部 ATS) でも、実キー入力と同じ経路になるので値が反映される。
+pub(crate) fn type_into(
+    port: u16,
+    page: PageRef<'_>,
+    selector: &str,
+    text: &str,
+    clear: bool,
+) -> Result<(), String> {
+    let mut client = connect_page_client(port, page)?;
+    let selector_json = serde_json::json!(selector).to_string();
+    let focused = evaluate_value(
+        &mut client,
+        &format!(
+            "(() => {{ const el = document.querySelector({selector_json}); if (!el) return false; el.scrollIntoView({{block: 'center', inline: 'center'}}); el.focus(); return document.activeElement === el; }})()"
+        ),
+    )?;
+    if focused.as_bool() != Some(true) {
+        return Err(format!("could not focus selector: {selector}"));
+    }
+    if clear {
+        client.call(serde_json::json!({
+            "method": "Input.dispatchKeyEvent",
+            "params": {
+                "type": "keyDown",
+                "key": "a",
+                "code": "KeyA",
+                "windowsVirtualKeyCode": 65,
+                "nativeVirtualKeyCode": 65,
+                "modifiers": 2
+            }
+        }))?;
+        client.call(serde_json::json!({
+            "method": "Input.dispatchKeyEvent",
+            "params": {
+                "type": "keyUp",
+                "key": "a",
+                "code": "KeyA",
+                "windowsVirtualKeyCode": 65,
+                "nativeVirtualKeyCode": 65,
+                "modifiers": 2
+            }
+        }))?;
+        for event_type in ["keyDown", "keyUp"] {
+            client.call(serde_json::json!({
+                "method": "Input.dispatchKeyEvent",
+                "params": {
+                    "type": event_type,
+                    "key": "Delete",
+                    "code": "Delete",
+                    "windowsVirtualKeyCode": 46,
+                    "nativeVirtualKeyCode": 46
+                }
+            }))?;
+        }
+    }
+    client.call(serde_json::json!({
+        "method": "Input.insertText",
+        "params": {"text": text}
     }))?;
     Ok(())
 }
@@ -453,6 +654,7 @@ fn list_page_targets(port: u16) -> Result<Vec<PageTarget>, String> {
         .iter()
         .filter(|item| item.get("type").and_then(|value| value.as_str()) == Some("page"))
         .filter_map(|item| {
+            let id = item.get("id").and_then(|value| value.as_str())?;
             let url = item.get("url").and_then(|value| value.as_str())?;
             let websocket = item
                 .get("webSocketDebuggerUrl")
@@ -462,6 +664,7 @@ fn list_page_targets(port: u16) -> Result<Vec<PageTarget>, String> {
                 .and_then(|(_, rest)| rest.split_once('/'))
                 .map(|(_, path)| format!("/{path}"))?;
             Some(PageTarget {
+                id: id.to_string(),
                 url: url.to_string(),
                 websocket_path,
             })
