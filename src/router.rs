@@ -1442,6 +1442,7 @@ pub(crate) fn is_native_tool(name: &str) -> bool {
             | "dispatch_key"
             | "set_file_input"
             | "type_into"
+            | "close_page_quiet"
     )
 }
 
@@ -1538,6 +1539,11 @@ fn native_tool_defs() -> Vec<serde_json::Value> {
                 },
                 "required": ["selector", "filePaths"]
             }
+        }),
+        serde_json::json!({
+            "name": "close_page_quiet",
+            "description": "Daemon-native: close the session's own tab through the DevTools HTTP endpoint. The MCP close_page queues behind the tool mutex, so it cannot reach a tab that is holding the mutex open (a JavaScript dialog, a tool that never returns). Closing that tab releases the mutex. The session picks up a fresh tab on its next call.",
+            "inputSchema": {"type": "object", "properties": {}}
         }),
         serde_json::json!({
             "name": "type_into",
@@ -1769,6 +1775,19 @@ fn run_native_tool(
                 .collect::<Result<Vec<_>, _>>()?;
             cdp::set_file_input(port, page, selector, &files)?;
             Ok(format!("attached {} file(s) to {selector}", files.len()))
+        }
+        "close_page_quiet" => {
+            let target_id = page
+                .target_id
+                .ok_or_else(|| "close_page_quiet requires a session page".to_string())?;
+            cdp::close_target(port, target_id)?;
+            if let Some(session_id) = session_id {
+                let (lock, _) = &**sessions;
+                if let Ok(mut registry) = lock.lock() {
+                    registry.clear_page(session_id);
+                }
+            }
+            Ok(format!("closed page target {target_id}"))
         }
         "type_into" => {
             let selector = arguments

@@ -63,6 +63,24 @@ fn connect_page_client(port: u16, page: PageRef<'_>) -> Result<CdpClient, String
     CdpClient::connect(port, &target.websocket_path)
 }
 
+/// session が所有する tab を閉じる。MCP の `close_page` は toolMutex の後ろに並ぶので、
+/// ダイアログや重い tool で MCP が詰まっている間は届かない。DevTools の HTTP endpoint を
+/// 直接叩くこの経路なら詰まった状態でも閉じられ、閉じた時点で MCP が回復する。
+pub(crate) fn close_target(port: u16, target_id: &str) -> Result<(), String> {
+    let targets = list_page_targets(port)?;
+    if !targets.iter().any(|target| target.id == target_id) {
+        return Err(format!("page target {target_id} is already gone"));
+    }
+    let response = http_get(port, &format!("/json/close/{target_id}"))?;
+    if response.contains("Target is closing") || response.trim().is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "unexpected /json/close response: {}",
+        response.trim()
+    ))
+}
+
 /// `/json` の page target id を列挙する。`new_page` の前後で差分を取り、
 /// セッションに割り当てられたタブの target id を確定するのに使う。
 pub(crate) fn page_target_ids(port: u16) -> Result<Vec<String>, String> {
