@@ -325,7 +325,7 @@ fn spawn_fake_devtools() -> FakeDevTools {
             let request = String::from_utf8_lossy(&buffer[..bytes]);
             if request.starts_with("GET /json ") {
                 let body = format!(
-                    r#"[{{"type":"page","url":"about:blank","webSocketDebuggerUrl":"ws://127.0.0.1:{port}/devtools/page/1"}}]"#
+                    r#"[{{"id":"FAKETARGET1","type":"page","url":"about:blank","webSocketDebuggerUrl":"ws://127.0.0.1:{port}/devtools/page/1"}}]"#
                 );
                 let _ = stream.write_all(
                     format!(
