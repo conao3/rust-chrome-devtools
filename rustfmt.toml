@@ -1,0 +1,4 @@
+# Cargo の edition は 2021 だが、コードベースは style edition 2024 で整形されている。
+# 明示しないと `cargo fmt` が edition から style edition 2021 を選び、repo 全体を
+# 旧スタイルへ書き戻してしまう。
+style_edition = "2024"
