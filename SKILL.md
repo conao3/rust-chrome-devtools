@@ -36,7 +36,7 @@ Use `chrome-devtools` when you need browser automation through Chrome DevTools M
 
 ## Daemon-Native Tools (no snapshot required)
 
-The daemon adds nine tools of its own on top of the MCP tool set (they appear in `tools/list` and are called like any other tool). They run over CDP directly on the session's page, bypassing the MCP process — they work even while a heavy MCP tool is still running, and they never trigger an accessibility snapshot, so they are the right choice on huge-DOM pages where `take_snapshot` is impractical.
+The daemon adds ten tools of its own on top of the MCP tool set (they appear in `tools/list` and are called like any other tool). They run over CDP directly on the session's page, bypassing the MCP process — they work even while a heavy MCP tool is still running, and they never trigger an accessibility snapshot, so they are the right choice on huge-DOM pages where `take_snapshot` is impractical.
 
 Each session is pinned to the CDP target id of its tab. Navigation changes the URL but not the target, and these tools never fall back to another tab: when the session's tab is gone they fail with `session page target <id> is gone; create a new session`. Several agents can therefore drive one Chrome profile at the same time without stealing each other's tabs.
 
@@ -47,6 +47,7 @@ Each session is pinned to the CDP target id of its tab. Navigation changes the U
 - `click_at {x, y}` — raw left click at viewport coordinates.
 - `dispatch_key {key, modifiers?}` — single key press (`Escape`, `Enter`, `Tab`, `ArrowDown`, single characters, ...). Modifiers bitmask: Alt=1, Ctrl=2, Meta=4, Shift=8.
 - `set_file_input {selector, filePaths}` — attach files to the `input[type=file]` matched by the selector via `DOM.setFileInputFiles`. Prefer it over `upload_file` when a page has several file inputs (a cover letter field and a resume field, say) or when no visible button opens a chooser. Paths must be absolute and under `$HOME` or the OS temp directory.
+- `print_pdf_quiet {filePath, landscape?, printBackground?, scale?}` — save the session page as a PDF through `Page.printToPDF`. `printBackground` defaults to true, `scale` is clamped to 0.1-2.0. `filePath` must be absolute and under `$HOME` or the OS temp directory.
 - `close_page_quiet {}` — close the session's own tab through the DevTools HTTP endpoint. Use it to recover when a JavaScript dialog or a tool that never returns is holding the MCP tool mutex, which is exactly when the MCP `close_page` cannot get through. The session gets a fresh tab on its next call.
 - `type_into {selector, text, clear?}` — focus the matched element and insert the text with `Input.insertText`. Use it when `evaluate_script` with a native value setter plus an `input` event leaves the framework state unchanged. `clear: true` selects all and deletes first.
 

@@ -1443,6 +1443,7 @@ pub(crate) fn is_native_tool(name: &str) -> bool {
             | "set_file_input"
             | "type_into"
             | "close_page_quiet"
+            | "print_pdf_quiet"
     )
 }
 
@@ -1538,6 +1539,20 @@ fn native_tool_defs() -> Vec<serde_json::Value> {
                     }
                 },
                 "required": ["selector", "filePaths"]
+            }
+        }),
+        serde_json::json!({
+            "name": "print_pdf_quiet",
+            "description": "Daemon-native: save the session page as a PDF with Page.printToPDF, without foregrounding the tab or entering the MCP queue. Use it to keep invoices, receipts and emails as they were rendered. filePath must be absolute and under $HOME or the OS temp directory.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "filePath": {"type": "string"},
+                    "landscape": {"type": "boolean", "description": "default false"},
+                    "printBackground": {"type": "boolean", "description": "default true"},
+                    "scale": {"type": "number", "description": "0.1 to 2.0"}
+                },
+                "required": ["filePath"]
             }
         }),
         serde_json::json!({
@@ -1775,6 +1790,30 @@ fn run_native_tool(
                 .collect::<Result<Vec<_>, _>>()?;
             cdp::set_file_input(port, page, selector, &files)?;
             Ok(format!("attached {} file(s) to {selector}", files.len()))
+        }
+        "print_pdf_quiet" => {
+            let file_path = arguments
+                .get("filePath")
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| "print_pdf_quiet requires 'filePath'".to_string())?;
+            let landscape = arguments
+                .get("landscape")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false);
+            let print_background = arguments
+                .get("printBackground")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(true);
+            let scale = arguments.get("scale").and_then(|value| value.as_f64());
+            let output = cdp::print_pdf_quiet(
+                port,
+                page,
+                std::path::Path::new(file_path),
+                landscape,
+                print_background,
+                scale,
+            )?;
+            Ok(format!("saved PDF to {}", output.display()))
         }
         "close_page_quiet" => {
             let target_id = page

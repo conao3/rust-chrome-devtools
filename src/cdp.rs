@@ -200,19 +200,19 @@ pub(crate) fn goto(
     }
 }
 
-fn allowed_output_path(path: &Path) -> Result<PathBuf, String> {
+fn allowed_output_path(path: &Path, tool: &str) -> Result<PathBuf, String> {
     if !path.is_absolute() {
-        return Err("screenshot_quiet filePath must be absolute".to_string());
+        return Err(format!("{tool} filePath must be absolute"));
     }
     let parent = path
         .parent()
-        .ok_or_else(|| "screenshot_quiet filePath has no parent".to_string())?;
+        .ok_or_else(|| format!("{tool} filePath has no parent"))?;
     let parent = parent
         .canonicalize()
-        .map_err(|error| format!("failed to resolve screenshot parent: {error}"))?;
+        .map_err(|error| format!("failed to resolve {tool} output parent: {error}"))?;
     let file_name = path
         .file_name()
-        .ok_or_else(|| "screenshot_quiet filePath has no file name".to_string())?;
+        .ok_or_else(|| format!("{tool} filePath has no file name"))?;
 
     let mut roots = vec![std::env::temp_dir()];
     if let Some(home) = std::env::var_os("HOME") {
@@ -223,7 +223,9 @@ fn allowed_output_path(path: &Path) -> Result<PathBuf, String> {
         .filter_map(|root| root.canonicalize().ok())
         .any(|root| parent.starts_with(root));
     if !allowed {
-        return Err("screenshot_quiet filePath must be under HOME or the OS temp directory".into());
+        return Err(format!(
+            "{tool} filePath must be under HOME or the OS temp directory"
+        ));
     }
     Ok(parent.join(file_name))
 }
@@ -264,7 +266,7 @@ pub(crate) fn screenshot_quiet(
     format: &str,
     quality: Option<u64>,
 ) -> Result<PathBuf, String> {
-    let output = allowed_output_path(file_path)?;
+    let output = allowed_output_path(file_path, "screenshot_quiet")?;
     let mut params = serde_json::json!({
         "format": format,
         "fromSurface": true,
@@ -305,6 +307,44 @@ pub(crate) fn screenshot_quiet(
     let bytes = BASE64_STANDARD
         .decode(encoded)
         .map_err(|error| format!("invalid screenshot base64: {error}"))?;
+    fs::write(&output, bytes)
+        .map_err(|error| format!("failed to write {}: {error}", output.display()))?;
+    Ok(output)
+}
+
+/// ページを PDF にして保存する。証憑 (請求書・領収書・メール) をそのまま残すのに使う。
+/// タブを前面化せず、MCP の queue も経由しない。
+pub(crate) fn print_pdf_quiet(
+    port: u16,
+    page: PageRef<'_>,
+    file_path: &Path,
+    landscape: bool,
+    print_background: bool,
+    scale: Option<f64>,
+) -> Result<PathBuf, String> {
+    let output = allowed_output_path(file_path, "print_pdf_quiet")?;
+    let mut params = serde_json::json!({
+        "landscape": landscape,
+        "printBackground": print_background,
+        "transferMode": "ReturnAsBase64"
+    });
+    if let Some(scale) = scale {
+        params["scale"] = serde_json::json!(scale.clamp(0.1, 2.0));
+    }
+    let mut client = connect_page_client(port, page)?;
+    client.set_read_timeout(Duration::from_secs(60))?;
+    let response = client.call(serde_json::json!({
+        "method": "Page.printToPDF",
+        "params": params
+    }))?;
+    let encoded = response
+        .get("result")
+        .and_then(|result| result.get("data"))
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| "Page.printToPDF returned no data".to_string())?;
+    let bytes = BASE64_STANDARD
+        .decode(encoded)
+        .map_err(|error| format!("invalid PDF base64: {error}"))?;
     fs::write(&output, bytes)
         .map_err(|error| format!("failed to write {}: {error}", output.display()))?;
     Ok(output)

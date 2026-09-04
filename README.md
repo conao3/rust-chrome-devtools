@@ -72,7 +72,7 @@ Chrome is always launched with `--disable-features=PasswordLeakDetection`: the n
 
 ## Daemon-native tools
 
-Besides forwarding the chrome-devtools-mcp tool set, the daemon implements nine tools of its own directly over CDP (they are listed in `tools/list` and called like any MCP tool). They run on the session's page without the MCP process, so they keep working while a heavy MCP tool is in flight and never trigger an accessibility snapshot:
+Besides forwarding the chrome-devtools-mcp tool set, the daemon implements ten tools of its own directly over CDP (they are listed in `tools/list` and called like any MCP tool). They run on the session's page without the MCP process, so they keep working while a heavy MCP tool is in flight and never trigger an accessibility snapshot:
 
 - `goto {url, waitSelector?, waitExpression?, timeout?, interval?}`: navigate the session page without foregrounding Chrome and wait in the same call. With no explicit wait condition it waits for `document.readyState === 'complete'`.
 - `screenshot_quiet {filePath, format?, quality?}`: capture the visible viewport directly with `Page.captureScreenshot`, bypassing the MCP queue and leaving the user's active tab alone. `filePath` must be absolute and under `$HOME` or the OS temp directory.
@@ -81,6 +81,7 @@ Besides forwarding the chrome-devtools-mcp tool set, the daemon implements nine 
 - `click_at {x, y}`: raw left click at viewport coordinates.
 - `dispatch_key {key, modifiers?}`: single key press (Escape, Enter, arrows, single characters; modifiers bitmask Alt=1 Ctrl=2 Meta=4 Shift=8).
 - `set_file_input {selector, filePaths}`: attach files to the `input[type=file]` matched by a selector through `DOM.setFileInputFiles`. No snapshot and no file chooser, so it picks the exact input on pages that have several and never crosses into another session's page. Paths must be absolute and under `$HOME` or the OS temp directory.
+- `print_pdf_quiet {filePath, landscape?, printBackground?, scale?}`: save the session page as a PDF with `Page.printToPDF`, without foregrounding the tab. Use it to keep invoices, receipts and emails as they were rendered. Same path rules as `screenshot_quiet`.
 - `close_page_quiet {}`: close the session's own tab through the DevTools HTTP endpoint. `close_page` queues behind the MCP tool mutex, so it cannot reach a tab that is holding the mutex open (a JavaScript dialog, a tool that never returns). Closing that tab releases the mutex, and the session picks up a fresh tab on its next call.
 - `type_into {selector, text, clear?}`: focus the matched element and insert text with `Input.insertText`. Use it when a native value setter plus an `input` event does not reach framework state (some React-based forms).
 
