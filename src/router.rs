@@ -2489,13 +2489,28 @@ fn route_select_page(
         .and_then(|page_id| page_id.as_u64());
     let lines = forward_line(mcp_stdin, mcp_reader, line, next_id, abandoned_ids)?;
     if let (Some(session_id), Some(page_id)) = (session_id, requested) {
-        let errored = lines
+        let response = lines
             .last()
-            .and_then(|last| serde_json::from_str::<serde_json::Value>(last).ok())
+            .and_then(|last| serde_json::from_str::<serde_json::Value>(last).ok());
+        let errored = response
+            .as_ref()
             .map(|response| response.get("error").is_some())
             .unwrap_or(false);
         if !errored {
-            let _ = record_session_page(sessions, session_id, page_id, false, None);
+            // 選んだ page の url を残す。daemon-native tool は target id で繋ぐが、
+            // select_page の時点では target id が分からないので、url から 1 回だけ
+            // 解決させる。url が無いと接続先を決められず native tool が全部落ちる。
+            let url = response
+                .as_ref()
+                .map(response_page_entries)
+                .and_then(|entries| {
+                    entries
+                        .into_iter()
+                        .find(|entry| entry.id == page_id)
+                        .map(|entry| entry.url)
+                })
+                .filter(|url| !url.is_empty());
+            let _ = record_session_page(sessions, session_id, page_id, false, url);
         }
     }
     Ok(lines)
