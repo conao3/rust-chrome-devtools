@@ -13,6 +13,7 @@ name = "chrome-devtools"
 version = "1.3.1"
 dependencies = [
  "base64",
+ "serde",
  "serde_json",
 ]
 

@@ -104,6 +104,18 @@ pub(crate) fn resolve_unique_target_id(port: u16, url: &str) -> Result<Option<St
     Ok(Some(first.id.clone()))
 }
 
+/// CDP の応答を `Value` に読む。`serde_json` の既定はネスト 128 段で打ち切るため、
+/// Gmail のように DOM が深いページの応答が `recursion limit exceeded` で落ちる。
+/// 相手はローカルの Chrome なので、深さの上限を外して読む。
+pub(crate) fn parse_cdp_value(text: &str, what: &str) -> Result<Value, String> {
+    use serde::Deserialize;
+
+    let mut deserializer = serde_json::Deserializer::from_str(text);
+    deserializer.disable_recursion_limit();
+    Value::deserialize(&mut deserializer)
+        .map_err(|error| format!("failed to parse {what}: {error}"))
+}
+
 fn evaluate_value(client: &mut CdpClient, expression: &str) -> Result<Value, String> {
     let response = client.call(serde_json::json!({
         "method": "Runtime.evaluate",
@@ -129,6 +141,43 @@ fn evaluate_value(client: &mut CdpClient, expression: &str) -> Result<Value, Str
         .and_then(|inner| inner.get("value"))
         .cloned()
         .unwrap_or(Value::Null))
+}
+
+/// JS 式が返した要素の CDP objectId を取る。`DOM.getDocument` で DOM ツリー全体を
+/// 引き寄せる経路を避けられるので、ノード数の多いページでも応答が小さいままになる。
+fn evaluate_object_id(client: &mut CdpClient, expression: &str) -> Result<Option<String>, String> {
+    let response = client.call(serde_json::json!({
+        "method": "Runtime.evaluate",
+        "params": {
+            "expression": expression,
+            "returnByValue": false
+        }
+    }))?;
+    let result = response
+        .get("result")
+        .ok_or_else(|| "Runtime.evaluate returned no result".to_string())?;
+    if let Some(details) = result.get("exceptionDetails") {
+        let text = details
+            .get("exception")
+            .and_then(|exception| exception.get("description"))
+            .and_then(|description| description.as_str())
+            .or_else(|| details.get("text").and_then(|text| text.as_str()))
+            .unwrap_or("unknown evaluation error");
+        return Err(format!("expression threw: {text}"));
+    }
+    Ok(result
+        .get("result")
+        .and_then(|inner| inner.get("objectId"))
+        .and_then(|object_id| object_id.as_str())
+        .map(|object_id| object_id.to_string()))
+}
+
+/// 使い終わった remote object を解放する。失敗しても呼び出し側の成否は変えない。
+fn release_object(client: &mut CdpClient, object_id: &str) {
+    let _ = client.call(serde_json::json!({
+        "method": "Runtime.releaseObject",
+        "params": { "objectId": object_id }
+    }));
 }
 
 fn is_transient_navigation_error(error: &str) -> bool {
@@ -535,32 +584,17 @@ pub(crate) fn set_file_input_files(
         return Err("upload_file fallback requires at least one file".to_string());
     }
     let mut client = connect_page_client(port, page)?;
-    let root_node_id = document_root_node_id(&mut client)?;
-    let node_id = query_file_input(&mut client, root_node_id)?;
-    let _ = client.call(serde_json::json!({
+    let object_id = first_file_input_object_id(&mut client)?;
+    let outcome = client.call(serde_json::json!({
         "method": "DOM.setFileInputFiles",
         "params": {
-            "nodeId": node_id,
+            "objectId": object_id,
             "files": files
         }
-    }))?;
+    }));
+    release_object(&mut client, &object_id);
+    outcome?;
     Ok(())
-}
-
-fn document_root_node_id(client: &mut CdpClient) -> Result<i64, String> {
-    let document = client.call(serde_json::json!({
-        "method": "DOM.getDocument",
-        "params": {
-            "depth": -1,
-            "pierce": true
-        }
-    }))?;
-    document
-        .get("result")
-        .and_then(|result| result.get("root"))
-        .and_then(|root| root.get("nodeId"))
-        .and_then(|node_id| node_id.as_i64())
-        .ok_or_else(|| "DOM.getDocument did not return root nodeId".to_string())
 }
 
 /// セレクタで指定した `input[type=file]` にファイルを渡す。file chooser を使わないので
@@ -588,27 +622,20 @@ pub(crate) fn set_file_input(
         Some("missing") => return Err(format!("no element matches selector: {selector}")),
         _ => return Err(format!("selector is not an input[type=file]: {selector}")),
     }
-    let root_node_id = document_root_node_id(&mut client)?;
-    let response = client.call(serde_json::json!({
-        "method": "DOM.querySelector",
-        "params": {
-            "nodeId": root_node_id,
-            "selector": selector
-        }
-    }))?;
-    let node_id = response
-        .get("result")
-        .and_then(|result| result.get("nodeId"))
-        .and_then(|node_id| node_id.as_i64())
-        .filter(|node_id| *node_id != 0)
-        .ok_or_else(|| format!("DOM.querySelector found no node for {selector}"))?;
-    let _ = client.call(serde_json::json!({
+    let object_id = evaluate_object_id(
+        &mut client,
+        &format!("document.querySelector({selector_json})"),
+    )?
+    .ok_or_else(|| format!("could not resolve a remote object for {selector}"))?;
+    let outcome = client.call(serde_json::json!({
         "method": "DOM.setFileInputFiles",
         "params": {
-            "nodeId": node_id,
+            "objectId": object_id,
             "files": files
         }
-    }))?;
+    }));
+    release_object(&mut client, &object_id);
+    outcome?;
     Ok(())
 }
 
@@ -676,26 +703,15 @@ pub(crate) fn type_into(
     Ok(())
 }
 
-fn query_file_input(client: &mut CdpClient, root_node_id: i64) -> Result<i64, String> {
-    for selector in [
-        "form input[type=file]",
-        "input[type=file]",
-        "input[type=\"file\"]",
-    ] {
-        let response = client.call(serde_json::json!({
-            "method": "DOM.querySelector",
-            "params": {
-                "nodeId": root_node_id,
-                "selector": selector
-            }
-        }))?;
-        if let Some(node_id) = response
-            .get("result")
-            .and_then(|result| result.get("nodeId"))
-            .and_then(|node_id| node_id.as_i64())
-            .filter(|node_id| *node_id != 0)
+/// `upload_file` の fallback が使う file input を探す。form 内を先に見るのは、
+/// ページ先頭に隠し input を置くサイトで本来の添付欄を外さないため。
+fn first_file_input_object_id(client: &mut CdpClient) -> Result<String, String> {
+    for selector in ["form input[type=file]", "input[type=file]"] {
+        let selector_json = serde_json::json!(selector).to_string();
+        if let Some(object_id) =
+            evaluate_object_id(client, &format!("document.querySelector({selector_json})"))?
         {
-            return Ok(node_id);
+            return Ok(object_id);
         }
     }
     Err("no input[type=file] for upload_file fallback".to_string())
@@ -703,8 +719,7 @@ fn query_file_input(client: &mut CdpClient, root_node_id: i64) -> Result<i64, St
 
 fn list_page_targets(port: u16) -> Result<Vec<PageTarget>, String> {
     let response = http_get(port, "/json")?;
-    let targets = serde_json::from_str::<Value>(&response)
-        .map_err(|error| format!("failed to parse /json response: {error}"))?;
+    let targets = parse_cdp_value(&response, "/json response")?;
     let Some(items) = targets.as_array() else {
         return Err("/json response is not an array".to_string());
     };
@@ -853,8 +868,7 @@ impl CdpClient {
         write_ws_text(&mut self.stream, &request.to_string())?;
         loop {
             let response = read_ws_text(&mut self.stream)?;
-            let value = serde_json::from_str::<Value>(&response)
-                .map_err(|error| format!("failed to parse CDP response: {error}"))?;
+            let value = parse_cdp_value(&response, "CDP response")?;
             if value.get("id").and_then(|value| value.as_i64()) == Some(id) {
                 if let Some(error) = value.get("error") {
                     return Err(format!("CDP call failed: {error}"));

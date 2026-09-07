@@ -383,6 +383,39 @@ fn allowed_input_path_requires_an_existing_file_under_home_or_temp() {
 }
 
 #[test]
+fn parse_cdp_value_reads_deeply_nested_json() {
+    // serde_json の既定はネスト 128 段で打ち切る。DOM が深いページの CDP 応答は
+    // これを超えるので、上限を外して読めることを確かめる。
+    let depth = 512;
+    let mut text = String::new();
+    for _ in 0..depth {
+        text.push('[');
+    }
+    for _ in 0..depth {
+        text.push(']');
+    }
+
+    let value = crate::cdp::parse_cdp_value(&text, "test payload").unwrap();
+
+    let mut current = &value;
+    let mut nesting = 1;
+    while let Some(inner) = current.as_array().and_then(|items| items.first()) {
+        nesting += 1;
+        current = inner;
+    }
+    assert_eq!(nesting, depth);
+}
+
+#[test]
+fn parse_cdp_value_reports_what_failed() {
+    let error = crate::cdp::parse_cdp_value("{", "CDP response").unwrap_err();
+    assert!(
+        error.starts_with("failed to parse CDP response: "),
+        "{error}"
+    );
+}
+
+#[test]
 fn generate_session_id_produces_unique_ids() {
     let mut ids = std::collections::HashSet::new();
     for _ in 0..100 {
