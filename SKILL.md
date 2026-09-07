@@ -243,7 +243,7 @@ chrome-devtools profile stop --profile conao3
 - `upload_file` falls back to Chrome DevTools Protocol when MCP cannot trigger the file chooser; check daemon logs for `upload_file_fallback` or `upload_file_fallback_failed`.
 - If the CLI warns about a daemon version mismatch, the daemon predates the installed CLI. Behavior fixes in the daemon only apply after it restarts; `daemon stop` (without `--force`) is safe once `sessions=0`.
 - If `daemon status` shows `respawns` increased, mint a new session before continuing browser work.
-- The daemon runs `chrome-devtools-mcp` pinned to a fixed version; set `CHROME_DEVTOOLS_MCP_VERSION` (e.g. `latest`) before `daemon start` to override.
+- The daemon runs `chrome-devtools-mcp` pinned to 1.8.0 and starts it with `--pageIdRouting`; set `CHROME_DEVTOOLS_MCP_VERSION` (e.g. `latest`) before `daemon start` to override. Up to 1.7.0 that flag is named `--experimentalPageIdRouting`, so those versions log `Unknown arguments` and fall back to their own default for page id routing.
 - The daemon-owned `chrome-devtools-mcp` Node heap defaults to 2048 MB; set `CHROME_DEVTOOLS_MCP_MAX_OLD_SPACE_MB` before `daemon start` for heavier trace runs.
 - If `fill` or `click` fails with a stale or foreign uid token, take a fresh snapshot in the same session and use the new token.
 - If the page is not the expected page, run an `evaluate_script` step that returns `window.location.href` and verify before acting.

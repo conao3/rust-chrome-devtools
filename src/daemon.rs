@@ -837,12 +837,12 @@ pub(crate) fn list_mcp_tools(profile: &Profile) -> Result<(), String> {
     Ok(())
 }
 
-pub(crate) const DEFAULT_MCP_VERSION: &str = "1.5.0";
+pub(crate) const DEFAULT_MCP_VERSION: &str = "1.8.0";
 
 pub(crate) fn daemon_mcp_command(profile: &Profile) -> Command {
     let mut command = mcp_command(profile);
     command
-        .arg("--experimentalPageIdRouting")
+        .arg("--pageIdRouting")
         .arg("--experimentalStructuredContent");
     command
 }

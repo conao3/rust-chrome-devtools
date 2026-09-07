@@ -791,7 +791,7 @@ fn daemon_starts_mcp_with_page_id_routing_and_hides_page_id_schema() {
     let mut env = TestEnv::new("pageidflag");
     env.start_daemon();
     let args = fs::read_to_string(env.home.join("fake-mcp-args")).unwrap();
-    assert!(args.contains("--experimentalPageIdRouting"), "args: {args}");
+    assert!(args.contains("--pageIdRouting"), "args: {args}");
 
     let (ok, output) = env.run_cli(&["mcp", "list", "--profile", "default"]);
     assert!(ok, "mcp list failed: {output}");

@@ -10,13 +10,13 @@ The next step is to let multiple sessions stay active on the same Chrome profile
 
 The checked package is `chrome-devtools-mcp` 1.5.0 under `~/.npm/_npx/15c61037b1978c83/node_modules/chrome-devtools-mcp/`.
 
-`build/src/bin/chrome-devtools-mcp-cli-options.js` defines `experimentalPageIdRouting`. The option description says it exposes `pageId` on page-scoped tools and routes requests by page ID.
+`build/src/bin/chrome-devtools-mcp-cli-options.js` defines `pageIdRouting`. The option description says it exposes `pageId` on page-scoped tools and routes requests by page ID.
 
-`build/src/ToolHandler.js` adds `pageId` to page-scoped tools when `experimentalPageIdRouting` is enabled. During a tool call, it resolves the target page with `context.getPageById(pageId)` instead of `context.getSelectedMcpPage()`.
+`build/src/ToolHandler.js` adds `pageId` to page-scoped tools when `pageIdRouting` is enabled. During a tool call, it resolves the target page with `context.getPageById(pageId)` instead of `context.getSelectedMcpPage()`.
 
-`build/src/tools/script.js` gives `evaluate_script` the same `pageId` path when `experimentalPageIdRouting` is enabled. That tool is defined outside `definePageTool`, so this separate path matters.
+`build/src/tools/script.js` gives `evaluate_script` the same `pageId` path when `pageIdRouting` is enabled. That tool is defined outside `definePageTool`, so this separate path matters.
 
-`tools/list` confirms the schema change. With `--experimentalPageIdRouting`, tools such as `click`, `fill`, `navigate_page`, `take_snapshot`, `take_screenshot`, `wait_for`, `list_console_messages`, and `list_network_requests` require `pageId`.
+`tools/list` confirms the schema change. With `--pageIdRouting`, tools such as `click`, `fill`, `navigate_page`, `take_snapshot`, `take_screenshot`, `wait_for`, `list_console_messages`, and `list_network_requests` require `pageId`.
 
 `build/src/McpContext.js` keeps one global `#selectedPage`. `newPage(background, isolatedContextName)` creates a Puppeteer page, refreshes the page snapshot, and calls `selectPage(newPage)`. `select_page` also mutates the same selected page.
 
@@ -28,7 +28,7 @@ The checked package is `chrome-devtools-mcp` 1.5.0 under `~/.npm/_npx/15c61037b1
 
 ## Direction
 
-Run the daemon-owned MCP process with `--experimentalPageIdRouting`.
+Run the daemon-owned MCP process with `--pageIdRouting`.
 
 ```text
 Agent A session=sess-a -> daemon router -> MCP tools/call pageId=1 -> Chrome tab 1
@@ -90,7 +90,7 @@ For each `tools/call` request, the router looks at `params.name`:
 | `close_page` | Close the caller session's page. A later policy may accept an explicit page id. |
 | Extension and profile-level tools | Run under an explicit policy because they target profile-level state. |
 
-The router should keep `tools/list` client-friendly. If the daemon starts MCP with `--experimentalPageIdRouting`, upstream `tools/list` marks `pageId` as required on many tools. The daemon should remove `pageId` from the schema it returns to clients and keep `pageId` injection as an internal detail.
+The router should keep `tools/list` client-friendly. If the daemon starts MCP with `--pageIdRouting`, upstream `tools/list` marks `pageId` as required on many tools. The daemon should remove `pageId` from the schema it returns to clients and keep `pageId` injection as an internal detail.
 
 ## UID namespace
 
@@ -175,7 +175,7 @@ The existing `session_list` line can append `page=<id>` and `url=<url>` once pag
 
 ### Phase 1: MCP page id routing
 
-Start MCP with `--experimentalPageIdRouting`. Teach the router to rewrite `tools/list` schemas, inject `pageId`, and keep a session page id.
+Start MCP with `--pageIdRouting`. Teach the router to rewrite `tools/list` schemas, inject `pageId`, and keep a session page id.
 
 Acceptance checks:
 
