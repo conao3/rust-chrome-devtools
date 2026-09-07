@@ -78,6 +78,14 @@ After a successful `bind`, the daemon stays in JSON-RPC forwarding mode on that 
 
 Control commands use independent daemon client connections and only take the session registry mutex. They respond while clients are bound. MCP forwarding goes through a single router that owns the MCP stdin/stdout pair, rewrites each client JSON-RPC id to a daemon-local numeric id, restores the original id in the response, injects the session page id for page-scoped tools, and rewrites snapshot uids to session uid tokens. The daemon records slow control and forward latency diagnostics and exposes recent maxima in `daemon status`. A per-request MCP timeout returns an error to the client, then the router probes MCP with a short request. Probe success keeps sessions alive. Probe failure, MCP process exit, or Chrome DevTools endpoint failure respawns MCP, clears in-memory sessions, closes daemon-created pages that remain visible through the new MCP runtime, and records the event in daemon health.
 
+## JavaScript dialogs
+
+When the daemon assigns a tab to a session it also opens a second CDP connection to that tab, enables `Page`, and keeps a thread reading events. A `Page.javascriptDialogOpening` event is answered right away with `Page.handleJavaScriptDialog`: accepted for `alert` and `beforeunload`, dismissed for `confirm` and `prompt`. Each decision is logged as `dialog_handled`.
+
+The connection has to exist before the dialog opens. Chrome's PageHandler keeps a pending dialog per client, so a connection that was not subscribed at that moment gets `-32602 No dialog is showing` and cannot close it. That is why a daemon-native `handle_dialog` tool on its own does not work, and why the watcher is tied to the tab's lifetime instead.
+
+The watcher is dropped when the session moves to another tab, when the page is cleared, and when the session is removed. Failing to attach is logged as `dialog_watch_failed` and does not fail the tool call that triggered the assignment.
+
 ## Future direction
 
 - Lock modes (`read`, `write`, `exclusive`) and origin-scoped locking for mutating operations.

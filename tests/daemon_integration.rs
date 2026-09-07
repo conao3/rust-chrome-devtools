@@ -338,7 +338,9 @@ fn spawn_fake_devtools() -> FakeDevTools {
                 let _ = stream.write_all(
                     b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: fake\r\n\r\n",
                 );
-                handle_fake_cdp(stream);
+                // ダイアログ watcher が tab ごとに常設接続を張るので、1 本の接続で
+                // accept ループを塞ぐと後続の /json が読めなくなる。
+                thread::spawn(move || handle_fake_cdp(stream));
             } else {
                 let _ = stream.write_all(
                     b"HTTP/1.1 200 OK\r\nContent-Length: 18\r\nConnection: close\r\n\r\n{\"Browser\":\"fake\"}",
@@ -378,6 +380,18 @@ fn handle_fake_cdp(mut stream: TcpStream) {
                 "id": id,
                 "result": {}
             }),
+            "Runtime.evaluate" if value["params"]["returnByValue"] == serde_json::json!(false) => {
+                // 要素を掴む評価。実 Chrome は remote object を返し、呼び出し側は
+                // objectId を DOM.setFileInputFiles に渡す。
+                serde_json::json!({
+                    "id": id,
+                    "result": {
+                        "result": {
+                            "objectId": "fake-object-1"
+                        }
+                    }
+                })
+            }
             "Runtime.evaluate" => {
                 let expression = value["params"]["expression"].as_str().unwrap_or("");
                 let result_value = if expression.contains("getBoundingClientRect") {

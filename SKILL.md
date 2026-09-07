@@ -49,6 +49,8 @@ Each session is pinned to the CDP target id of its tab. Navigation changes the U
 - `set_file_input {selector, filePaths}` — attach files to the `input[type=file]` matched by the selector via `DOM.setFileInputFiles`. Prefer it over `upload_file` when a page has several file inputs (a cover letter field and a resume field, say) or when no visible button opens a chooser. Works on large-DOM pages such as an open Gmail thread. Paths must be absolute and under `$HOME` or the OS temp directory.
 - `print_pdf_quiet {filePath, landscape?, printBackground?, scale?}` — save the session page as a PDF through `Page.printToPDF`. `printBackground` defaults to true, `scale` is clamped to 0.1-2.0. `filePath` must be absolute and under `$HOME` or the OS temp directory.
 - `close_page_quiet {}` — close the session's own tab through the DevTools HTTP endpoint. Use it to recover when a JavaScript dialog or a tool that never returns is holding the MCP tool mutex, which is exactly when the MCP `close_page` cannot get through. The session gets a fresh tab on its next call.
+
+The daemon watches each session's tab for JavaScript dialogs and closes them on its own: `alert` and `beforeunload` are accepted, `confirm` and `prompt` are dismissed. Look for `dialog_handled` in the daemon log. A dialog left open holds the MCP tool mutex, so this keeps a page's `confirm()` from stalling every session on the profile.
 - `type_into {selector, text, clear?}` — focus the matched element and insert the text with `Input.insertText`. Use it when `evaluate_script` with a native value setter plus an `input` event leaves the framework state unchanged. `clear: true` selects all and deletes first.
 
 ## Profile Setup

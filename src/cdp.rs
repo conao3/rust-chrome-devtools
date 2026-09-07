@@ -63,6 +63,119 @@ fn connect_page_client(port: u16, page: PageRef<'_>) -> Result<CdpClient, String
     CdpClient::connect(port, &target.websocket_path)
 }
 
+/// JavaScript ダイアログを開いた種類ごとにどう閉じるかを決める。
+///
+/// `beforeunload` は agent が遷移を意図して出しているので通す。`alert` は閉じる以外の
+/// 選択肢が無い。`confirm` / `prompt` はページの状態を変えうるので、承諾せずに閉じる。
+pub(crate) fn dialog_accepts(dialog_type: &str) -> bool {
+    matches!(dialog_type, "beforeunload" | "alert")
+}
+
+/// session の tab に張り付いて JavaScript ダイアログを閉じ続ける常設接続。
+///
+/// ページに alert / confirm / prompt / beforeunload が開くと puppeteer の tool 実行が
+/// 返らず、MCP の toolMutex が塞がって後続の request が全部待たされる。Chrome の
+/// PageHandler は pending なダイアログをクライアントごとに持つため、開いてから接続した
+/// クライアントが `Page.handleJavaScriptDialog` を送っても `No dialog is showing` になる。
+/// ダイアログが開く前から `Page.enable` した接続を保っておく必要がある。
+pub(crate) struct DialogWatcher {
+    target_id: String,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl DialogWatcher {
+    /// tab に接続してイベント購読スレッドを起こす。接続や `Page.enable` に失敗したら
+    /// 呼び出し側の処理は続けたいので、エラーは返すだけで daemon は止めない。
+    pub(crate) fn spawn(port: u16, target_id: &str, session_id: &str) -> Result<Self, String> {
+        let targets = list_page_targets(port)?;
+        let target = targets
+            .iter()
+            .find(|target| target.id == target_id)
+            .ok_or_else(|| format!("page target {target_id} is gone"))?;
+        let mut client = CdpClient::connect(port, &target.websocket_path)?;
+        client.call(serde_json::json!({ "method": "Page.enable" }))?;
+        client.set_read_timeout(Duration::from_millis(500))?;
+
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_thread = std::sync::Arc::clone(&stop);
+        let session = session_id.to_string();
+        let watched = target_id.to_string();
+        thread::Builder::new()
+            .name(format!("dialog-watch-{session_id}"))
+            .spawn(move || watch_dialogs(client, stop_thread, &session, &watched))
+            .map_err(|error| format!("failed to start the dialog watcher: {error}"))?;
+        Ok(Self {
+            target_id: target_id.to_string(),
+            stop,
+        })
+    }
+
+    pub(crate) fn target_id(&self) -> &str {
+        &self.target_id
+    }
+}
+
+impl Drop for DialogWatcher {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+impl std::fmt::Debug for DialogWatcher {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DialogWatcher")
+            .field("target_id", &self.target_id)
+            .finish()
+    }
+}
+
+fn watch_dialogs(
+    mut client: CdpClient,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    session_id: &str,
+    target_id: &str,
+) {
+    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+        let frame = match read_ws_text_deadline(&mut client.stream) {
+            Ok(Some(frame)) => frame,
+            Ok(None) => continue,
+            Err(error) => {
+                eprintln!(
+                    "dialog_watch_stopped session={session_id} target={target_id} reason={error}"
+                );
+                return;
+            }
+        };
+        let Ok(value) = parse_cdp_value(&frame, "CDP event") else {
+            continue;
+        };
+        if value.get("method").and_then(|method| method.as_str())
+            != Some("Page.javascriptDialogOpening")
+        {
+            continue;
+        }
+        let params = value.get("params");
+        let dialog_type = params
+            .and_then(|params| params.get("type"))
+            .and_then(|dialog_type| dialog_type.as_str())
+            .unwrap_or("unknown");
+        let accept = dialog_accepts(dialog_type);
+        let outcome = client.call(serde_json::json!({
+            "method": "Page.handleJavaScriptDialog",
+            "params": { "accept": accept }
+        }));
+        match outcome {
+            Ok(_) => eprintln!(
+                "dialog_handled session={session_id} target={target_id} type={dialog_type} accept={accept}"
+            ),
+            Err(error) => eprintln!(
+                "dialog_handle_failed session={session_id} target={target_id} type={dialog_type} error={error}"
+            ),
+        }
+    }
+}
+
 /// session が所有する tab を閉じる。MCP の `close_page` は toolMutex の後ろに並ぶので、
 /// ダイアログや重い tool で MCP が詰まっている間は届かない。DevTools の HTTP endpoint を
 /// 直接叩くこの経路なら詰まった状態でも閉じられ、閉じた時点で MCP が回復する。
@@ -910,6 +1023,28 @@ fn read_ws_text(stream: &mut TcpStream) -> Result<String, String> {
     stream
         .read_exact(&mut head)
         .map_err(|error| format!("failed to read CDP WebSocket frame: {error}"))?;
+    read_ws_text_body(stream, head)
+}
+
+/// 読み取り待ちで期限が来たら `Ok(None)` を返す。イベント購読ループが停止フラグを
+/// 見に戻れるようにするための入口で、フレームの途中で切れることはない。
+fn read_ws_text_deadline(stream: &mut TcpStream) -> Result<Option<String>, String> {
+    let mut head = [0_u8; 2];
+    match stream.read_exact(&mut head) {
+        Ok(()) => read_ws_text_body(stream, head).map(Some),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ) =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(format!("failed to read CDP WebSocket frame: {error}")),
+    }
+}
+
+fn read_ws_text_body(stream: &mut TcpStream, head: [u8; 2]) -> Result<String, String> {
     let opcode = head[0] & 0x0f;
     let masked = head[1] & 0x80 != 0;
     let mut len = (head[1] & 0x7f) as u64;

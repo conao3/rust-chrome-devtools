@@ -310,6 +310,7 @@ fn format_session_line_renders_all_fields() {
         page_created_by_daemon: true,
         page_url: Some("about:blank".to_string()),
         target_id: Some("TARGET1".to_string()),
+        dialog_watcher: None,
         snapshot_epoch: 0,
         uid_bindings: std::collections::HashMap::new(),
     };
@@ -413,6 +414,28 @@ fn parse_cdp_value_reports_what_failed() {
         error.starts_with("failed to parse CDP response: "),
         "{error}"
     );
+}
+
+#[test]
+fn dialog_accepts_only_navigation_and_alerts() {
+    // beforeunload は agent が遷移を意図して出しているので通す。alert は閉じる以外に
+    // 選択肢が無い。confirm / prompt はページの状態を変えうるので承諾しない。
+    assert!(crate::cdp::dialog_accepts("beforeunload"));
+    assert!(crate::cdp::dialog_accepts("alert"));
+    assert!(!crate::cdp::dialog_accepts("confirm"));
+    assert!(!crate::cdp::dialog_accepts("prompt"));
+    assert!(!crate::cdp::dialog_accepts("unknown"));
+}
+
+#[test]
+fn session_without_a_watcher_reports_no_dialog_watch() {
+    let mut registry = crate::router::SessionRegistry::default();
+    let session = registry.create();
+
+    registry.set_target_id(&session.id, Some("TAB-A".to_string()));
+
+    assert!(!registry.watches_dialogs(&session.id, "TAB-A"));
+    assert!(!registry.watches_dialogs(&session.id, "TAB-B"));
 }
 
 #[test]

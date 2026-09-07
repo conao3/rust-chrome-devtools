@@ -171,6 +171,9 @@ pub(crate) struct SessionState {
     /// CDP の target id。タブの寿命の間ずっと変わらないので、daemon-native tool は
     /// URL ではなくこれで接続先を決める (URL は遷移で変わり、他タブと衝突する)。
     pub(crate) target_id: Option<String>,
+    /// tab に張り付いて JavaScript ダイアログを閉じる常設 CDP 接続。session が消えるか
+    /// tab が変わると Drop で止まる。
+    pub(crate) dialog_watcher: Option<Arc<cdp::DialogWatcher>>,
     pub(crate) snapshot_epoch: u64,
     pub(crate) uid_bindings: HashMap<String, UidBinding>,
 }
@@ -193,6 +196,7 @@ impl SessionRegistry {
             page_created_by_daemon: false,
             page_url: None,
             target_id: None,
+            dialog_watcher: None,
             snapshot_epoch: 0,
             uid_bindings: HashMap::new(),
         };
@@ -289,6 +293,7 @@ impl SessionRegistry {
             session.uid_bindings.clear();
             // 別ページに移ったら target id は無効。次の native call で解決し直す。
             session.target_id = None;
+            session.dialog_watcher = None;
         }
         session.page_id = Some(page_id);
         session.page_created_by_daemon = page_created_by_daemon;
@@ -299,8 +304,26 @@ impl SessionRegistry {
 
     pub(crate) fn set_target_id(&mut self, id: &str, target_id: Option<String>) {
         if let Some(session) = self.sessions.get_mut(id) {
+            if session.target_id.as_deref() != target_id.as_deref() {
+                session.dialog_watcher = None;
+            }
             session.target_id = target_id;
         }
+    }
+
+    /// tab を watch する接続を session に持たせる。既に同じ tab を見ているものがあれば
+    /// そのまま残し、接続を張り直さない。
+    pub(crate) fn set_dialog_watcher(&mut self, id: &str, watcher: Arc<cdp::DialogWatcher>) {
+        if let Some(session) = self.sessions.get_mut(id) {
+            session.dialog_watcher = Some(watcher);
+        }
+    }
+
+    pub(crate) fn watches_dialogs(&self, id: &str, target_id: &str) -> bool {
+        self.sessions
+            .get(id)
+            .and_then(|session| session.dialog_watcher.as_ref())
+            .is_some_and(|watcher| watcher.target_id() == target_id)
     }
 
     pub(crate) fn clear_page(&mut self, id: &str) {
@@ -309,6 +332,7 @@ impl SessionRegistry {
             session.page_created_by_daemon = false;
             session.page_url = None;
             session.target_id = None;
+            session.dialog_watcher = None;
             session.snapshot_epoch = session.snapshot_epoch.wrapping_add(1);
             session.uid_bindings.clear();
             session.last_used_at = SystemTime::now();
@@ -1353,13 +1377,43 @@ fn ensure_session_page(
         // 同時に複数タブが増えたら、どれが自分のものか決められない。
         added.next().is_none().then_some(first)
     });
-    let (lock, _) = &**sessions;
-    let mut registry = lock
-        .lock()
-        .map_err(|_| "session registry poisoned".to_string())?;
-    registry.set_page(session_id, page_id, true, Some("about:blank".to_string()))?;
-    registry.set_target_id(session_id, target_id);
+    {
+        let (lock, _) = &**sessions;
+        let mut registry = lock
+            .lock()
+            .map_err(|_| "session registry poisoned".to_string())?;
+        registry.set_page(session_id, page_id, true, Some("about:blank".to_string()))?;
+        registry.set_target_id(session_id, target_id.clone());
+    }
+    if let (Some(port), Some(target_id)) = (port, target_id.as_deref()) {
+        attach_dialog_watcher(sessions, session_id, port, target_id);
+    }
     Ok(page_id)
+}
+
+/// tab に JavaScript ダイアログの watcher を張る。張れなくても tool の実行は続けたいので、
+/// 失敗は daemon log に残すだけにする。
+fn attach_dialog_watcher(sessions: &SharedSessions, session_id: &str, port: u16, target_id: &str) {
+    {
+        let (lock, _) = &**sessions;
+        let Ok(registry) = lock.lock() else {
+            return;
+        };
+        if registry.watches_dialogs(session_id, target_id) {
+            return;
+        }
+    }
+    match cdp::DialogWatcher::spawn(port, target_id, session_id) {
+        Ok(watcher) => {
+            let (lock, _) = &**sessions;
+            if let Ok(mut registry) = lock.lock() {
+                registry.set_dialog_watcher(session_id, Arc::new(watcher));
+            }
+        }
+        Err(error) => {
+            eprintln!("dialog_watch_failed session={session_id} target={target_id} error={error}")
+        }
+    }
 }
 
 fn session_page(sessions: &SharedSessions, session_id: &str) -> Option<u64> {
@@ -1890,6 +1944,9 @@ pub(crate) fn try_native_tool(
                 target_id = Some(resolved);
             }
         }
+    }
+    if let (Some(port), Some(target_id)) = (current_port(profile), target_id.as_deref()) {
+        attach_dialog_watcher(sessions, session_id, port, target_id);
     }
     let page = cdp::PageRef::new(target_id.as_deref(), page_url.as_deref());
     Some(

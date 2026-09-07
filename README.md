@@ -83,6 +83,14 @@ Besides forwarding the chrome-devtools-mcp tool set, the daemon implements ten t
 - `set_file_input {selector, filePaths}`: attach files to the `input[type=file]` matched by a selector through `DOM.setFileInputFiles`. No snapshot and no file chooser, so it picks the exact input on pages that have several and never crosses into another session's page. The element is resolved through `Runtime.evaluate`, so it works on pages with a large DOM (Gmail, for one). Paths must be absolute and under `$HOME` or the OS temp directory.
 - `print_pdf_quiet {filePath, landscape?, printBackground?, scale?}`: save the session page as a PDF with `Page.printToPDF`, without foregrounding the tab. Use it to keep invoices, receipts and emails as they were rendered. Same path rules as `screenshot_quiet`.
 - `close_page_quiet {}`: close the session's own tab through the DevTools HTTP endpoint. `close_page` queues behind the MCP tool mutex, so it cannot reach a tab that is holding the mutex open (a JavaScript dialog, a tool that never returns). Closing that tab releases the mutex, and the session picks up a fresh tab on its next call.
+
+## JavaScript dialogs
+
+A session's tab is watched for JavaScript dialogs from the moment the daemon assigns it. `alert` and `beforeunload` are accepted, `confirm` and `prompt` are dismissed, and each one is logged as `dialog_handled session=... target=... type=... accept=...`.
+
+This runs on a CDP connection the daemon keeps open for the tab, because Chrome tracks a pending dialog per client: a connection that was not listening when the dialog opened gets `No dialog is showing` and cannot close it. Without the watcher, an open dialog holds the MCP tool mutex and every later request on the profile waits behind it.
+
+If the watcher cannot attach, the daemon logs `dialog_watch_failed` and carries on; recover a stuck tab with `close_page_quiet`.
 - `type_into {selector, text, clear?}`: focus the matched element and insert text with `Input.insertText`. Use it when a native value setter plus an `input` event does not reach framework state (some React-based forms).
 
 Each session is pinned to the CDP target id of its tab, which stays the same for the life of that tab. Navigation changes the URL but not the target, and daemon-native tools never fall back to another tab: if the session's tab is gone they fail with `session page target <id> is gone` instead of acting on somebody else's page. This matters when several agents share one Chrome profile.
