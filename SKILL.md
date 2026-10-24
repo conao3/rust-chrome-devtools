@@ -40,7 +40,7 @@ The daemon adds ten tools of its own on top of the MCP tool set (they appear in 
 
 Each session is pinned to the CDP target id of its tab. Navigation, redirects, hash changes and SPA route changes alter the URL but not the target, and tabs that share a URL are told apart, because `new_page` and `select_page` pin the tab's target id when the session takes it. These tools never fall back to another tab: when the session's tab is gone they fail with `session page target <id> is gone; create a new session`, and a page that cannot be pinned fails with `could not tell which tab is the session page` (run `select_page` again or create a new session). Several agents can therefore drive one Chrome profile at the same time without stealing each other's tabs.
 
-- `goto {url, waitSelector?, waitExpression?, timeout?, interval?}` — navigate the session page without foregrounding Chrome, then wait in the same tool call. `waitSelector` and `waitExpression` are mutually exclusive; without either it waits for `document.readyState === 'complete'`.
+- `goto {url, waitSelector?, waitExpression?, timeout?, interval?}` — navigate the session page without foregrounding Chrome, then wait in the same tool call. `waitSelector` and `waitExpression` are mutually exclusive; without either it waits for `document.readyState === 'complete'`. When the condition is not met in time, the error carries the current URL, title, `readyState` and what the condition evaluated to (`wait_for_js` reports the same).
 - `screenshot_quiet {filePath, format?, quality?}` — save a visible-viewport screenshot directly through CDP without selecting the page or entering the MCP queue. Use this for Slack/image viewers. `filePath` must be absolute and under `$HOME` or the OS temp directory.
 - `wait_for_js {expression | selector, timeout?, interval?}` — poll a JS expression (or CSS selector) until truthy. Use instead of fixed `sleep_ms` waits for SPA rendering. Defaults: timeout 30000ms (max 120000), interval 500ms. A throwing/invalid expression fails immediately rather than polling.
 - `click_selector {selector}` — scroll the first matching element into view and click its center. Inside iframes the click point is translated to the top frame's viewport.
@@ -109,6 +109,8 @@ Sessions are in-memory on the daemon. They are dropped after 30 minutes of inact
 - Tool call: `{ "type": "tool", "name": "<mcp-tool>", "args": { ... }, "label": "<optional>", "on_error": "continue|stop" }`
 - Sleep: `{ "type": "sleep_ms", "ms": <u64>, "label": "<optional>" }`
 
+The script is validated before anything runs: a `tool` step named `sleep_ms` / `sleep` / `wait` (the pause is the `sleep_ms` step type, not a tool) or a step without `type` fails the whole batch with the list of step types, and no step executes.
+
 `label` is preserved verbatim in the output, which makes it easy to grep / jq for specific step results.
 
 ### Value references inside args
@@ -117,7 +119,7 @@ Replace any `args` value with `{ "$ref": "<label>.<path>" }` to substitute it wi
 
 ### Error handling
 
-A tool step is considered to have errored if the MCP response carries a non-null `error` field or the result has `isError: true`. By default, the scenario records the error and continues; pass `--fail-fast` (or `"on_error": "stop"` on a step) to abort. The runner still emits the partial results array and exits non-zero on aborts.
+A tool step is considered to have errored if the MCP response carries a non-null `error` field or the result has `isError: true`, except when the error is `Execution context was destroyed` (a click or script that navigated the page): that step is recorded as `"navigated": true` with `error: null` and `result.isError: false`, so the batch continues and the step must not be retried. By default, the scenario records the error and continues; pass `--fail-fast` (or `"on_error": "stop"` on a step) to abort. The runner still emits the partial results array and exits non-zero on aborts.
 
 When the batch fails before any step runs (e.g. `unknown session`), stdout still receives a JSON array of the shape `[{"type":"error","error":"..."}]`, so piping into `jq` keeps working; check the exit code to detect failure.
 
@@ -225,6 +227,8 @@ Stop the profile daemon (refused while sessions are active; `--force` overrides)
 chrome-devtools daemon stop --profile conao3
 ```
 
+List the tools with `mcp list`; `mcp direct-list` does the same through the running daemon (and says so) because the daemon holds the profile lock.
+
 Bypass the daemon only for manual fallback debugging (cannot preserve snapshot uids across separate invocations, ignores sessions):
 
 ```sh
@@ -240,7 +244,7 @@ chrome-devtools profile stop --profile conao3
 ## Troubleshooting
 
 - If `mcp call` or `mcp batch` exits with `unknown session`, the session expired (30 min idle) or the daemon restarted. Mint a new id via `session create` and retry.
-- If `mcp call` or `mcp batch` exits with `session in use`, another invocation is currently bound to that id. Wait for it to finish or mint a separate session for the new agent.
+- If `mcp call` or `mcp batch` exits with `session in use: <id> (held by pid <pid> for <n>s)`, another invocation is currently bound to that id; the pid is the holding `chrome-devtools` process (`session list` shows it as `owner_pid`). Wait for it to finish or mint a separate session for the new agent.
 - File-writing tool arguments (`take_screenshot` `filePath` etc.) accept paths under your home directory and the OS tempdir.
 - `upload_file` falls back to Chrome DevTools Protocol when MCP cannot trigger the file chooser; check daemon logs for `upload_file_fallback` or `upload_file_fallback_failed`.
 - If the CLI warns about a daemon version mismatch, the daemon predates the installed CLI. Behavior fixes in the daemon only apply after it restarts; `daemon stop` (without `--force`) is safe once `sessions=0`.

@@ -106,6 +106,13 @@ pub(crate) fn run() -> Result<(), String> {
                 return Ok(());
             }
             let profile = require_profile(&config, &rest)?;
+            if is_daemon_ready(&profile)? {
+                eprintln!(
+                    "note: the daemon for profile {} holds the profile lock, so the tools are listed through the daemon (same as `mcp list`)",
+                    profile.name
+                );
+                return list_mcp_tools_via_daemon(&profile);
+            }
             let _lock = acquire_profile_lock(&profile)?;
             ensure_chrome(&profile)?;
             list_mcp_tools(&profile)
@@ -570,6 +577,7 @@ pub(crate) fn print_mcp_batch_help() {
             "Result shape (per step):",
             &[
                 "{\"type\":\"tool\",\"name\":\"...\",\"label\":\"...\",\"result\":<mcp tools/call result>,\"error\":<mcp error or null>}",
+                "A step whose page navigated (error 'Execution context was destroyed') adds \"navigated\":true and has error null.",
                 "{\"type\":\"sleep_ms\",\"ms\":<u64>,\"label\":\"...\"}",
             ],
         )
@@ -577,7 +585,8 @@ pub(crate) fn print_mcp_batch_help() {
             "Error handling:",
             &[
                 "A tool step is considered to have errored if the MCP response carries a",
-                "non-null 'error' field or the result has isError=true. By default the",
+                "non-null 'error' field or the result has isError=true (a navigated step is",
+                "not an error). By default the",
                 "batch continues; pass --fail-fast or set on_error=stop on a step to",
                 "stop execution after that error. When stopped, batch writes the partial",
                 "results to stdout/--output and exits non-zero.",
@@ -676,7 +685,14 @@ pub(crate) fn print_mcp_direct_list_help() {
                 "-h, --help        Show this help and exit.",
             ],
         )
-        .section("Notes:", &["Acquires a per-profile lock under ~/.cache/chrome-devtools/locks."])
+        .section(
+            "Notes:",
+            &[
+                "Acquires a per-profile lock under ~/.cache/chrome-devtools/locks.",
+                "While the profile daemon is running it holds that lock, so direct-list lists the",
+                "tools through the daemon instead (same output as `mcp list`).",
+            ],
+        )
         .print_stdout();
 }
 
@@ -888,7 +904,7 @@ pub(crate) fn print_session_list_help() {
                 "List active sessions held by the profile daemon. Each session is printed",
                 "on one line as:",
                 "",
-                "  session=<id> created=<unix-ts> last_used=<unix-ts> owned=<true|false> page=<id>",
+                "  session=<id> created=<unix-ts> last_used=<unix-ts> owned=<true|false> owner_pid=<pid or empty> page=<id>",
                 "",
                 "Prints nothing when the daemon is not running.",
             ],

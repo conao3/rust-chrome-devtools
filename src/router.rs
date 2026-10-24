@@ -165,6 +165,8 @@ pub(crate) struct SessionState {
     pub(crate) created_at: SystemTime,
     pub(crate) last_used_at: SystemTime,
     pub(crate) owned: bool,
+    pub(crate) owner_pid: Option<u32>,
+    pub(crate) owned_since: Option<SystemTime>,
     pub(crate) page_id: Option<u64>,
     pub(crate) page_created_by_daemon: bool,
     pub(crate) page_url: Option<String>,
@@ -192,6 +194,8 @@ impl SessionRegistry {
             created_at: now,
             last_used_at: now,
             owned: false,
+            owner_pid: None,
+            owned_since: None,
             page_id: None,
             page_created_by_daemon: false,
             page_url: None,
@@ -215,7 +219,7 @@ impl SessionRegistry {
             return Err(format!("unknown session: {id}"));
         };
         if session.owned {
-            return Err(format!("session in use: {id}"));
+            return Err(session_in_use_message(session));
         }
         let session = self
             .sessions
@@ -225,22 +229,27 @@ impl SessionRegistry {
         Ok(page_cleanup_for_session(session))
     }
 
-    pub(crate) fn bind(&mut self, id: &str) -> Result<(), String> {
+    pub(crate) fn bind(&mut self, id: &str, owner_pid: Option<u32>) -> Result<(), String> {
         let session = self
             .sessions
             .get_mut(id)
             .ok_or_else(|| format!("unknown session: {id}"))?;
         if session.owned {
-            return Err(format!("session in use: {id}"));
+            return Err(session_in_use_message(session));
         }
+        let now = SystemTime::now();
         session.owned = true;
-        session.last_used_at = SystemTime::now();
+        session.owner_pid = owner_pid;
+        session.owned_since = Some(now);
+        session.last_used_at = now;
         Ok(())
     }
 
     pub(crate) fn unbind(&mut self, id: &str) {
         if let Some(session) = self.sessions.get_mut(id) {
             session.owned = false;
+            session.owner_pid = None;
+            session.owned_since = None;
             session.last_used_at = SystemTime::now();
         }
     }
@@ -418,6 +427,19 @@ impl SessionRegistry {
         }
         Ok(binding.raw_uid.clone())
     }
+}
+
+fn session_in_use_message(session: &SessionState) -> String {
+    let holder = session
+        .owner_pid
+        .map(|pid| format!("pid {pid}"))
+        .unwrap_or_else(|| "an unknown client".to_string());
+    let held = session
+        .owned_since
+        .and_then(|since| SystemTime::now().duration_since(since).ok())
+        .map(|elapsed| format!(" for {}s", elapsed.as_secs()))
+        .unwrap_or_default();
+    format!("session in use: {} (held by {holder}{held})", session.id)
 }
 
 fn page_cleanup_for_session(session: SessionState) -> Option<PageCleanup> {
@@ -3184,7 +3206,7 @@ pub(crate) fn handle_control_command(
         }
         "bind" => {
             let id = parse_session_arg(rest).map_err(DaemonError::Client)?;
-            let result = bind_session_in_registry(sessions, &id);
+            let result = bind_session_in_registry(sessions, &id, parse_pid_arg(rest));
             match result {
                 Ok(()) => {
                     bound.mark_bound(id.clone());
@@ -3212,12 +3234,16 @@ pub(crate) fn lock_sessions<'a>(
         .map_err(|_| DaemonError::Fatal("session registry poisoned".to_string()))
 }
 
-pub(crate) fn bind_session_in_registry(sessions: &SharedSessions, id: &str) -> Result<(), String> {
+pub(crate) fn bind_session_in_registry(
+    sessions: &SharedSessions,
+    id: &str,
+    owner_pid: Option<u32>,
+) -> Result<(), String> {
     let (lock, _) = &**sessions;
     let mut registry = lock
         .lock()
         .map_err(|_| "session registry poisoned".to_string())?;
-    registry.bind(id)
+    registry.bind(id, owner_pid)
 }
 
 pub(crate) fn write_control_line(stream: &mut UnixStream, body: &str) -> Result<(), DaemonError> {
@@ -3236,11 +3262,15 @@ pub(crate) fn format_session_line(state: &SessionState) -> String {
     let page_url = state.page_url.as_deref().unwrap_or("");
     let target_id = state.target_id.as_deref().unwrap_or("");
     format!(
-        "session={} created={} last_used={} owned={} page={} page_created_by_daemon={} page_url={} target_id={} snapshot_epoch={}",
+        "session={} created={} last_used={} owned={} owner_pid={} page={} page_created_by_daemon={} page_url={} target_id={} snapshot_epoch={}",
         state.id,
         unix_secs(state.created_at),
         unix_secs(state.last_used_at),
         state.owned,
+        state
+            .owner_pid
+            .map(|pid| pid.to_string())
+            .unwrap_or_default(),
         page,
         state.page_created_by_daemon,
         page_url,
@@ -3259,6 +3289,12 @@ pub(crate) fn parse_session_arg(args: &str) -> Result<String, String> {
         }
     }
     Err("missing session=<id> argument".to_string())
+}
+
+pub(crate) fn parse_pid_arg(args: &str) -> Option<u32> {
+    args.split_whitespace()
+        .find_map(|part| part.strip_prefix("pid="))
+        .and_then(|value| value.parse::<u32>().ok())
 }
 
 pub(crate) fn parse_page_arg(args: &str) -> Result<u64, String> {

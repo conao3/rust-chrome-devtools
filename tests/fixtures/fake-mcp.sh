@@ -189,6 +189,8 @@ while IFS= read -r line; do
           page_id=$(field_number "$line" pageId)
           [ -z "$page_id" ] && page_id="$selected_page"
           tool_response "$id" "snapshot page=$page_id uid=${page_id}_button uid=${page_id}_after" "{}" ;;
+        navigating_click)
+          error_response "$id" "Execution context was destroyed, most likely because of a navigation." ;;
         upload_file)
           error_response "$id" "could not accept the file directly, and clicking it did not trigger a file chooser" ;;
         click)

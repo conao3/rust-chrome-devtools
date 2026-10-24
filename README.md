@@ -74,7 +74,7 @@ Chrome is always launched with `--disable-features=PasswordLeakDetection`: the n
 
 Besides forwarding the chrome-devtools-mcp tool set, the daemon implements ten tools of its own directly over CDP (they are listed in `tools/list` and called like any MCP tool). They run on the session's page without the MCP process, so they keep working while a heavy MCP tool is in flight and never trigger an accessibility snapshot:
 
-- `goto {url, waitSelector?, waitExpression?, timeout?, interval?}`: navigate the session page without foregrounding Chrome and wait in the same call. With no explicit wait condition it waits for `document.readyState === 'complete'`.
+- `goto {url, waitSelector?, waitExpression?, timeout?, interval?}`: navigate the session page without foregrounding Chrome and wait in the same call. With no explicit wait condition it waits for `document.readyState === 'complete'`. A wait that times out reports the current URL, title, `readyState` and the condition's value.
 - `screenshot_quiet {filePath, format?, quality?}`: capture the visible viewport directly with `Page.captureScreenshot`, bypassing the MCP queue and leaving the user's active tab alone. `filePath` must be absolute and under `$HOME` or the OS temp directory.
 - `wait_for_js {expression | selector, timeout?, interval?}`: poll a JS expression (or CSS selector) until truthy — replaces fixed sleeps for SPA waits.
 - `click_selector {selector}`: scroll the first match into view and click its center. Inside iframes the click point is translated to the top frame's viewport.
@@ -139,7 +139,7 @@ chrome-devtools profile stop --profile default
 
 Inside `args`, replace any value with `{"$ref":"<label>.<path>"}` to substitute it with a previous step's result. `<path>` is dot-separated; numeric segments index arrays. For example, `{"$ref":"snap.result.content.0.text"}` resolves to the text of the first content entry of the result whose `label` was `snap`.
 
-By default a tool step that returns an error (non-null `error` field or `isError: true`) is recorded and the batch continues. Pass `--fail-fast` (or `"on_error": "stop"` on a step) to abort on the first error; partial results are still written and `chrome-devtools` exits non-zero.
+By default a tool step that returns an error (non-null `error` field or `isError: true`) is recorded and the batch continues. An `Execution context was destroyed` error (the step navigated the page) is recorded as `"navigated": true` with `error: null` and `result.isError: false` instead. The script is validated before the first step runs, so a `tool` step named `sleep_ms`, `sleep` or `wait`, or a step without `type`, fails the batch up front with the list of step types. Pass `--fail-fast` (or `"on_error": "stop"` on a step) to abort on the first error; partial results are still written and `chrome-devtools` exits non-zero.
 
 Use `--script -` to read the batch from stdin instead of a file, and `--output <path>` to write the JSON results to a file instead of stdout.
 
@@ -147,7 +147,7 @@ Important: daemon-routed `take_snapshot` result `uid` values use the form `u:<se
 
 `daemon start` starts one background broker for the profile. Daemon metadata lives under `~/.cache/chrome-devtools/daemons`. `daemon stop` asks the broker to stop and cleans up its socket/pid files.
 
-`mcp direct-call` and `mcp direct-list` bypass the daemon and run `chrome-devtools-mcp` directly. Use them only for fallback/manual debugging; they cannot preserve snapshot state across independent process invocations.
+`mcp direct-call` and `mcp direct-list` bypass the daemon and run `chrome-devtools-mcp` directly (while the profile daemon runs it holds the profile lock, so `direct-list` lists the tools through the daemon instead). Use them only for fallback/manual debugging; they cannot preserve snapshot state across independent process invocations.
 
 See [`docs/session-daemon-design.md`](docs/session-daemon-design.md) for the per-profile daemon/broker design and future session ownership direction.
 

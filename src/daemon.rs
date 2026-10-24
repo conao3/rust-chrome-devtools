@@ -411,7 +411,10 @@ pub(crate) fn bind_session(
 ) -> Result<(), String> {
     let timeout = bind_timeout();
     let _ = stream.set_read_timeout(Some(timeout));
-    let request = format!("__chrome_devtools_daemon__:bind session={session_id}\n");
+    let request = format!(
+        "__chrome_devtools_daemon__:bind session={session_id} pid={}\n",
+        std::process::id()
+    );
     stream
         .write_all(request.as_bytes())
         .and_then(|_| stream.flush())

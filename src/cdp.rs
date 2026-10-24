@@ -270,6 +270,39 @@ fn release_object(client: &mut CdpClient, object_id: &str) {
     }));
 }
 
+fn wait_diagnostics(client: &mut CdpClient, expression: &str) -> String {
+    let page = evaluate_value(
+        client,
+        "({ url: location.href, title: document.title, readyState: document.readyState })",
+    )
+    .ok()
+    .filter(|value| value.is_object());
+    let Some(page) = page else {
+        return String::new();
+    };
+    let field = |name: &str| {
+        page.get(name)
+            .and_then(|value| value.as_str())
+            .unwrap_or("unknown")
+            .to_string()
+    };
+    let condition = evaluate_value(
+        client,
+        &format!(
+            "(() => {{ try {{ const v = ({expression}); return v === undefined ? 'undefined' : JSON.stringify(v); }} catch (e) {{ return 'threw: ' + e; }} }})()"
+        ),
+    )
+    .ok()
+    .and_then(|value| value.as_str().map(str::to_string))
+    .unwrap_or_else(|| "unavailable".to_string());
+    format!(
+        " (current url: {}, title: {:?}, readyState: {}; condition evaluated to: {condition})",
+        field("url"),
+        field("title"),
+        field("readyState")
+    )
+}
+
 fn is_transient_navigation_error(error: &str) -> bool {
     [
         "Cannot find context with specified id",
@@ -323,16 +356,18 @@ pub(crate) fn goto(
             Err(error) => {
                 if started.elapsed() >= timeout {
                     return Err(format!(
-                        "goto timed out after {}ms while waiting for {wait_expression}: {error}",
-                        timeout.as_millis()
+                        "goto timed out after {}ms while waiting for {wait_expression}: {error}{}",
+                        timeout.as_millis(),
+                        wait_diagnostics(&mut client, wait_expression)
                     ));
                 }
             }
         }
         if started.elapsed() >= timeout {
             return Err(format!(
-                "goto timed out after {}ms while waiting for {wait_expression}",
-                timeout.as_millis()
+                "goto timed out after {}ms while waiting for {wait_expression}{}",
+                timeout.as_millis(),
+                wait_diagnostics(&mut client, wait_expression)
             ));
         }
         thread::sleep(interval);
@@ -535,8 +570,12 @@ pub(crate) fn wait_for_js(
             }
         }
         if started.elapsed() >= timeout {
+            let diagnostics = client
+                .as_mut()
+                .map(|client| wait_diagnostics(client, expression))
+                .unwrap_or_default();
             return Err(format!(
-                "wait_for_js timed out after {}ms: {expression}",
+                "wait_for_js timed out after {}ms: {expression}{diagnostics}",
                 timeout.as_millis()
             ));
         }

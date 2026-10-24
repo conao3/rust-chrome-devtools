@@ -17,8 +17,9 @@ pub(crate) struct BatchOptions {
     pub(crate) fail_fast: bool,
 }
 
-pub(crate) const STEP_SHAPE_HINT: &str =
-    r#"{"type":"tool","name":"<mcp-tool>","args":{...}} or {"type":"sleep_ms","ms":<u64>}"#;
+pub(crate) const STEP_SHAPE_HINT: &str = r#"one of the step types "tool" or "sleep_ms": {"type":"tool","name":"<mcp-tool>","args":{...}} or {"type":"sleep_ms","ms":<u64>}"#;
+
+const SLEEP_LIKE_TOOL_NAMES: [&str; 3] = ["sleep_ms", "sleep", "wait"];
 
 pub(crate) enum BatchOutcome {
     Completed,
@@ -62,6 +63,8 @@ pub(crate) fn execute_batch(
     let steps = steps_value
         .as_array()
         .ok_or_else(|| "script must be a JSON array of steps".to_string())?;
+
+    validate_steps(steps)?;
 
     ensure_daemon(&profile)?;
     let socket_path = daemon_socket_path(&profile)?;
@@ -152,15 +155,26 @@ pub(crate) fn execute_batch(
                     result_value.as_ref().and_then(|value| value.get("isError")),
                     Some(serde_json::Value::Bool(true))
                 );
-                let has_error =
-                    error_value.as_ref().is_some_and(|value| !value.is_null()) || is_error_result;
-                results.push(serde_json::json!({
+                let navigated = (is_error_result || error_value.is_some())
+                    && is_navigation_context_loss(result_value.as_ref(), error_value.as_ref());
+                let has_error = !navigated
+                    && (error_value.as_ref().is_some_and(|value| !value.is_null())
+                        || is_error_result);
+                let mut entry = serde_json::json!({
                     "type": "tool",
                     "name": name,
                     "label": label,
                     "result": result_value,
                     "error": error_value,
-                }));
+                });
+                if navigated {
+                    entry["navigated"] = serde_json::json!(true);
+                    entry["error"] = serde_json::Value::Null;
+                    if let Some(result) = entry["result"].as_object_mut() {
+                        result.insert("isError".to_string(), serde_json::json!(false));
+                    }
+                }
+                results.push(entry);
                 if has_error && on_error == "stop" {
                     stopped_on_error = Some(
                         label
@@ -190,6 +204,70 @@ pub(crate) fn execute_batch(
         Some(label) => Ok(BatchOutcome::StoppedOnError(label)),
         None => Ok(BatchOutcome::Completed),
     }
+}
+
+fn validate_steps(steps: &[serde_json::Value]) -> Result<(), String> {
+    for (index, step) in steps.iter().enumerate() {
+        let position = index + 1;
+        let Some(step_type) = step.get("type").and_then(|value| value.as_str()) else {
+            let keys = step
+                .as_object()
+                .map(|object| object.keys().cloned().collect::<Vec<_>>().join(", "))
+                .unwrap_or_else(|| "not an object".to_string());
+            return Err(format!(
+                "step {position} missing 'type' (found: {keys}): expected {STEP_SHAPE_HINT}"
+            ));
+        };
+        match step_type {
+            "sleep_ms" => {
+                if step.get("ms").and_then(|value| value.as_u64()).is_none() {
+                    return Err(format!(
+                        "step {position}: sleep_ms requires 'ms' (non-negative integer)"
+                    ));
+                }
+            }
+            "tool" => {
+                let Some(name) = step.get("name").and_then(|value| value.as_str()) else {
+                    return Err(format!(
+                        "step {position}: tool step requires 'name' (the MCP tool name, e.g. take_snapshot)"
+                    ));
+                };
+                if SLEEP_LIKE_TOOL_NAMES.contains(&name) {
+                    return Err(format!(
+                        "step {position}: '{name}' is a step type, not a tool. Use {{\"type\":\"sleep_ms\",\"ms\":<u64>}} to pause, or the daemon-native wait_for_js / goto to wait for a page condition. Step types: tool, sleep_ms"
+                    ));
+                }
+            }
+            other => {
+                return Err(format!(
+                    "step {position}: unknown step type: {other}: expected {STEP_SHAPE_HINT}"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn is_navigation_context_loss(
+    result: Option<&serde_json::Value>,
+    error: Option<&serde_json::Value>,
+) -> bool {
+    const MESSAGE: &str = "Execution context was destroyed";
+    let in_result = result
+        .and_then(|result| result.get("content"))
+        .and_then(|content| content.as_array())
+        .is_some_and(|items| {
+            items.iter().any(|item| {
+                item.get("text")
+                    .and_then(|text| text.as_str())
+                    .is_some_and(|text| text.contains(MESSAGE))
+            })
+        });
+    let in_error = error
+        .and_then(|error| error.get("message"))
+        .and_then(|message| message.as_str())
+        .is_some_and(|message| message.contains(MESSAGE));
+    in_result || in_error
 }
 
 pub(crate) fn read_script_source(path: &str) -> Result<String, String> {

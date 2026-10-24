@@ -485,6 +485,17 @@ fn handle_fake_cdp(mut stream: TcpStream, state: Arc<Mutex<FakeState>>, target_i
                         Some(marker) => serde_json::json!(marker),
                         None => serde_json::Value::Null,
                     }
+                } else if expression.contains("readyState: document.readyState") {
+                    let state = state.lock().unwrap();
+                    let url = state
+                        .targets
+                        .iter()
+                        .find(|target| target.id == target_id)
+                        .map(|target| target.url.clone())
+                        .unwrap_or_default();
+                    serde_json::json!({"url": url, "title": "Fake Title", "readyState": "loading"})
+                } else if expression.contains("JSON.stringify") {
+                    serde_json::json!("false")
                 } else if expression == "location.href" {
                     let state = state.lock().unwrap();
                     state
@@ -767,6 +778,156 @@ fn batch_failure_emits_json_error_on_stdout() {
             .as_str()
             .unwrap()
             .contains("unknown session")
+    );
+}
+
+fn write_script(env: &TestEnv, body: &str) -> PathBuf {
+    let script = env.home.join("script.json");
+    fs::write(&script, body).unwrap();
+    script
+}
+
+fn batch_args<'a>(session: &'a str, script: &'a Path) -> Vec<&'a str> {
+    vec![
+        "mcp",
+        "batch",
+        "--profile",
+        "default",
+        "--session",
+        session,
+        "--script",
+        script.to_str().unwrap(),
+    ]
+}
+
+#[test]
+fn batch_treats_a_navigation_context_loss_as_navigated() {
+    let mut env = TestEnv::new("batchnav");
+    env.start_daemon();
+    let session = env.create_session();
+    let script = write_script(
+        &env,
+        r#"[{"type":"tool","name":"navigating_click","label":"nav"},{"type":"tool","name":"take_snapshot","label":"after"}]"#,
+    );
+    let mut args = batch_args(&session, &script);
+    args.push("--fail-fast");
+    let (ok, output) = env.run_cli(&args);
+    assert!(ok, "batch failed: {output}");
+    let results: serde_json::Value = serde_json::from_str(&output).unwrap();
+    assert_eq!(results[0]["navigated"], serde_json::json!(true));
+    assert_eq!(results[0]["error"], serde_json::Value::Null);
+    assert_eq!(results[0]["result"]["isError"], serde_json::json!(false));
+    assert!(
+        results[1]["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("snapshot page="),
+        "output: {output}"
+    );
+    assert!(results[1].get("navigated").is_none());
+}
+
+#[test]
+fn batch_rejects_a_sleep_tool_step_before_running_anything() {
+    let mut env = TestEnv::new("batchsleep");
+    env.start_daemon();
+    let script = write_script(
+        &env,
+        r#"[{"type":"tool","name":"take_snapshot"},{"type":"tool","name":"sleep_ms","args":{"ms":1000}}]"#,
+    );
+    let output = env
+        .cli()
+        .args(batch_args("sess-bogus", &script))
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let parsed: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).unwrap();
+    let error = parsed[0]["error"].as_str().unwrap();
+    assert!(
+        error.contains("step 2: 'sleep_ms' is a step type, not a tool")
+            && error.contains("Step types: tool, sleep_ms"),
+        "error: {error}"
+    );
+}
+
+#[test]
+fn batch_reports_the_keys_of_a_step_without_type() {
+    let mut env = TestEnv::new("batchkeys");
+    env.start_daemon();
+    let script = write_script(&env, r#"[{"tool":"take_snapshot","arguments":{}}]"#);
+    let (ok, output) = env.run_cli(&batch_args("sess-bogus", &script));
+    assert!(!ok);
+    assert!(
+        output.contains("step 1 missing 'type' (found: arguments, tool)"),
+        "output: {output}"
+    );
+}
+
+#[test]
+fn session_in_use_names_the_holder() {
+    let mut env = TestEnv::new("inuse");
+    env.start_daemon();
+    let session = env.create_session();
+    let mut holder = env.connect();
+    let bound = control_roundtrip(&mut holder, &format!("bind session={session} pid=4242"));
+    assert_eq!(bound, format!("bound={session}"));
+
+    let script = write_script(&env, r#"[{"type":"tool","name":"take_snapshot"}]"#);
+    let (ok, output) = env.run_cli(&batch_args(&session, &script));
+    assert!(!ok);
+    assert!(
+        output.contains(&format!("session in use: {session} (held by pid 4242 for ")),
+        "output: {output}"
+    );
+    let (_, listed) = env.run_cli(&["session", "list", "--profile", "default"]);
+    assert!(listed.contains("owner_pid=4242"), "list: {listed}");
+}
+
+#[test]
+fn goto_and_wait_failures_report_the_page_state() {
+    let mut env = TestEnv::new("waitdiag");
+    env.start_daemon();
+    let session = env.create_session();
+    let mut stream = env.connect();
+    bind_stream(&mut stream, &session);
+
+    let goto = tool_error_text(&tool_call(
+        &mut stream,
+        500,
+        "goto",
+        serde_json::json!({"url": "https://slow.test/", "waitExpression": "window.__never", "timeout": 300, "interval": 50}),
+    ));
+    assert!(
+        goto.contains("goto timed out after 300ms while waiting for window.__never")
+            && goto.contains("current url: https://slow.test/")
+            && goto.contains("title: \"Fake Title\"")
+            && goto.contains("condition evaluated to: false"),
+        "message: {goto}"
+    );
+
+    let wait = tool_error_text(&tool_call(
+        &mut stream,
+        501,
+        "wait_for_js",
+        serde_json::json!({"expression": "window.__never", "timeout": 300, "interval": 50}),
+    ));
+    assert!(
+        wait.contains("wait_for_js timed out after 300ms")
+            && wait.contains("current url: https://slow.test/"),
+        "message: {wait}"
+    );
+}
+
+#[test]
+fn direct_list_goes_through_the_running_daemon() {
+    let mut env = TestEnv::new("directlist");
+    env.start_daemon();
+    let (ok, output) = env.run_cli(&["mcp", "direct-list", "--profile", "default"]);
+    assert!(ok, "direct-list failed: {output}");
+    assert!(
+        output.contains("holds the profile lock") && output.contains("\"tools\""),
+        "output: {output}"
     );
 }
 

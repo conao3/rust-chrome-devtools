@@ -306,6 +306,8 @@ fn format_session_line_renders_all_fields() {
         created_at: now,
         last_used_at: now,
         owned: true,
+        owner_pid: Some(4242),
+        owned_since: Some(now),
         page_id: Some(7),
         page_created_by_daemon: true,
         page_url: Some("about:blank".to_string()),
@@ -317,6 +319,7 @@ fn format_session_line_renders_all_fields() {
     let line = format_session_line(&state);
     assert!(line.starts_with("session=sess-test "));
     assert!(line.contains(" owned=true"));
+    assert!(line.contains(" owner_pid=4242"));
     assert!(line.contains(" created="));
     assert!(line.contains(" last_used="));
     assert!(line.contains(" target_id=TARGET1"));
@@ -471,7 +474,7 @@ fn session_registry_close_removes_known_and_errors_on_unknown() {
 fn session_registry_close_rejects_owned_session() {
     let mut registry = SessionRegistry::default();
     let state = registry.create();
-    registry.bind(&state.id).unwrap();
+    registry.bind(&state.id, None).unwrap();
     let error = registry.close(&state.id).unwrap_err();
     assert!(error.contains("session in use"));
 }
@@ -480,7 +483,7 @@ fn session_registry_close_rejects_owned_session() {
 fn session_registry_bind_marks_owned_and_rejects_second_bind() {
     let mut registry = SessionRegistry::default();
     let state = registry.create();
-    assert!(registry.bind(&state.id).is_ok());
+    assert!(registry.bind(&state.id, Some(4242)).is_ok());
     assert!(
         registry
             .sessions
@@ -488,8 +491,9 @@ fn session_registry_bind_marks_owned_and_rejects_second_bind() {
             .map(|session| session.owned)
             .unwrap_or(false)
     );
-    let error = registry.bind(&state.id).unwrap_err();
+    let error = registry.bind(&state.id, None).unwrap_err();
     assert!(error.contains("session in use"));
+    assert!(error.contains("held by pid 4242 for "), "error: {error}");
 }
 
 #[test]
@@ -497,8 +501,8 @@ fn session_registry_bind_allows_another_session_to_bind() {
     let mut registry = SessionRegistry::default();
     let first = registry.create();
     let second = registry.create();
-    registry.bind(&first.id).unwrap();
-    registry.bind(&second.id).unwrap();
+    registry.bind(&first.id, None).unwrap();
+    registry.bind(&second.id, None).unwrap();
     assert!(registry.sessions.get(&first.id).unwrap().owned);
     assert!(registry.sessions.get(&second.id).unwrap().owned);
 }
@@ -507,7 +511,7 @@ fn session_registry_bind_allows_another_session_to_bind() {
 fn session_registry_unbind_clears_owned() {
     let mut registry = SessionRegistry::default();
     let state = registry.create();
-    registry.bind(&state.id).unwrap();
+    registry.bind(&state.id, None).unwrap();
     registry.unbind(&state.id);
     let session = registry.sessions.get(&state.id).unwrap();
     assert!(!session.owned);
