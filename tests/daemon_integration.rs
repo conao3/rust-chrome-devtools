@@ -198,6 +198,15 @@ impl TestEnv {
         command
     }
 
+    fn use_devtools_port(&self, port: u16) {
+        fs::write(
+            self.home
+                .join(".cache/chrome-devtools/daemons/default.port"),
+            port.to_string(),
+        )
+        .unwrap();
+    }
+
     fn replace_devtools(&mut self) -> u16 {
         self.devtools.clear();
         let devtools = spawn_fake_devtools();
@@ -488,6 +497,24 @@ fn handle_fake_cdp(mut stream: TcpStream, state: Arc<Mutex<FakeState>>, target_i
                     serde_json::json!(true)
                 } else {
                     serde_json::json!(false)
+                };
+                serde_json::json!({
+                    "id": id,
+                    "result": {
+                        "result": {
+                            "value": result_value
+                        }
+                    }
+                })
+            }
+            "Runtime.callFunctionOn" => {
+                let declaration = value["params"]["functionDeclaration"]
+                    .as_str()
+                    .unwrap_or("");
+                let result_value = if declaration.contains("getBoundingClientRect") {
+                    serde_json::json!({"x": 100.0, "y": 200.0})
+                } else {
+                    serde_json::json!(true)
                 };
                 serde_json::json!({
                     "id": id,
@@ -1509,6 +1536,382 @@ fn session_keeps_its_tab_after_the_url_changes() {
         screenshot_target(&env, &mut owner_stream, 325, "owner-after-goto"),
         "FAKETARGET2"
     );
+}
+
+struct RealChrome {
+    child: Child,
+    port: u16,
+    profile_dir: PathBuf,
+}
+
+impl RealChrome {
+    fn find_binary() -> Option<PathBuf> {
+        if let Some(path) = std::env::var_os("CHROME_DEVTOOLS_TEST_CHROME") {
+            return Some(PathBuf::from(path));
+        }
+        let path_var = std::env::var_os("PATH")?;
+        [
+            "google-chrome-stable",
+            "google-chrome",
+            "chromium",
+            "chromium-browser",
+        ]
+        .iter()
+        .flat_map(|name| std::env::split_paths(&path_var).map(move |dir| dir.join(name)))
+        .find(|candidate| candidate.is_file())
+    }
+
+    fn launch(binary: &Path, tag: &str) -> Self {
+        let profile_dir = std::env::temp_dir().join(format!(
+            "cdt-chrome-{tag}-{}-{}",
+            std::process::id(),
+            NEXT_TEST_ENV_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = fs::remove_dir_all(&profile_dir);
+        fs::create_dir_all(&profile_dir).unwrap();
+        let child = Command::new(binary)
+            .args([
+                "--headless=new",
+                "--no-sandbox",
+                "--disable-gpu",
+                "--no-first-run",
+                "--site-per-process",
+                "--host-resolver-rules=MAP crossorigin.test 127.0.0.1",
+                "--remote-debugging-port=0",
+            ])
+            .arg(format!("--user-data-dir={}", profile_dir.display()))
+            .arg("about:blank")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let active_port = profile_dir.join("DevToolsActivePort");
+        let started = Instant::now();
+        let port = loop {
+            if let Some(port) = fs::read_to_string(&active_port).ok().and_then(|text| {
+                text.lines()
+                    .next()
+                    .and_then(|line| line.parse::<u16>().ok())
+            }) {
+                break port;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(30),
+                "Chrome did not publish DevToolsActivePort"
+            );
+            thread::sleep(Duration::from_millis(100));
+        };
+        Self {
+            child,
+            port,
+            profile_dir,
+        }
+    }
+}
+
+impl Drop for RealChrome {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let _ = fs::remove_dir_all(&self.profile_dir);
+    }
+}
+
+struct FrameFixtureServer {
+    port: u16,
+    stop: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl FrameFixtureServer {
+    fn start(label: &'static str, cross_origin_url: String, log: Arc<Mutex<Vec<String>>>) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        listener.set_nonblocking(true).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_for_thread = Arc::clone(&stop);
+        let handle = thread::spawn(move || {
+            while !stop_for_thread.load(Ordering::SeqCst) {
+                let Ok((stream, _)) = listener.accept() else {
+                    thread::sleep(Duration::from_millis(10));
+                    continue;
+                };
+                let log = Arc::clone(&log);
+                let cross_origin_url = cross_origin_url.clone();
+                thread::spawn(move || serve_frame_fixture(stream, label, &cross_origin_url, &log));
+            }
+        });
+        Self {
+            port,
+            stop,
+            handle: Some(handle),
+        }
+    }
+}
+
+impl Drop for FrameFixtureServer {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+const FRAME_CHILD_HTML: &str = r#"<!doctype html><body>
+<input id="name" oninput="fetch('/report?name=' + encodeURIComponent(this.value))">
+<input id="hidden" style="display:none">
+<input type="file" id="file" onchange="fetch('/report?file=' + encodeURIComponent(this.files[0].name))">
+<button id="go" onclick="fetch('/report?click=go')">go</button>
+<iframe id="nested" src="/nested.html" width="300" height="80"></iframe>
+</body>"#;
+
+const FRAME_NESTED_HTML: &str = r#"<!doctype html><body>
+<input id="deep" oninput="fetch('/report?deep=' + encodeURIComponent(this.value))">
+</body>"#;
+
+fn serve_frame_fixture(
+    mut stream: TcpStream,
+    label: &str,
+    cross_origin_url: &str,
+    log: &Mutex<Vec<String>>,
+) {
+    let mut buffer = [0u8; 4096];
+    let bytes = stream.read(&mut buffer).unwrap_or(0);
+    let request = String::from_utf8_lossy(&buffer[..bytes]).to_string();
+    let path = request
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .unwrap_or("/")
+        .to_string();
+    let body = if let Some(entry) = path.strip_prefix("/report?") {
+        log.lock().unwrap().push(format!("{label}:{entry}"));
+        String::new()
+    } else if path == "/nested.html" {
+        FRAME_NESTED_HTML.to_string()
+    } else if path == "/child.html" {
+        FRAME_CHILD_HTML.to_string()
+    } else {
+        format!(
+            r#"<!doctype html><body><h1>parent</h1>
+<input id="top" oninput="fetch('/report?top=' + encodeURIComponent(this.value))">
+<iframe id="same" src="/child.html" style="position:absolute;left:60px;top:300px;width:400px;height:200px;border:3px solid red;padding:5px"></iframe>
+<iframe id="cross" src="{cross_origin_url}/child.html" style="position:absolute;left:60px;top:800px;width:400px;height:200px"></iframe>
+</body>"#
+        )
+    };
+    let _ = stream.write_all(
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .as_bytes(),
+    );
+}
+
+fn tool_error_text(response: &serde_json::Value) -> String {
+    assert_eq!(
+        response["result"]["isError"],
+        serde_json::json!(true),
+        "expected a tool error: {response}"
+    );
+    content_text(response).to_string()
+}
+
+fn wait_for_log(log: &Mutex<Vec<String>>, expected: &str) {
+    let started = Instant::now();
+    loop {
+        if log.lock().unwrap().iter().any(|entry| entry == expected) {
+            return;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "log never contained {expected}: {:?}",
+            log.lock().unwrap()
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn retry_tool(
+    stream: &mut UnixStream,
+    first_id: u64,
+    name: &str,
+    arguments: serde_json::Value,
+) -> serde_json::Value {
+    let started = Instant::now();
+    let mut id = first_id;
+    loop {
+        let response = tool_call(stream, id, name, arguments.clone());
+        if response["result"]["isError"] != serde_json::json!(true) {
+            return response;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "{name} kept failing: {response}"
+        );
+        id += 1;
+        thread::sleep(Duration::from_millis(200));
+    }
+}
+
+#[test]
+fn iframe_elements_are_reachable_with_the_frame_separator() {
+    let Some(binary) = RealChrome::find_binary() else {
+        eprintln!("skipping: no Chrome binary (set CHROME_DEVTOOLS_TEST_CHROME)");
+        return;
+    };
+    let chrome = RealChrome::launch(&binary, "frames");
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let cross_server = FrameFixtureServer::start("cross", String::new(), Arc::clone(&log));
+    let cross_origin_url = format!("http://crossorigin.test:{}", cross_server.port);
+    let parent_server = FrameFixtureServer::start("same", cross_origin_url, Arc::clone(&log));
+
+    let mut env = TestEnv::new("frames");
+    env.use_devtools_port(chrome.port);
+    env.start_daemon();
+    let session = env.create_session();
+    let mut stream = env.connect();
+    bind_stream(&mut stream, &session);
+
+    let parent_url = format!("http://127.0.0.1:{}/", parent_server.port);
+    let navigated = tool_call(
+        &mut stream,
+        400,
+        "goto",
+        serde_json::json!({"url": parent_url, "waitSelector": "iframe#cross"}),
+    );
+    assert!(
+        content_text(&navigated).contains("navigated to"),
+        "response: {navigated}"
+    );
+
+    retry_tool(
+        &mut stream,
+        410,
+        "type_into",
+        serde_json::json!({"selector": "iframe#same >>> #name", "text": "same-origin"}),
+    );
+    wait_for_log(&log, "same:name=same-origin");
+
+    retry_tool(
+        &mut stream,
+        430,
+        "type_into",
+        serde_json::json!({"selector": "iframe#cross >>> #name", "text": "cross-origin"}),
+    );
+    wait_for_log(&log, "cross:name=cross-origin");
+
+    retry_tool(
+        &mut stream,
+        450,
+        "type_into",
+        serde_json::json!({"selector": "iframe#cross >>> iframe#nested >>> #deep", "text": "nested"}),
+    );
+    wait_for_log(&log, "cross:deep=nested");
+
+    let upload = env.home.join("upload.txt");
+    fs::write(&upload, "attachment").unwrap();
+    for (id, selector, label) in [
+        (470, "iframe#same >>> #file", "same"),
+        (471, "iframe#cross >>> #file", "cross"),
+    ] {
+        let response = tool_call(
+            &mut stream,
+            id,
+            "set_file_input",
+            serde_json::json!({"selector": selector, "filePaths": [upload.to_str().unwrap()]}),
+        );
+        assert!(
+            content_text(&response).contains("attached 1 file(s)"),
+            "response: {response}"
+        );
+        wait_for_log(&log, &format!("{label}:file=upload.txt"));
+    }
+
+    for (id, selector, label) in [
+        (480, "iframe#same >>> #go", "same"),
+        (481, "iframe#cross >>> #go", "cross"),
+    ] {
+        let response = tool_call(
+            &mut stream,
+            id,
+            "click_selector",
+            serde_json::json!({"selector": selector}),
+        );
+        assert!(
+            content_text(&response).contains("clicked"),
+            "response: {response}"
+        );
+        wait_for_log(&log, &format!("{label}:click=go"));
+    }
+
+    let missing_frame = tool_error_text(&tool_call(
+        &mut stream,
+        490,
+        "type_into",
+        serde_json::json!({"selector": "iframe#nosuch >>> #name", "text": "x"}),
+    ));
+    assert!(
+        missing_frame.contains("no iframe matches selector: iframe#nosuch")
+            && missing_frame.contains("top frame")
+            && missing_frame.contains("iframes here: iframe#same, iframe#cross"),
+        "message: {missing_frame}"
+    );
+
+    let missing_element = tool_error_text(&tool_call(
+        &mut stream,
+        491,
+        "click_selector",
+        serde_json::json!({"selector": "iframe#same >>> #nosuch"}),
+    ));
+    assert!(
+        missing_element.contains("no element matches selector: #nosuch")
+            && missing_element.contains("frame iframe#same")
+            && missing_element.contains(&format!(
+                "http://127.0.0.1:{}/child.html",
+                parent_server.port
+            )),
+        "message: {missing_element}"
+    );
+
+    let hidden = tool_error_text(&tool_call(
+        &mut stream,
+        492,
+        "type_into",
+        serde_json::json!({"selector": "iframe#cross >>> #hidden", "text": "x"}),
+    ));
+    assert!(
+        hidden.contains("could not focus selector")
+            && hidden.contains("matched <input>, hidden")
+            && hidden.contains("frame iframe#cross"),
+        "message: {hidden}"
+    );
+
+    let not_iframe = tool_error_text(&tool_call(
+        &mut stream,
+        493,
+        "type_into",
+        serde_json::json!({"selector": "h1 >>> #name", "text": "x"}),
+    ));
+    assert!(
+        not_iframe.contains("matches <h1>, not an iframe"),
+        "message: {not_iframe}"
+    );
+
+    let top = tool_call(
+        &mut stream,
+        494,
+        "type_into",
+        serde_json::json!({"selector": "#top", "text": "top-level"}),
+    );
+    assert!(
+        content_text(&top).contains("typed 9 char(s)"),
+        "response: {top}"
+    );
+    wait_for_log(&log, "same:top=top-level");
 }
 
 #[test]

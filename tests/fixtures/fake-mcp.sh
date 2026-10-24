@@ -22,7 +22,7 @@ fake_devtools() {
   port=$(cat "${HOME}/.cache/chrome-devtools/daemons/default.port" 2>/dev/null) || return 0
   exec 9<>"/dev/tcp/127.0.0.1/${port}" || return 0
   printf 'GET %s HTTP/1.1\r\nHost: fake\r\nConnection: close\r\n\r\n' "$1" >&9
-  cat <&9 > /dev/null
+  IFS= read -r -t 2 _status <&9 || true
   exec 9>&-
 }
 

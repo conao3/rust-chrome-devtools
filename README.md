@@ -77,7 +77,7 @@ Besides forwarding the chrome-devtools-mcp tool set, the daemon implements ten t
 - `goto {url, waitSelector?, waitExpression?, timeout?, interval?}`: navigate the session page without foregrounding Chrome and wait in the same call. With no explicit wait condition it waits for `document.readyState === 'complete'`.
 - `screenshot_quiet {filePath, format?, quality?}`: capture the visible viewport directly with `Page.captureScreenshot`, bypassing the MCP queue and leaving the user's active tab alone. `filePath` must be absolute and under `$HOME` or the OS temp directory.
 - `wait_for_js {expression | selector, timeout?, interval?}`: poll a JS expression (or CSS selector) until truthy — replaces fixed sleeps for SPA waits.
-- `click_selector {selector}`: scroll the first match into view and click its center.
+- `click_selector {selector}`: scroll the first match into view and click its center. Inside iframes the click point is translated to the top frame's viewport.
 - `click_at {x, y}`: raw left click at viewport coordinates.
 - `dispatch_key {key, modifiers?}`: single key press (Escape, Enter, arrows, single characters; modifiers bitmask Alt=1 Ctrl=2 Meta=4 Shift=8).
 - `set_file_input {selector, filePaths}`: attach files to the `input[type=file]` matched by a selector through `DOM.setFileInputFiles`. No snapshot and no file chooser, so it picks the exact input on pages that have several and never crosses into another session's page. The element is resolved through `Runtime.evaluate`, so it works on pages with a large DOM (Gmail, for one). Paths must be absolute and under `$HOME` or the OS temp directory.
@@ -92,6 +92,8 @@ This runs on a CDP connection the daemon keeps open for the tab, because Chrome 
 
 If the watcher cannot attach, the daemon logs `dialog_watch_failed` and carries on; recover a stuck tab with `close_page_quiet`.
 - `type_into {selector, text, clear?}`: focus the matched element and insert text with `Input.insertText`. Use it when a native value setter plus an `input` event does not reach framework state (some React-based forms).
+
+`click_selector`, `set_file_input` and `type_into` reach into iframes with `>>>` in the selector (`iframe#form >>> input[name=email]`, nested as `iframe#a >>> iframe#b >>> input`), for same-origin and cross-origin (out-of-process) iframes alike. A missing element is reported with the frame, its URL and the iframes it contains; `could not focus selector` also says whether the element is hidden, disabled or read-only.
 
 Each session is pinned to the CDP target id of its tab, which stays the same for the life of that tab. Navigation, redirects and SPA route changes alter the URL but not the target, tabs that share a URL are told apart (`new_page` and `select_page` pin the target id), and daemon-native tools never fall back to another tab: if the session's tab is gone they fail with `session page target <id> is gone` instead of acting on somebody else's page. This matters when several agents share one Chrome profile.
 

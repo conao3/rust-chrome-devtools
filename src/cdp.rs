@@ -1,3 +1,4 @@
+use crate::frame;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use serde_json::Value;
@@ -570,22 +571,10 @@ pub(crate) fn click_selector(
     selector: &str,
 ) -> Result<(f64, f64), String> {
     let mut client = connect_page_client(port, target_id)?;
-    let selector_json = serde_json::json!(selector).to_string();
-    let expression = format!(
-        "(() => {{ const el = document.querySelector({selector_json}); if (!el) return null; el.scrollIntoView({{block: 'center', inline: 'center'}}); const r = el.getBoundingClientRect(); return {{x: r.x + r.width / 2, y: r.y + r.height / 2}}; }})()"
-    );
-    let value = evaluate_value(&mut client, &expression)?;
-    if value.is_null() {
-        return Err(format!("no element matches selector: {selector}"));
-    }
-    let x = value
-        .get("x")
-        .and_then(|x| x.as_f64())
-        .ok_or_else(|| "selector center has no x".to_string())?;
-    let y = value
-        .get("y")
-        .and_then(|y| y.as_f64())
-        .ok_or_else(|| "selector center has no y".to_string())?;
+    let located = frame::locate(&mut client, selector)?;
+    let point = frame::click_point(&mut client, &located);
+    located.release(&mut client);
+    let (x, y) = point?;
     dispatch_click(&mut client, x, y)?;
     Ok((x, y))
 }
@@ -688,7 +677,7 @@ pub(crate) fn set_file_input_files(
 
 /// セレクタで指定した `input[type=file]` にファイルを渡す。file chooser を使わないので
 /// 他 session の chooser を横取りする余地がなく、file input が複数あるページでも
-/// どれに添付するかを呼び出し側が決められる。
+/// どれに添付するかを呼び出し側が決められる。`iframe >>> input` で iframe の中も指せる。
 pub(crate) fn set_file_input(
     port: u16,
     target_id: &str,
@@ -699,33 +688,14 @@ pub(crate) fn set_file_input(
         return Err("set_file_input requires at least one file".to_string());
     }
     let mut client = connect_page_client(port, target_id)?;
-    let selector_json = serde_json::json!(selector).to_string();
-    let kind = evaluate_value(
-        &mut client,
-        &format!(
-            "(() => {{ const el = document.querySelector({selector_json}); if (!el) return 'missing'; if (el.tagName !== 'INPUT' || el.type !== 'file') return 'not-file'; return 'ok'; }})()"
-        ),
-    )?;
-    match kind.as_str() {
-        Some("ok") => {}
-        Some("missing") => return Err(format!("no element matches selector: {selector}")),
-        _ => return Err(format!("selector is not an input[type=file]: {selector}")),
-    }
-    let object_id = evaluate_object_id(
-        &mut client,
-        &format!("document.querySelector({selector_json})"),
-    )?
-    .ok_or_else(|| format!("could not resolve a remote object for {selector}"))?;
-    let outcome = client.call(serde_json::json!({
-        "method": "DOM.setFileInputFiles",
-        "params": {
-            "objectId": object_id,
-            "files": files
-        }
-    }));
-    release_object(&mut client, &object_id);
-    outcome?;
-    Ok(())
+    let located = frame::locate(&mut client, selector)?;
+    let outcome = if frame::is_file_input(&mut client, &located)? {
+        frame::set_files(&mut client, &located, files)
+    } else {
+        Err(frame::not_file_input(&mut client, &located, selector))
+    };
+    located.release(&mut client);
+    outcome
 }
 
 /// セレクタの要素に実フォーカスを当て、`Input.insertText` で文字列を入れる。
@@ -739,16 +709,19 @@ pub(crate) fn type_into(
     clear: bool,
 ) -> Result<(), String> {
     let mut client = connect_page_client(port, target_id)?;
-    let selector_json = serde_json::json!(selector).to_string();
-    let focused = evaluate_value(
-        &mut client,
-        &format!(
-            "(() => {{ const el = document.querySelector({selector_json}); if (!el) return false; el.scrollIntoView({{block: 'center', inline: 'center'}}); el.focus(); return document.activeElement === el; }})()"
-        ),
-    )?;
-    if focused.as_bool() != Some(true) {
-        return Err(format!("could not focus selector: {selector}"));
+    let located = frame::locate(&mut client, selector)?;
+    let focused = frame::focus(&mut client, &located);
+    if !matches!(focused, Ok(true)) {
+        let message = match focused {
+            Ok(_) => {
+                frame::failure_context(&mut client, &located, selector, "could not focus selector")
+            }
+            Err(error) => error,
+        };
+        located.release(&mut client);
+        return Err(message);
     }
+    located.release(&mut client);
     if clear {
         client.call(serde_json::json!({
             "method": "Input.dispatchKeyEvent",
@@ -896,7 +869,7 @@ fn http_get(port: u16, path: &str) -> Result<String, String> {
     }
 }
 
-struct CdpClient {
+pub(crate) struct CdpClient {
     stream: TcpStream,
     next_id: i64,
 }
@@ -948,6 +921,17 @@ impl CdpClient {
             }
         }
         Ok(Self { stream, next_id: 1 })
+    }
+
+    pub(crate) fn call_in(
+        &mut self,
+        session_id: Option<&str>,
+        mut request: Value,
+    ) -> Result<Value, String> {
+        if let Some(session_id) = session_id {
+            request["sessionId"] = serde_json::json!(session_id);
+        }
+        self.call(request)
     }
 
     fn call(&mut self, mut request: Value) -> Result<Value, String> {

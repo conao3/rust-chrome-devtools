@@ -3,6 +3,7 @@ mod cdp;
 mod cli;
 mod config;
 mod daemon;
+mod frame;
 mod lock;
 mod router;
 

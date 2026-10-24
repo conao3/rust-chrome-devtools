@@ -43,7 +43,7 @@ Each session is pinned to the CDP target id of its tab. Navigation, redirects, h
 - `goto {url, waitSelector?, waitExpression?, timeout?, interval?}` — navigate the session page without foregrounding Chrome, then wait in the same tool call. `waitSelector` and `waitExpression` are mutually exclusive; without either it waits for `document.readyState === 'complete'`.
 - `screenshot_quiet {filePath, format?, quality?}` — save a visible-viewport screenshot directly through CDP without selecting the page or entering the MCP queue. Use this for Slack/image viewers. `filePath` must be absolute and under `$HOME` or the OS temp directory.
 - `wait_for_js {expression | selector, timeout?, interval?}` — poll a JS expression (or CSS selector) until truthy. Use instead of fixed `sleep_ms` waits for SPA rendering. Defaults: timeout 30000ms (max 120000), interval 500ms. A throwing/invalid expression fails immediately rather than polling.
-- `click_selector {selector}` — scroll the first matching element into view and click its center.
+- `click_selector {selector}` — scroll the first matching element into view and click its center. Inside iframes the click point is translated to the top frame's viewport.
 - `click_at {x, y}` — raw left click at viewport coordinates.
 - `dispatch_key {key, modifiers?}` — single key press (`Escape`, `Enter`, `Tab`, `ArrowDown`, single characters, ...). Modifiers bitmask: Alt=1, Ctrl=2, Meta=4, Shift=8.
 - `set_file_input {selector, filePaths}` — attach files to the `input[type=file]` matched by the selector via `DOM.setFileInputFiles`. Prefer it over `upload_file` when a page has several file inputs (a cover letter field and a resume field, say) or when no visible button opens a chooser. Works on large-DOM pages such as an open Gmail thread. Paths must be absolute and under `$HOME` or the OS temp directory.
@@ -52,6 +52,8 @@ Each session is pinned to the CDP target id of its tab. Navigation, redirects, h
 
 The daemon watches each session's tab for JavaScript dialogs and closes them on its own: `alert` and `beforeunload` are accepted, `confirm` and `prompt` are dismissed. Look for `dialog_handled` in the daemon log. A dialog left open holds the MCP tool mutex, so this keeps a page's `confirm()` from stalling every session on the profile.
 - `type_into {selector, text, clear?}` — focus the matched element and insert the text with `Input.insertText`. Use it when `evaluate_script` with a native value setter plus an `input` event leaves the framework state unchanged. `clear: true` selects all and deletes first.
+
+`selector` of `click_selector`, `set_file_input` and `type_into` reaches into iframes with `>>>`: `iframe#form >>> input[name=email]`, nested as `iframe#a >>> iframe#b >>> input`. Same-origin and cross-origin (out-of-process) iframes both work. When an element is missing, the error names the frame, its URL and the iframes it contains (`no element matches selector: #x in frame iframe#form (url ..., iframes here: iframe#inner)`); `could not focus selector` also says whether the matched element is hidden, disabled or read-only.
 
 ## Profile Setup
 

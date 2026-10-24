@@ -1667,7 +1667,7 @@ fn native_tool_defs() -> Vec<serde_json::Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "selector": {"type": "string"}
+                    "selector": {"type": "string", "description": "CSS selector; prefix iframe selectors with >>> to reach inside iframes, e.g. iframe#a >>> input"}
                 },
                 "required": ["selector"]
             }
@@ -1690,7 +1690,7 @@ fn native_tool_defs() -> Vec<serde_json::Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "selector": {"type": "string", "description": "CSS selector for an input[type=file] on the session page"},
+                    "selector": {"type": "string", "description": "CSS selector for an input[type=file] on the session page; prefix iframe selectors with >>> to reach inside iframes, e.g. iframe#a >>> input[type=file]"},
                     "filePaths": {
                         "type": "array",
                         "items": {"type": "string"},
@@ -1725,7 +1725,7 @@ fn native_tool_defs() -> Vec<serde_json::Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "selector": {"type": "string"},
+                    "selector": {"type": "string", "description": "CSS selector; prefix iframe selectors with >>> to reach inside iframes, e.g. iframe#a >>> input"},
                     "text": {"type": "string"},
                     "clear": {"type": "boolean", "description": "select all and delete before inserting (default false)"}
                 },
