@@ -60,9 +60,9 @@ snapshot_epoch=<u64>
 
 `page_id` is the MCP page id, which `McpContext.createPagesSnapshot()` re-issues from `#nextPageId++`, so it shifts when other tabs open or close. `target_id` is the CDP target id from `/json`, which stays the same for the life of the tab. Daemon-native tools resolve their connection through `target_id` and treat `page_url` as diagnostic state.
 
-The daemon learns the target id by diffing `/json` page target ids around the `new_page` call in `ensure_session_page`. A session that has a page but no target id (after an MCP respawn, say) resolves it once from `page_url`, and only when exactly one target carries that url.
+The daemon learns the target id whenever a session gets a page. `ensure_session_page` and `new_page` diff the `/json` page target ids around the `new_page` call. When the diff does not name exactly one new tab, and for `select_page` and `session attach`, the daemon pins the MCP page to its target: if exactly one target carries the url MCP reports it is that one, otherwise the daemon places a one-time marker (`window.__cdt_pin`) on the MCP page through `evaluate_script` and reads which target carries it. Tabs that share a url and tabs whose url changed after the page was selected are therefore both told apart.
 
-`connect_page_client` never falls back to another target. A missing target returns `session page target <id> is gone; create a new session`, and an ambiguous url returns `url <url> matches multiple page targets`. Falling back to `targets.first()` sends input to whatever tab happens to be first, which on a shared profile is another agent'"'"'s page.
+`connect_page_client` connects only to the pinned target and never falls back to another one. A missing target returns `session page target <id> is gone; create a new session`. A page that cannot be pinned fails the native tool with `could not tell which tab is the session page`. Falling back to `targets.first()` sends input to whatever tab happens to be first, which on a shared profile is another agent's page.
 
 A session can get a page in 3 ways.
 

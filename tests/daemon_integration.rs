@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
@@ -5,8 +6,8 @@ use std::net::TcpStream;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -28,6 +29,29 @@ struct FakeDevTools {
     port: u16,
     stop: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
+    state: Arc<Mutex<FakeState>>,
+}
+
+struct FakeTarget {
+    id: String,
+    url: String,
+}
+
+struct FakeState {
+    targets: Vec<FakeTarget>,
+    markers: HashMap<String, String>,
+}
+
+impl FakeDevTools {
+    fn navigate(&self, id: &str, url: &str) {
+        let mut state = self.state.lock().unwrap();
+        let target = state
+            .targets
+            .iter_mut()
+            .find(|target| target.id == id)
+            .unwrap();
+        target.url = url.to_string();
+    }
 }
 
 static NEXT_TEST_ENV_ID: AtomicU64 = AtomicU64::new(1);
@@ -314,6 +338,14 @@ fn spawn_fake_devtools() -> FakeDevTools {
     listener.set_nonblocking(true).unwrap();
     let stop = Arc::new(AtomicBool::new(false));
     let stop_for_thread = Arc::clone(&stop);
+    let state = Arc::new(Mutex::new(FakeState {
+        targets: vec![FakeTarget {
+            id: "FAKETARGET1".to_string(),
+            url: "about:blank".to_string(),
+        }],
+        markers: HashMap::new(),
+    }));
+    let state_for_thread = Arc::clone(&state);
     let handle = thread::spawn(move || {
         while !stop_for_thread.load(Ordering::SeqCst) {
             let Ok((mut stream, _)) = listener.accept() else {
@@ -322,11 +354,25 @@ fn spawn_fake_devtools() -> FakeDevTools {
             };
             let mut buffer = [0u8; 1024];
             let bytes = stream.read(&mut buffer).unwrap_or(0);
-            let request = String::from_utf8_lossy(&buffer[..bytes]);
+            let request = String::from_utf8_lossy(&buffer[..bytes]).to_string();
+            let request_line = request.lines().next().unwrap_or("").to_string();
+            let path = request_line.split_whitespace().nth(1).unwrap_or("");
             if request.starts_with("GET /json ") {
-                let body = format!(
-                    r#"[{{"id":"FAKETARGET1","type":"page","url":"about:blank","webSocketDebuggerUrl":"ws://127.0.0.1:{port}/devtools/page/1"}}]"#
-                );
+                let items = state_for_thread
+                    .lock()
+                    .unwrap()
+                    .targets
+                    .iter()
+                    .map(|target| {
+                        format!(
+                            r#"{{"id":"{id}","type":"page","url":"{url}","webSocketDebuggerUrl":"ws://127.0.0.1:{port}/devtools/page/{id}"}}"#,
+                            id = target.id,
+                            url = target.url
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let body = format!("[{items}]");
                 let _ = stream.write_all(
                     format!(
                         "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -335,12 +381,29 @@ fn spawn_fake_devtools() -> FakeDevTools {
                     .as_bytes(),
                 );
             } else if request.contains("Upgrade: websocket") {
+                let target_id = path
+                    .strip_prefix("/devtools/page/")
+                    .unwrap_or("")
+                    .to_string();
                 let _ = stream.write_all(
                     b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: fake\r\n\r\n",
                 );
                 // ダイアログ watcher が tab ごとに常設接続を張るので、1 本の接続で
                 // accept ループを塞ぐと後続の /json が読めなくなる。
-                thread::spawn(move || handle_fake_cdp(stream));
+                let state = Arc::clone(&state_for_thread);
+                thread::spawn(move || handle_fake_cdp(stream, state, target_id));
+            } else if let Some(query) = path.strip_prefix("/__fake/add?") {
+                let (id, url) = fake_query_pair(query, "id", "url");
+                state_for_thread
+                    .lock()
+                    .unwrap()
+                    .targets
+                    .push(FakeTarget { id, url });
+                respond_fake_ok(&mut stream);
+            } else if let Some(query) = path.strip_prefix("/__fake/marker?") {
+                let (id, value) = fake_query_pair(query, "id", "value");
+                state_for_thread.lock().unwrap().markers.insert(id, value);
+                respond_fake_ok(&mut stream);
             } else {
                 let _ = stream.write_all(
                     b"HTTP/1.1 200 OK\r\nContent-Length: 18\r\nConnection: close\r\n\r\n{\"Browser\":\"fake\"}",
@@ -352,10 +415,22 @@ fn spawn_fake_devtools() -> FakeDevTools {
         port,
         stop,
         handle: Some(handle),
+        state,
     }
 }
 
-fn handle_fake_cdp(mut stream: TcpStream) {
+fn fake_query_pair(query: &str, first: &str, second: &str) -> (String, String) {
+    let rest = query.strip_prefix(&format!("{first}=")).unwrap();
+    let (first_value, rest) = rest.split_once(&format!("&{second}=")).unwrap();
+    (first_value.to_string(), rest.to_string())
+}
+
+fn respond_fake_ok(stream: &mut TcpStream) {
+    let _ =
+        stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+}
+
+fn handle_fake_cdp(mut stream: TcpStream, state: Arc<Mutex<FakeState>>, target_id: String) {
     while let Ok(text) = read_fake_ws_text(&mut stream) {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
             continue;
@@ -396,8 +471,19 @@ fn handle_fake_cdp(mut stream: TcpStream) {
                 let expression = value["params"]["expression"].as_str().unwrap_or("");
                 let result_value = if expression.contains("getBoundingClientRect") {
                     serde_json::json!({"x": 100.0, "y": 200.0})
+                } else if expression.contains("__cdt_pin") {
+                    match state.lock().unwrap().markers.remove(&target_id) {
+                        Some(marker) => serde_json::json!(marker),
+                        None => serde_json::Value::Null,
+                    }
                 } else if expression == "location.href" {
-                    serde_json::json!("https://navigated.test/")
+                    let state = state.lock().unwrap();
+                    state
+                        .targets
+                        .iter()
+                        .find(|target| target.id == target_id)
+                        .map(|target| serde_json::json!(target.url))
+                        .unwrap_or(serde_json::Value::Null)
                 } else if expression.contains("__ready") {
                     serde_json::json!(true)
                 } else {
@@ -412,14 +498,29 @@ fn handle_fake_cdp(mut stream: TcpStream) {
                     }
                 })
             }
-            "Page.navigate" => serde_json::json!({
-                "id": id,
-                "result": {"frameId": "fake-frame"}
-            }),
-            "Page.captureScreenshot" => serde_json::json!({
-                "id": id,
-                "result": {"data": "aGVsbG8="}
-            }),
+            "Page.navigate" => {
+                let url = value["params"]["url"].as_str().unwrap_or("").to_string();
+                if let Some(target) = state
+                    .lock()
+                    .unwrap()
+                    .targets
+                    .iter_mut()
+                    .find(|target| target.id == target_id)
+                {
+                    target.url = url;
+                }
+                serde_json::json!({
+                    "id": id,
+                    "result": {"frameId": "fake-frame"}
+                })
+            }
+            "Page.captureScreenshot" => {
+                use base64::Engine;
+                serde_json::json!({
+                    "id": id,
+                    "result": {"data": base64::engine::general_purpose::STANDARD.encode(&target_id)}
+                })
+            }
             _ => serde_json::json!({
                 "id": id,
                 "result": {}
@@ -1203,7 +1304,7 @@ fn native_tools_run_via_cdp_without_mcp() {
         content_text(&screenshot).contains("saved screenshot"),
         "response: {screenshot}"
     );
-    assert_eq!(fs::read(&screenshot_path).unwrap(), b"hello");
+    assert_eq!(fs::read(&screenshot_path).unwrap(), b"FAKETARGET2");
 
     let ready = tool_call(
         &mut stream,
@@ -1259,6 +1360,154 @@ fn native_tools_run_via_cdp_without_mcp() {
     assert!(
         content_text(&key).contains("dispatched key Escape"),
         "response: {key}"
+    );
+}
+
+fn screenshot_target(env: &TestEnv, stream: &mut UnixStream, id: u64, name: &str) -> String {
+    let path = env.home.join(format!("{name}.png"));
+    let response = tool_call(
+        stream,
+        id,
+        "screenshot_quiet",
+        serde_json::json!({"filePath": path.to_str().unwrap()}),
+    );
+    assert!(
+        content_text(&response).contains("saved screenshot"),
+        "response: {response}"
+    );
+    String::from_utf8(fs::read(&path).unwrap()).unwrap()
+}
+
+#[test]
+fn two_sessions_with_the_same_url_keep_their_own_tab() {
+    let mut env = TestEnv::new("sameurl");
+    env.start_daemon();
+    let first = env.create_session();
+    let second = env.create_session();
+    let mut first_stream = env.connect();
+    let mut second_stream = env.connect();
+    bind_stream(&mut first_stream, &first);
+    bind_stream(&mut second_stream, &second);
+
+    tool_call(
+        &mut first_stream,
+        300,
+        "new_page",
+        serde_json::json!({"url": "https://same.test/"}),
+    );
+    tool_call(
+        &mut second_stream,
+        301,
+        "new_page",
+        serde_json::json!({"url": "https://same.test/"}),
+    );
+
+    assert_eq!(
+        screenshot_target(&env, &mut first_stream, 302, "first"),
+        "FAKETARGET2"
+    );
+    assert_eq!(
+        screenshot_target(&env, &mut second_stream, 303, "second"),
+        "FAKETARGET3"
+    );
+    let key = tool_call(
+        &mut first_stream,
+        304,
+        "dispatch_key",
+        serde_json::json!({"key": "Escape"}),
+    );
+    assert!(
+        content_text(&key).contains("dispatched key Escape"),
+        "response: {key}"
+    );
+}
+
+#[test]
+fn select_page_pins_the_tab_among_tabs_with_the_same_url() {
+    let mut env = TestEnv::new("selectsameurl");
+    env.start_daemon();
+    let owner = env.create_session();
+    let other = env.create_session();
+    let mut owner_stream = env.connect();
+    let mut other_stream = env.connect();
+    bind_stream(&mut owner_stream, &owner);
+    bind_stream(&mut other_stream, &other);
+
+    tool_call(
+        &mut owner_stream,
+        310,
+        "new_page",
+        serde_json::json!({"url": "https://same.test/"}),
+    );
+    tool_call(
+        &mut owner_stream,
+        311,
+        "new_page",
+        serde_json::json!({"url": "https://same.test/"}),
+    );
+
+    for (id, page_id, expected) in [(312, 2, "FAKETARGET2"), (314, 3, "FAKETARGET3")] {
+        tool_call(
+            &mut other_stream,
+            id,
+            "select_page",
+            serde_json::json!({"pageId": page_id}),
+        );
+        assert_eq!(
+            screenshot_target(&env, &mut other_stream, id + 1, "selected"),
+            expected
+        );
+    }
+}
+
+#[test]
+fn session_keeps_its_tab_after_the_url_changes() {
+    let mut env = TestEnv::new("urlchange");
+    env.start_daemon();
+    let owner = env.create_session();
+    let other = env.create_session();
+    let mut owner_stream = env.connect();
+    let mut other_stream = env.connect();
+    bind_stream(&mut owner_stream, &owner);
+    bind_stream(&mut other_stream, &other);
+
+    tool_call(
+        &mut owner_stream,
+        320,
+        "new_page",
+        serde_json::json!({"url": "https://before.test/"}),
+    );
+    env.devtools[0].navigate("FAKETARGET2", "https://after.test/#/redirected");
+
+    assert_eq!(
+        screenshot_target(&env, &mut owner_stream, 321, "owner"),
+        "FAKETARGET2"
+    );
+
+    tool_call(
+        &mut other_stream,
+        322,
+        "select_page",
+        serde_json::json!({"pageId": 2}),
+    );
+    assert_eq!(
+        screenshot_target(&env, &mut other_stream, 323, "other"),
+        "FAKETARGET2"
+    );
+
+    let navigated = tool_call(
+        &mut owner_stream,
+        324,
+        "goto",
+        serde_json::json!({"url": "https://third.test/", "waitExpression": "window.__ready", "interval": 50}),
+    );
+    assert!(
+        content_text(&navigated).contains("navigated to https://third.test/"),
+        "response: {navigated}"
+    );
+    assert_eq!(
+        screenshot_target(&env, &mut owner_stream, 325, "owner-after-goto"),
+        "FAKETARGET2"
     );
 }
 

@@ -93,7 +93,7 @@ This runs on a CDP connection the daemon keeps open for the tab, because Chrome 
 If the watcher cannot attach, the daemon logs `dialog_watch_failed` and carries on; recover a stuck tab with `close_page_quiet`.
 - `type_into {selector, text, clear?}`: focus the matched element and insert text with `Input.insertText`. Use it when a native value setter plus an `input` event does not reach framework state (some React-based forms).
 
-Each session is pinned to the CDP target id of its tab, which stays the same for the life of that tab. Navigation changes the URL but not the target, and daemon-native tools never fall back to another tab: if the session's tab is gone they fail with `session page target <id> is gone` instead of acting on somebody else's page. This matters when several agents share one Chrome profile.
+Each session is pinned to the CDP target id of its tab, which stays the same for the life of that tab. Navigation, redirects and SPA route changes alter the URL but not the target, tabs that share a URL are told apart (`new_page` and `select_page` pin the target id), and daemon-native tools never fall back to another tab: if the session's tab is gone they fail with `session page target <id> is gone` instead of acting on somebody else's page. This matters when several agents share one Chrome profile.
 
 ## Commands
 

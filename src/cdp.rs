@@ -18,48 +18,15 @@ struct PageTarget {
     websocket_path: String,
 }
 
-/// セッションが所有するタブの指し方。`target_id` は CDP の target id で、タブの寿命の
-/// 間ずっと変わらない。`url` は診断用と、target id 未解決時の 1 回きりの解決に使う。
-#[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct PageRef<'a> {
-    pub(crate) target_id: Option<&'a str>,
-    pub(crate) url: Option<&'a str>,
-}
-
-impl<'a> PageRef<'a> {
-    pub(crate) fn new(target_id: Option<&'a str>, url: Option<&'a str>) -> Self {
-        Self { target_id, url }
-    }
-}
-
 /// セッションのタブだけに接続する。**他のタブへフォールバックしない。**
 /// 共有 Chrome では別エージェントのタブが並んでいるので、取り違えると相手のフォームを
 /// 操作してしまう。対象が見つからないときは黙って別のタブを掴まずエラーにする。
-fn connect_page_client(port: u16, page: PageRef<'_>) -> Result<CdpClient, String> {
+fn connect_page_client(port: u16, target_id: &str) -> Result<CdpClient, String> {
     let targets = list_page_targets(port)?;
-    let target = match page.target_id {
-        Some(target_id) => targets
-            .iter()
-            .find(|target| target.id == target_id)
-            .ok_or_else(|| {
-                format!("session page target {target_id} is gone; create a new session")
-            })?,
-        None => {
-            let url = page
-                .url
-                .ok_or_else(|| "session has no page target".to_string())?;
-            let mut matches = targets.iter().filter(|target| target.url == url);
-            let first = matches
-                .next()
-                .ok_or_else(|| format!("no page target for url {url}"))?;
-            if matches.next().is_some() {
-                return Err(format!(
-                    "url {url} matches multiple page targets; cannot pick the session tab"
-                ));
-            }
-            first
-        }
-    };
+    let target = targets
+        .iter()
+        .find(|target| target.id == target_id)
+        .ok_or_else(|| format!("session page target {target_id} is gone; create a new session"))?;
     CdpClient::connect(port, &target.websocket_path)
 }
 
@@ -203,18 +170,27 @@ pub(crate) fn page_target_ids(port: u16) -> Result<Vec<String>, String> {
         .collect())
 }
 
-/// url がちょうど 1 つの target に一致するときだけ target id を返す。
-/// 0 件・複数件では `None` を返し、呼び出し側は解決を諦める。
-pub(crate) fn resolve_unique_target_id(port: u16, url: &str) -> Result<Option<String>, String> {
+pub(crate) fn candidate_target_ids(port: u16, url: Option<&str>) -> Result<Vec<String>, String> {
     let targets = list_page_targets(port)?;
-    let mut matches = targets.iter().filter(|target| target.url == url);
-    let Some(first) = matches.next() else {
-        return Ok(None);
-    };
-    if matches.next().is_some() {
-        return Ok(None);
+    let matching = targets
+        .iter()
+        .filter(|target| Some(target.url.as_str()) == url)
+        .map(|target| target.id.clone())
+        .collect::<Vec<_>>();
+    if matching.is_empty() {
+        return Ok(targets.into_iter().map(|target| target.id).collect());
     }
-    Ok(Some(first.id.clone()))
+    Ok(matching)
+}
+
+pub(crate) fn take_pin_marker(port: u16, target_id: &str) -> Result<Option<String>, String> {
+    let mut client = connect_page_client(port, target_id)?;
+    client.set_read_timeout(Duration::from_secs(3))?;
+    let value = evaluate_value(
+        &mut client,
+        "(() => { const v = window.__cdt_pin; delete window.__cdt_pin; return v === undefined ? null : String(v); })()",
+    )?;
+    Ok(value.as_str().map(str::to_string))
 }
 
 /// CDP の応答を `Value` に読む。`serde_json` の既定はネスト 128 段で打ち切るため、
@@ -305,13 +281,13 @@ fn is_transient_navigation_error(error: &str) -> bool {
 
 pub(crate) fn goto(
     port: u16,
-    page: PageRef<'_>,
+    target_id: &str,
     url: &str,
     wait_expression: &str,
     timeout: Duration,
     interval: Duration,
 ) -> Result<(Duration, String), String> {
-    let mut client = connect_page_client(port, page)?;
+    let mut client = connect_page_client(port, target_id)?;
     client.set_read_timeout(Duration::from_secs(3))?;
     let response = client.call(serde_json::json!({
         "method": "Page.navigate",
@@ -423,7 +399,7 @@ pub(crate) fn allowed_input_path(path: &Path) -> Result<PathBuf, String> {
 
 pub(crate) fn screenshot_quiet(
     port: u16,
-    page: PageRef<'_>,
+    target_id: &str,
     file_path: &Path,
     format: &str,
     quality: Option<u64>,
@@ -443,7 +419,7 @@ pub(crate) fn screenshot_quiet(
     // delay its first paint. Retry transport failures without activating the tab.
     let started = Instant::now();
     let response = loop {
-        let attempt = connect_page_client(port, page).and_then(|mut client| {
+        let attempt = connect_page_client(port, target_id).and_then(|mut client| {
             client.set_read_timeout(Duration::from_secs(5))?;
             client.call(serde_json::json!({
                 "method": "Page.captureScreenshot",
@@ -478,7 +454,7 @@ pub(crate) fn screenshot_quiet(
 /// タブを前面化せず、MCP の queue も経由しない。
 pub(crate) fn print_pdf_quiet(
     port: u16,
-    page: PageRef<'_>,
+    target_id: &str,
     file_path: &Path,
     landscape: bool,
     print_background: bool,
@@ -493,7 +469,7 @@ pub(crate) fn print_pdf_quiet(
     if let Some(scale) = scale {
         params["scale"] = serde_json::json!(scale.clamp(0.1, 2.0));
     }
-    let mut client = connect_page_client(port, page)?;
+    let mut client = connect_page_client(port, target_id)?;
     client.set_read_timeout(Duration::from_secs(60))?;
     let response = client.call(serde_json::json!({
         "method": "Page.printToPDF",
@@ -514,7 +490,7 @@ pub(crate) fn print_pdf_quiet(
 
 pub(crate) fn wait_for_js(
     port: u16,
-    page: PageRef<'_>,
+    target_id: &str,
     expression: &str,
     timeout: Duration,
     interval: Duration,
@@ -528,7 +504,7 @@ pub(crate) fn wait_for_js(
     let mut client: Option<CdpClient> = None;
     loop {
         if client.is_none() {
-            match connect_page_client(port, page) {
+            match connect_page_client(port, target_id) {
                 Ok(new_client) => {
                     let _ = new_client.set_read_timeout(poll_read_timeout);
                     client = Some(new_client);
@@ -583,17 +559,17 @@ fn dispatch_click(client: &mut CdpClient, x: f64, y: f64) -> Result<(), String> 
     Ok(())
 }
 
-pub(crate) fn click_at(port: u16, page: PageRef<'_>, x: f64, y: f64) -> Result<(), String> {
-    let mut client = connect_page_client(port, page)?;
+pub(crate) fn click_at(port: u16, target_id: &str, x: f64, y: f64) -> Result<(), String> {
+    let mut client = connect_page_client(port, target_id)?;
     dispatch_click(&mut client, x, y)
 }
 
 pub(crate) fn click_selector(
     port: u16,
-    page: PageRef<'_>,
+    target_id: &str,
     selector: &str,
 ) -> Result<(f64, f64), String> {
-    let mut client = connect_page_client(port, page)?;
+    let mut client = connect_page_client(port, target_id)?;
     let selector_json = serde_json::json!(selector).to_string();
     let expression = format!(
         "(() => {{ const el = document.querySelector({selector_json}); if (!el) return null; el.scrollIntoView({{block: 'center', inline: 'center'}}); const r = el.getBoundingClientRect(); return {{x: r.x + r.width / 2, y: r.y + r.height / 2}}; }})()"
@@ -652,11 +628,11 @@ fn key_info(key: &str) -> (String, i64, Option<String>) {
 
 pub(crate) fn dispatch_key(
     port: u16,
-    page: PageRef<'_>,
+    target_id: &str,
     key: &str,
     modifiers: u64,
 ) -> Result<(), String> {
-    let mut client = connect_page_client(port, page)?;
+    let mut client = connect_page_client(port, target_id)?;
     let (code, virtual_key_code, text) = key_info(key);
     let mut down = serde_json::json!({
         "method": "Input.dispatchKeyEvent",
@@ -690,13 +666,13 @@ pub(crate) fn dispatch_key(
 
 pub(crate) fn set_file_input_files(
     port: u16,
-    page: PageRef<'_>,
+    target_id: &str,
     files: &[String],
 ) -> Result<(), String> {
     if files.is_empty() {
         return Err("upload_file fallback requires at least one file".to_string());
     }
-    let mut client = connect_page_client(port, page)?;
+    let mut client = connect_page_client(port, target_id)?;
     let object_id = first_file_input_object_id(&mut client)?;
     let outcome = client.call(serde_json::json!({
         "method": "DOM.setFileInputFiles",
@@ -715,14 +691,14 @@ pub(crate) fn set_file_input_files(
 /// どれに添付するかを呼び出し側が決められる。
 pub(crate) fn set_file_input(
     port: u16,
-    page: PageRef<'_>,
+    target_id: &str,
     selector: &str,
     files: &[String],
 ) -> Result<(), String> {
     if files.is_empty() {
         return Err("set_file_input requires at least one file".to_string());
     }
-    let mut client = connect_page_client(port, page)?;
+    let mut client = connect_page_client(port, target_id)?;
     let selector_json = serde_json::json!(selector).to_string();
     let kind = evaluate_value(
         &mut client,
@@ -757,12 +733,12 @@ pub(crate) fn set_file_input(
 /// (React 系の一部 ATS) でも、実キー入力と同じ経路になるので値が反映される。
 pub(crate) fn type_into(
     port: u16,
-    page: PageRef<'_>,
+    target_id: &str,
     selector: &str,
     text: &str,
     clear: bool,
 ) -> Result<(), String> {
-    let mut client = connect_page_client(port, page)?;
+    let mut client = connect_page_client(port, target_id)?;
     let selector_json = serde_json::json!(selector).to_string();
     let focused = evaluate_value(
         &mut client,

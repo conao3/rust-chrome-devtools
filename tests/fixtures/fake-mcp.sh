@@ -17,6 +17,15 @@ save_state() {
   fi
 }
 
+fake_devtools() {
+  local port
+  port=$(cat "${HOME}/.cache/chrome-devtools/daemons/default.port" 2>/dev/null) || return 0
+  exec 9<>"/dev/tcp/127.0.0.1/${port}" || return 0
+  printf 'GET %s HTTP/1.1\r\nHost: fake\r\nConnection: close\r\n\r\n' "$1" >&9
+  cat <&9 > /dev/null
+  exec 9>&-
+}
+
 json_escape() {
   printf '%s' "$1" | sed ':a;N;$!ba;s|\\|\\\\|g; s|"|\\"|g; s|\n|\\n|g'
 }
@@ -157,6 +166,7 @@ while IFS= read -r line; do
           set_page_url "$page_id" "$url"
           selected_page="$page_id"
           save_state
+          fake_devtools "/__fake/add?id=FAKETARGET${page_id}&url=${url}"
           tool_response "$id" "$(pages_text)" "{\"pages\":$(pages_structured)}" ;;
         list_pages)
           tool_response "$id" "$(pages_text)" "{\"pages\":$(pages_structured)}" ;;
@@ -210,7 +220,11 @@ while IFS= read -r line; do
           page_id=$(field_number "$line" pageId)
           [ -z "$page_id" ] && page_id="$selected_page"
           arg=$(field_array_string "$line" args)
-          if [ -n "$arg" ] && [ "$arg" != "${page_id}_button" ]; then
+          pin=$(printf '%s' "$line" | sed -n "s/.*__cdt_pin = '\([^']*\)'.*/\1/p")
+          if [ -n "$pin" ]; then
+            fake_devtools "/__fake/marker?id=FAKETARGET${page_id}&value=${pin}"
+            tool_response "$id" "pinned page=$page_id" "{}"
+          elif [ -n "$arg" ] && [ "$arg" != "${page_id}_button" ]; then
             error_response "$id" "wrong eval arg page=$page_id arg=$arg"
           else
             tool_response "$id" "evaluated page=$page_id arg=$arg" "{}"

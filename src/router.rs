@@ -1371,11 +1371,18 @@ fn ensure_session_page(
     let page_id = selected_page_id(&response)
         .ok_or_else(|| "failed to determine the allocated page id".to_string())?;
     let target_id = port.and_then(|port| {
-        let after = cdp::page_target_ids(port).ok()?;
-        let mut added = after.into_iter().filter(|id| !before.contains(id));
-        let first = added.next()?;
-        // 同時に複数タブが増えたら、どれが自分のものか決められない。
-        added.next().is_none().then_some(first)
+        added_target_id(port, &before).or_else(|| {
+            pin_page_target(
+                mcp_stdin,
+                mcp_reader,
+                next_id,
+                abandoned_ids,
+                port,
+                page_id,
+                Some("about:blank"),
+            )
+            .ok()
+        })
     });
     {
         let (lock, _) = &**sessions;
@@ -1389,6 +1396,104 @@ fn ensure_session_page(
         attach_dialog_watcher(sessions, session_id, port, target_id);
     }
     Ok(page_id)
+}
+
+fn added_target_id(port: u16, before: &[String]) -> Option<String> {
+    let after = cdp::page_target_ids(port).ok()?;
+    let mut added = after.into_iter().filter(|id| !before.contains(id));
+    let first = added.next()?;
+    added.next().is_none().then_some(first)
+}
+
+fn pin_page_target(
+    mcp_stdin: &mut impl Write,
+    mcp_reader: &mut impl BufRead,
+    next_id: &mut u64,
+    abandoned_ids: &mut HashMap<u64, Instant>,
+    port: u16,
+    page_id: u64,
+    url: Option<&str>,
+) -> Result<String, String> {
+    let candidates = cdp::candidate_target_ids(port, url)?;
+    match candidates.as_slice() {
+        [] => return Err("no page targets are open".to_string()),
+        [only] => return Ok(only.clone()),
+        _ => {}
+    }
+    let token = generate_session_id();
+    let response = mcp_call(
+        mcp_stdin,
+        mcp_reader,
+        next_id,
+        abandoned_ids,
+        serde_json::json!({
+            "method": "tools/call",
+            "params": {
+                "name": "evaluate_script",
+                "arguments": {
+                    "pageId": page_id,
+                    "function": format!("() => {{ window.__cdt_pin = '{token}'; return true; }}")
+                }
+            }
+        }),
+    )?;
+    if response.get("error").is_some()
+        || response
+            .get("result")
+            .and_then(|result| result.get("isError"))
+            .and_then(|is_error| is_error.as_bool())
+            == Some(true)
+    {
+        return Err(format!(
+            "could not place a pin marker on MCP page {page_id}: {response}"
+        ));
+    }
+    for candidate in &candidates {
+        if let Ok(Some(found)) = cdp::take_pin_marker(port, candidate) {
+            if found == token {
+                return Ok(candidate.clone());
+            }
+        }
+    }
+    Err(format!(
+        "none of the {} candidate tabs carries the pin marker of MCP page {page_id}",
+        candidates.len()
+    ))
+}
+
+fn ensure_session_target(
+    mcp_stdin: &mut impl Write,
+    mcp_reader: &mut impl BufRead,
+    profile: &Profile,
+    sessions: &SharedSessions,
+    session_id: &str,
+    next_id: &mut u64,
+    abandoned_ids: &mut HashMap<u64, Instant>,
+) -> Result<String, String> {
+    if let Some(target_id) = session_target_id(sessions, session_id) {
+        return Ok(target_id);
+    }
+    let port = current_port(profile).ok_or_else(|| "missing DevTools port".to_string())?;
+    let page_id =
+        session_page(sessions, session_id).ok_or_else(|| "session has no page".to_string())?;
+    let url = session_page_url(sessions, session_id);
+    let target_id = pin_page_target(
+        mcp_stdin,
+        mcp_reader,
+        next_id,
+        abandoned_ids,
+        port,
+        page_id,
+        url.as_deref(),
+    )
+    .map_err(|error| {
+        format!(
+            "could not tell which tab is the session page (MCP page {page_id}); run select_page again or create a new session: {error}"
+        )
+    })?;
+    set_session_target_id(sessions, session_id, Some(target_id.clone()));
+    attach_dialog_watcher(sessions, session_id, port, &target_id);
+    Ok(target_id)
 }
 
 /// tab に JavaScript ダイアログの watcher を張る。張れなくても tool の実行は続けたいので、
@@ -1666,7 +1771,7 @@ fn run_native_tool(
     profile: &Profile,
     sessions: &SharedSessions,
     session_id: Option<&str>,
-    page: cdp::PageRef<'_>,
+    target_id: &str,
     name: &str,
     arguments: &serde_json::Value,
 ) -> Result<String, String> {
@@ -1706,7 +1811,7 @@ fn run_native_tool(
                 .clamp(50, 10_000);
             let (elapsed, final_url) = cdp::goto(
                 port,
-                page,
+                target_id,
                 url,
                 &wait_expression,
                 Duration::from_millis(timeout),
@@ -1743,7 +1848,7 @@ fn run_native_tool(
             let quality = arguments.get("quality").and_then(|value| value.as_u64());
             let output = cdp::screenshot_quiet(
                 port,
-                page,
+                target_id,
                 std::path::Path::new(file_path),
                 format,
                 quality,
@@ -1775,7 +1880,7 @@ fn run_native_tool(
                 .clamp(50, 10_000);
             let elapsed = cdp::wait_for_js(
                 port,
-                page,
+                target_id,
                 &expression,
                 Duration::from_millis(timeout),
                 Duration::from_millis(interval),
@@ -1794,7 +1899,7 @@ fn run_native_tool(
                 .get("y")
                 .and_then(|value| value.as_f64())
                 .ok_or_else(|| "click_at requires numeric 'y'".to_string())?;
-            cdp::click_at(port, page, x, y)?;
+            cdp::click_at(port, target_id, x, y)?;
             Ok(format!("clicked at ({x}, {y})"))
         }
         "click_selector" => {
@@ -1802,7 +1907,7 @@ fn run_native_tool(
                 .get("selector")
                 .and_then(|value| value.as_str())
                 .ok_or_else(|| "click_selector requires 'selector'".to_string())?;
-            let (x, y) = cdp::click_selector(port, page, selector)?;
+            let (x, y) = cdp::click_selector(port, target_id, selector)?;
             Ok(format!("clicked {selector} at ({x:.0}, {y:.0})"))
         }
         "dispatch_key" => {
@@ -1814,7 +1919,7 @@ fn run_native_tool(
                 .get("modifiers")
                 .and_then(|value| value.as_u64())
                 .unwrap_or(0);
-            cdp::dispatch_key(port, page, key, modifiers)?;
+            cdp::dispatch_key(port, target_id, key, modifiers)?;
             Ok(format!("dispatched key {key}"))
         }
         "set_file_input" => {
@@ -1842,7 +1947,7 @@ fn run_native_tool(
                         .map(|resolved| resolved.to_string_lossy().into_owned())
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            cdp::set_file_input(port, page, selector, &files)?;
+            cdp::set_file_input(port, target_id, selector, &files)?;
             Ok(format!("attached {} file(s) to {selector}", files.len()))
         }
         "print_pdf_quiet" => {
@@ -1861,7 +1966,7 @@ fn run_native_tool(
             let scale = arguments.get("scale").and_then(|value| value.as_f64());
             let output = cdp::print_pdf_quiet(
                 port,
-                page,
+                target_id,
                 std::path::Path::new(file_path),
                 landscape,
                 print_background,
@@ -1870,9 +1975,6 @@ fn run_native_tool(
             Ok(format!("saved PDF to {}", output.display()))
         }
         "close_page_quiet" => {
-            let target_id = page
-                .target_id
-                .ok_or_else(|| "close_page_quiet requires a session page".to_string())?;
             cdp::close_target(port, target_id)?;
             if let Some(session_id) = session_id {
                 let (lock, _) = &**sessions;
@@ -1895,7 +1997,7 @@ fn run_native_tool(
                 .get("clear")
                 .and_then(|value| value.as_bool())
                 .unwrap_or(false);
-            cdp::type_into(port, page, selector, text, clear)?;
+            cdp::type_into(port, target_id, selector, text, clear)?;
             Ok(format!(
                 "typed {} char(s) into {selector}",
                 text.chars().count()
@@ -1927,30 +2029,27 @@ pub(crate) fn try_native_tool(
     // one once; after that, native tools can keep bypassing the MCP queue.
     let session_id = session_id?;
     session_page(sessions, session_id)?;
+    // target id が未解決の session は MCP の page id から解決する必要があり、MCP の
+    // queue に載せる経路 (route_request) に任せる。
+    let target_id = session_target_id(sessions, session_id)?;
     let id = value.get("id").cloned().unwrap_or(serde_json::Value::Null);
     let empty_args = serde_json::json!({});
     let arguments = value
         .get("params")
         .and_then(|params| params.get("arguments"))
         .unwrap_or(&empty_args);
-    let page_url = session_page_url(sessions, session_id);
-    // target id が未解決のセッション (daemon respawn 後など) は、URL が一意に定まる
-    // ときだけ 1 回解決して固定する。以後は URL が変わっても同じタブを掴み続ける。
-    let mut target_id = session_target_id(sessions, session_id);
-    if target_id.is_none() {
-        if let (Some(port), Some(url)) = (current_port(profile), page_url.as_deref()) {
-            if let Ok(Some(resolved)) = cdp::resolve_unique_target_id(port, url) {
-                set_session_target_id(sessions, session_id, Some(resolved.clone()));
-                target_id = Some(resolved);
-            }
-        }
+    if let Some(port) = current_port(profile) {
+        attach_dialog_watcher(sessions, session_id, port, &target_id);
     }
-    if let (Some(port), Some(target_id)) = (current_port(profile), target_id.as_deref()) {
-        attach_dialog_watcher(sessions, session_id, port, target_id);
-    }
-    let page = cdp::PageRef::new(target_id.as_deref(), page_url.as_deref());
     Some(
-        match run_native_tool(profile, sessions, Some(session_id), page, &name, arguments) {
+        match run_native_tool(
+            profile,
+            sessions,
+            Some(session_id),
+            &target_id,
+            &name,
+            arguments,
+        ) {
             Ok(text) => native_tool_response(id, text, false),
             Err(message) => native_tool_response(id, format!("{name} failed: {message}"), true),
         },
@@ -2314,6 +2413,7 @@ fn route_request(
         "new_page" => route_new_page(
             mcp_stdin,
             mcp_reader,
+            profile,
             sessions,
             session_id,
             value,
@@ -2330,6 +2430,7 @@ fn route_request(
         "select_page" => route_select_page(
             mcp_stdin,
             mcp_reader,
+            profile,
             sessions,
             session_id,
             &value,
@@ -2359,6 +2460,22 @@ fn route_request(
                 next_id,
                 abandoned_ids,
             )?;
+            if let Err(message) = ensure_session_target(
+                mcp_stdin,
+                mcp_reader,
+                profile,
+                sessions,
+                session_id,
+                next_id,
+                abandoned_ids,
+            ) {
+                let id = value.get("id").cloned().unwrap_or(serde_json::Value::Null);
+                return Ok(native_tool_response(
+                    id,
+                    format!("{other} failed: {message}"),
+                    true,
+                ));
+            }
             try_native_tool(profile, sessions, Some(session_id), line)
                 .ok_or_else(|| format!("failed to route native tool: {other}"))
         }
@@ -2420,13 +2537,9 @@ fn route_request(
                     .and_then(|port| {
                         // fallback も session のタブに固定する。target id が取れない
                         // ときは別タブへ渡さず失敗させる (projects メモの session 境界要件)。
-                        let url = session_page_url(sessions, session_id);
-                        let target_id = session_target_id(sessions, session_id);
-                        cdp::set_file_input_files(
-                            port,
-                            cdp::PageRef::new(target_id.as_deref(), url.as_deref()),
-                            &upload_paths,
-                        )
+                        let target_id = session_target_id(sessions, session_id)
+                            .ok_or_else(|| "session page target is not resolved".to_string())?;
+                        cdp::set_file_input_files(port, &target_id, &upload_paths)
                     }) {
                     Ok(()) => {
                         eprintln!("upload_file_fallback session={session_id} page={page_id}");
@@ -2481,9 +2594,11 @@ fn annotate_session_page(mut lines: Vec<String>, page_id: Option<u64>) -> Vec<St
     lines
 }
 
+#[allow(clippy::too_many_arguments)]
 fn route_new_page(
     mcp_stdin: &mut impl Write,
     mcp_reader: &mut impl BufRead,
+    profile: &Profile,
     sessions: &SharedSessions,
     session_id: Option<&str>,
     value: serde_json::Value,
@@ -2511,6 +2626,10 @@ fn route_new_page(
             .entry("background".to_string())
             .or_insert_with(|| serde_json::json!(true));
     }
+    let port = current_port(profile);
+    let before = port
+        .and_then(|port| cdp::page_target_ids(port).ok())
+        .unwrap_or_default();
     let lines = forward_line(
         mcp_stdin,
         mcp_reader,
@@ -2521,7 +2640,25 @@ fn route_new_page(
     if let (Some(session_id), Some(last)) = (session_id, lines.last()) {
         if let Ok(response) = serde_json::from_str::<serde_json::Value>(last) {
             if let Some(page_id) = selected_page_id(&response) {
-                let _ = record_session_page(sessions, session_id, page_id, true, url);
+                let _ = record_session_page(sessions, session_id, page_id, true, url.clone());
+                if let Some(port) = port {
+                    let target_id = added_target_id(port, &before).or_else(|| {
+                        pin_page_target(
+                            mcp_stdin,
+                            mcp_reader,
+                            next_id,
+                            abandoned_ids,
+                            port,
+                            page_id,
+                            url.as_deref(),
+                        )
+                        .ok()
+                    });
+                    if let Some(target_id) = target_id {
+                        set_session_target_id(sessions, session_id, Some(target_id.clone()));
+                        attach_dialog_watcher(sessions, session_id, port, &target_id);
+                    }
+                }
             }
         }
     }
@@ -2532,6 +2669,7 @@ fn route_new_page(
 fn route_select_page(
     mcp_stdin: &mut impl Write,
     mcp_reader: &mut impl BufRead,
+    profile: &Profile,
     sessions: &SharedSessions,
     session_id: Option<&str>,
     value: &serde_json::Value,
@@ -2554,9 +2692,6 @@ fn route_select_page(
             .map(|response| response.get("error").is_some())
             .unwrap_or(false);
         if !errored {
-            // 選んだ page の url を残す。daemon-native tool は target id で繋ぐが、
-            // select_page の時点では target id が分からないので、url から 1 回だけ
-            // 解決させる。url が無いと接続先を決められず native tool が全部落ちる。
             let url = response
                 .as_ref()
                 .map(response_page_entries)
@@ -2568,6 +2703,15 @@ fn route_select_page(
                 })
                 .filter(|url| !url.is_empty());
             let _ = record_session_page(sessions, session_id, page_id, false, url);
+            let _ = ensure_session_target(
+                mcp_stdin,
+                mcp_reader,
+                profile,
+                sessions,
+                session_id,
+                next_id,
+                abandoned_ids,
+            );
         }
     }
     Ok(lines)
