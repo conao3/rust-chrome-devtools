@@ -1744,12 +1744,17 @@ impl RealChrome {
             .arg("about:blank")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(fs::File::create(profile_dir.join("chrome.stderr")).unwrap())
             .spawn()
             .unwrap();
-        let active_port = profile_dir.join("DevToolsActivePort");
+        let mut chrome = Self {
+            child,
+            port: 0,
+            profile_dir,
+        };
+        let active_port = chrome.profile_dir.join("DevToolsActivePort");
         let started = Instant::now();
-        let port = loop {
+        chrome.port = loop {
             if let Some(port) = fs::read_to_string(&active_port).ok().and_then(|text| {
                 text.lines()
                     .next()
@@ -1757,18 +1762,65 @@ impl RealChrome {
             }) {
                 break port;
             }
+            chrome.assert_alive("publishing DevToolsActivePort");
             assert!(
                 started.elapsed() < Duration::from_secs(30),
-                "Chrome did not publish DevToolsActivePort"
+                "Chrome did not publish DevToolsActivePort: {}",
+                chrome.diagnostics()
             );
             thread::sleep(Duration::from_millis(100));
         };
-        Self {
-            child,
-            port,
-            profile_dir,
+        while !(http_get_body(chrome.port, "/json/version").contains("200 OK")
+            && http_get_body(chrome.port, "/json").contains("\"type\": \"page\""))
+        {
+            chrome.assert_alive("serving DevTools HTTP");
+            assert!(
+                started.elapsed() < Duration::from_secs(60),
+                "Chrome DevTools HTTP did not become ready: {}",
+                chrome.diagnostics()
+            );
+            thread::sleep(Duration::from_millis(100));
+        }
+        chrome
+    }
+
+    fn assert_alive(&mut self, phase: &str) {
+        if let Ok(Some(status)) = self.child.try_wait() {
+            panic!(
+                "Chrome exited with {status} while {phase}: {}",
+                self.diagnostics()
+            );
         }
     }
+
+    fn diagnostics(&self) -> String {
+        let stderr = fs::read_to_string(self.profile_dir.join("chrome.stderr")).unwrap_or_default();
+        let version = http_get_body(self.port, "/json/version");
+        format!(
+            "port={} /json/version={version:?} stderr={stderr}",
+            self.port
+        )
+    }
+}
+
+fn http_get_body(port: u16, path: &str) -> String {
+    let Ok(mut stream) = TcpStream::connect(("127.0.0.1", port)) else {
+        return String::new();
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+    let request = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+    if stream.write_all(request.as_bytes()).is_err() {
+        return String::new();
+    }
+    let mut response = Vec::new();
+    let mut chunk = [0u8; 4096];
+    while let Ok(bytes) = stream.read(&mut chunk) {
+        if bytes == 0 {
+            break;
+        }
+        response.extend_from_slice(&chunk[..bytes]);
+    }
+    String::from_utf8_lossy(&response).to_string()
 }
 
 impl Drop for RealChrome {
