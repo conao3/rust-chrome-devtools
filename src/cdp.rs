@@ -19,9 +19,9 @@ struct PageTarget {
     websocket_path: String,
 }
 
-/// セッションのタブだけに接続する。**他のタブへフォールバックしない。**
-/// 共有 Chrome では別エージェントのタブが並んでいるので、取り違えると相手のフォームを
-/// 操作してしまう。対象が見つからないときは黙って別のタブを掴まずエラーにする。
+/// Connects only to the session's tab. **Never falls back to another tab.** A shared Chrome has
+/// other agents' tabs side by side, and picking the wrong one would operate on someone else's form.
+/// When the target is missing, return an error instead of silently grabbing another tab.
 fn connect_page_client(port: u16, target_id: &str) -> Result<CdpClient, String> {
     let targets = list_page_targets(port)?;
     let target = targets
@@ -31,29 +31,31 @@ fn connect_page_client(port: u16, target_id: &str) -> Result<CdpClient, String> 
     CdpClient::connect(port, &target.websocket_path)
 }
 
-/// JavaScript ダイアログを開いた種類ごとにどう閉じるかを決める。
+/// Decides how to dismiss a JavaScript dialog based on its type.
 ///
-/// `beforeunload` は agent が遷移を意図して出しているので通す。`alert` は閉じる以外の
-/// 選択肢が無い。`confirm` / `prompt` はページの状態を変えうるので、承諾せずに閉じる。
+/// `beforeunload` is let through because the agent triggered it intending to navigate. `alert` has
+/// no option other than closing. `confirm` / `prompt` can change page state, so they are dismissed
+/// without accepting.
 pub(crate) fn dialog_accepts(dialog_type: &str) -> bool {
     matches!(dialog_type, "beforeunload" | "alert")
 }
 
-/// session の tab に張り付いて JavaScript ダイアログを閉じ続ける常設接続。
+/// Persistent connection attached to the session's tab that keeps dismissing JavaScript dialogs.
 ///
-/// ページに alert / confirm / prompt / beforeunload が開くと puppeteer の tool 実行が
-/// 返らず、MCP の toolMutex が塞がって後続の request が全部待たされる。Chrome の
-/// PageHandler は pending なダイアログをクライアントごとに持つため、開いてから接続した
-/// クライアントが `Page.handleJavaScriptDialog` を送っても `No dialog is showing` になる。
-/// ダイアログが開く前から `Page.enable` した接続を保っておく必要がある。
+/// When an alert / confirm / prompt / beforeunload opens, puppeteer's tool execution never returns,
+/// MCP's toolMutex stays held, and every subsequent request waits. Chrome's PageHandler tracks
+/// pending dialogs per client, so a client that connects after the dialog opened gets `No dialog is
+/// showing` when it sends `Page.handleJavaScriptDialog`. A connection that ran `Page.enable` before
+/// the dialog opened has to be kept alive.
 pub(crate) struct DialogWatcher {
     target_id: String,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl DialogWatcher {
-    /// tab に接続してイベント購読スレッドを起こす。接続や `Page.enable` に失敗したら
-    /// 呼び出し側の処理は続けたいので、エラーは返すだけで daemon は止めない。
+    /// Connects to the tab and starts the event subscription thread. If connecting or `Page.enable`
+    /// fails, the caller should still carry on, so the error is only returned and the daemon keeps
+    /// running.
     pub(crate) fn spawn(port: u16, target_id: &str, session_id: &str) -> Result<Self, String> {
         let targets = list_page_targets(port)?;
         let target = targets
@@ -144,9 +146,9 @@ fn watch_dialogs(
     }
 }
 
-/// session が所有する tab を閉じる。MCP の `close_page` は toolMutex の後ろに並ぶので、
-/// ダイアログや重い tool で MCP が詰まっている間は届かない。DevTools の HTTP endpoint を
-/// 直接叩くこの経路なら詰まった状態でも閉じられ、閉じた時点で MCP が回復する。
+/// Closes the tab owned by the session. MCP's `close_page` queues behind the toolMutex, so it never
+/// arrives while MCP is stuck on a dialog or a heavy tool. Hitting the DevTools HTTP endpoint
+/// directly can close the tab even in that state, and MCP recovers once it is closed.
 pub(crate) fn close_target(port: u16, target_id: &str) -> Result<(), String> {
     let targets = list_page_targets(port)?;
     if !targets.iter().any(|target| target.id == target_id) {
@@ -162,8 +164,8 @@ pub(crate) fn close_target(port: u16, target_id: &str) -> Result<(), String> {
     ))
 }
 
-/// `/json` の page target id を列挙する。`new_page` の前後で差分を取り、
-/// セッションに割り当てられたタブの target id を確定するのに使う。
+/// Lists the page target ids from `/json`. Used to diff before and after `new_page` to pin down the
+/// target id of the tab assigned to the session.
 pub(crate) fn page_target_ids(port: u16) -> Result<Vec<String>, String> {
     Ok(list_page_targets(port)?
         .into_iter()
@@ -194,9 +196,9 @@ pub(crate) fn take_pin_marker(port: u16, target_id: &str) -> Result<Option<Strin
     Ok(value.as_str().map(str::to_string))
 }
 
-/// CDP の応答を `Value` に読む。`serde_json` の既定はネスト 128 段で打ち切るため、
-/// Gmail のように DOM が深いページの応答が `recursion limit exceeded` で落ちる。
-/// 相手はローカルの Chrome なので、深さの上限を外して読む。
+/// Reads a CDP response into a `Value`. `serde_json` stops at 128 levels of nesting by default, so
+/// responses from pages with deep DOMs such as Gmail fail with `recursion limit exceeded`. The peer
+/// is the local Chrome, so read without a depth limit.
 pub(crate) fn parse_cdp_value(text: &str, what: &str) -> Result<Value, String> {
     use serde::Deserialize;
 
@@ -233,8 +235,8 @@ fn evaluate_value(client: &mut CdpClient, expression: &str) -> Result<Value, Str
         .unwrap_or(Value::Null))
 }
 
-/// JS 式が返した要素の CDP objectId を取る。`DOM.getDocument` で DOM ツリー全体を
-/// 引き寄せる経路を避けられるので、ノード数の多いページでも応答が小さいままになる。
+/// Gets the CDP objectId of the element returned by a JS expression. This avoids pulling in the
+/// whole DOM tree via `DOM.getDocument`, so responses stay small even on pages with many nodes.
 fn evaluate_object_id(client: &mut CdpClient, expression: &str) -> Result<Option<String>, String> {
     let response = client.call(serde_json::json!({
         "method": "Runtime.evaluate",
@@ -262,7 +264,8 @@ fn evaluate_object_id(client: &mut CdpClient, expression: &str) -> Result<Option
         .map(|object_id| object_id.to_string()))
 }
 
-/// 使い終わった remote object を解放する。失敗しても呼び出し側の成否は変えない。
+/// Releases a remote object once it is no longer needed. Failure does not change whether the caller
+/// succeeds.
 fn release_object(client: &mut CdpClient, object_id: &str) {
     let _ = client.call(serde_json::json!({
         "method": "Runtime.releaseObject",
@@ -404,8 +407,8 @@ fn allowed_output_path(path: &Path, tool: &str) -> Result<PathBuf, String> {
     Ok(parent.join(file_name))
 }
 
-/// アップロード対象のパスを検証する。MCP の roots と同じ範囲 ($HOME と OS の temp)
-/// に制限し、実在するファイルだけを通す。
+/// Validates a path to upload. Restricts it to the same scope as the MCP roots ($HOME and the OS
+/// temp directory) and only lets existing files through.
 pub(crate) fn allowed_input_path(path: &Path) -> Result<PathBuf, String> {
     if !path.is_absolute() {
         return Err(format!("file path must be absolute: {}", path.display()));
@@ -486,8 +489,8 @@ pub(crate) fn screenshot_quiet(
     Ok(output)
 }
 
-/// ページを PDF にして保存する。証憑 (請求書・領収書・メール) をそのまま残すのに使う。
-/// タブを前面化せず、MCP の queue も経由しない。
+/// Saves the page as a PDF. Used to keep records (invoices, receipts, emails) as they are. Does not
+/// bring the tab to the front and bypasses the MCP queue.
 pub(crate) fn print_pdf_quiet(
     port: u16,
     target_id: &str,
@@ -531,11 +534,13 @@ pub(crate) fn wait_for_js(
     timeout: Duration,
     interval: Duration,
 ) -> Result<Duration, String> {
-    // 式は毎回 !!() で bool に潰す。syntax error / throw は poll せず即エラーにする。
+    // Always coerce the expression to a bool with !!(). A syntax error or throw fails immediately
+    // without polling.
     let wrapped = format!("!!({expression})");
     let started = Instant::now();
-    // クリック起点のページ遷移中は CDP 接続が応答しない/壊れることがあるため、
-    // poll ごとの read timeout を短くし、接続系エラーは deadline 内で再接続して続行する。
+    // The CDP connection may stop responding or break while a click triggers navigation, so keep
+    // the per-poll read timeout short and reconnect on connection errors as long as the deadline
+    // allows.
     let poll_read_timeout = Duration::from_secs(3);
     let mut client: Option<CdpClient> = None;
     loop {
@@ -565,7 +570,7 @@ pub(crate) fn wait_for_js(
             }
             Err(error) if error.starts_with("expression threw:") => return Err(error),
             Err(_) => {
-                // 遷移などによる接続断: 次のループで張り直す。
+                // Connection dropped, e.g. by navigation: reconnect on the next iteration.
                 client = None;
             }
         }
@@ -619,7 +624,8 @@ pub(crate) fn click_selector(
 }
 
 fn key_info(key: &str) -> (String, i64, Option<String>) {
-    // (code, windowsVirtualKeyCode, text) の対応。text は文字入力を伴うキーのみ。
+    // Maps to (code, windowsVirtualKeyCode, text). text is set only for keys that produce character
+    // input.
     match key {
         "Enter" => ("Enter".to_string(), 13, Some("\r".to_string())),
         "Escape" => ("Escape".to_string(), 27, None),
@@ -714,9 +720,9 @@ pub(crate) fn set_file_input_files(
     Ok(())
 }
 
-/// セレクタで指定した `input[type=file]` にファイルを渡す。file chooser を使わないので
-/// 他 session の chooser を横取りする余地がなく、file input が複数あるページでも
-/// どれに添付するかを呼び出し側が決められる。`iframe >>> input` で iframe の中も指せる。
+/// Hands files to the `input[type=file]` matched by the selector. Not using the file chooser leaves
+/// no way to steal another session's chooser, and on pages with several file inputs the caller
+/// decides which one gets the attachment. `iframe >>> input` reaches inside iframes.
 pub(crate) fn set_file_input(
     port: u16,
     target_id: &str,
@@ -737,9 +743,9 @@ pub(crate) fn set_file_input(
     outcome
 }
 
-/// セレクタの要素に実フォーカスを当て、`Input.insertText` で文字列を入れる。
-/// native value setter + `input` イベントでは state が更新されないフレームワーク
-/// (React 系の一部 ATS) でも、実キー入力と同じ経路になるので値が反映される。
+/// Gives the selector's element real focus and inserts the string with `Input.insertText`. This
+/// follows the same path as real key input, so the value sticks even in frameworks (some
+/// React-based ATSs) whose state is not updated by a native value setter plus an `input` event.
 pub(crate) fn type_into(
     port: u16,
     target_id: &str,
@@ -804,8 +810,8 @@ pub(crate) fn type_into(
     Ok(())
 }
 
-/// `upload_file` の fallback が使う file input を探す。form 内を先に見るのは、
-/// ページ先頭に隠し input を置くサイトで本来の添付欄を外さないため。
+/// Finds the file input used by the `upload_file` fallback. Inputs inside a form are checked first
+/// so that sites with a hidden input at the top of the page do not miss the real attachment field.
 fn first_file_input_object_id(client: &mut CdpClient) -> Result<String, String> {
     for selector in ["form input[type=file]", "input[type=file]"] {
         let selector_json = serde_json::json!(selector).to_string();
@@ -858,9 +864,9 @@ fn http_get(port: u16, path: &str) -> Result<String, String> {
                 .as_bytes(),
         )
         .map_err(|error| format!("failed to request DevTools HTTP: {error}"))?;
-    // Chrome は Connection: close を送っても接続を維持することがあり、EOF 依存の
-    // read_to_string は read timeout (EAGAIN) で死ぬ。Content-Length を読んで
-    // その分だけ body を読む。
+    // Chrome may keep the connection open even after sending Connection: close, so an EOF-based
+    // read_to_string dies on the read timeout (EAGAIN). Read Content-Length and read exactly that
+    // much body.
     let mut reader = BufReader::new(&mut stream);
     let mut status = String::new();
     reader
@@ -898,7 +904,7 @@ fn http_get(port: u16, path: &str) -> Result<String, String> {
                 .map_err(|error| format!("DevTools HTTP body is not UTF-8: {error}"))
         }
         None => {
-            // Content-Length なし (chunked 等は DevTools では想定外): EOF まで読む。
+            // No Content-Length (chunked etc. is not expected from DevTools): read until EOF.
             let mut body = String::new();
             reader
                 .read_to_string(&mut body)
@@ -1025,8 +1031,8 @@ fn read_ws_text(stream: &mut TcpStream) -> Result<String, String> {
     read_ws_text_body(stream, head)
 }
 
-/// 読み取り待ちで期限が来たら `Ok(None)` を返す。イベント購読ループが停止フラグを
-/// 見に戻れるようにするための入口で、フレームの途中で切れることはない。
+/// Returns `Ok(None)` when the deadline passes while waiting to read. This is the entry point that
+/// lets the event subscription loop go back and check its stop flag; it never cuts a frame in half.
 fn read_ws_text_deadline(stream: &mut TcpStream) -> Result<Option<String>, String> {
     let mut head = [0_u8; 2];
     match stream.read_exact(&mut head) {

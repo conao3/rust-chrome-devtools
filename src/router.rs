@@ -67,9 +67,9 @@ pub(crate) fn mcp_heavy_request_timeout() -> Duration {
         .unwrap_or(MCP_HEAVY_REQUEST_TIMEOUT)
 }
 
-// Chrome の Accessibility.getFullAXTree は DOM ノード数に対し超線形 (~O(n^2)) で、
-// 巨大ページでは分単位かかる。timeout で見放しても MCP は処理を中断しないため
-// (単一 tool mutex も保持したまま)、これらの tool は長い deadline で待つ方が損が少ない。
+// Chrome's Accessibility.getFullAXTree is superlinear (~O(n^2)) in the number of DOM nodes and
+// takes minutes on huge pages. Giving up on a timeout does not make MCP abort the work (it keeps
+// holding the single tool mutex too), so waiting on a long deadline costs less for these tools.
 pub(crate) fn is_heavy_mcp_tool(tool: &str) -> bool {
     matches!(
         tool,
@@ -170,11 +170,12 @@ pub(crate) struct SessionState {
     pub(crate) page_id: Option<u64>,
     pub(crate) page_created_by_daemon: bool,
     pub(crate) page_url: Option<String>,
-    /// CDP の target id。タブの寿命の間ずっと変わらないので、daemon-native tool は
-    /// URL ではなくこれで接続先を決める (URL は遷移で変わり、他タブと衝突する)。
+    /// The CDP target id. It stays the same for the lifetime of the tab, so daemon-native tools
+    /// pick their connection target by this rather than by URL (URLs change on navigation and
+    /// collide with other tabs).
     pub(crate) target_id: Option<String>,
-    /// tab に張り付いて JavaScript ダイアログを閉じる常設 CDP 接続。session が消えるか
-    /// tab が変わると Drop で止まる。
+    /// Persistent CDP connection attached to the tab that dismisses JavaScript dialogs. Dropping it
+    /// stops it when the session goes away or the tab changes.
     pub(crate) dialog_watcher: Option<Arc<cdp::DialogWatcher>>,
     pub(crate) snapshot_epoch: u64,
     pub(crate) uid_bindings: HashMap<String, UidBinding>,
@@ -300,7 +301,8 @@ impl SessionRegistry {
         if session.page_id != Some(page_id) {
             session.snapshot_epoch = session.snapshot_epoch.wrapping_add(1);
             session.uid_bindings.clear();
-            // 別ページに移ったら target id は無効。次の native call で解決し直す。
+            // Moving to another page invalidates the target id. The next native call resolves it
+            // again.
             session.target_id = None;
             session.dialog_watcher = None;
         }
@@ -320,8 +322,8 @@ impl SessionRegistry {
         }
     }
 
-    /// tab を watch する接続を session に持たせる。既に同じ tab を見ているものがあれば
-    /// そのまま残し、接続を張り直さない。
+    /// Gives the session a connection watching the tab. If one is already watching the same tab,
+    /// keep it as is rather than reconnecting.
     pub(crate) fn set_dialog_watcher(&mut self, id: &str, watcher: Arc<cdp::DialogWatcher>) {
         if let Some(session) = self.sessions.get_mut(id) {
             session.dialog_watcher = Some(watcher);
@@ -1056,8 +1058,9 @@ pub(crate) fn forward_line(
             lines.push(rewrite_jsonrpc_id(&response_line, original_id.clone())?);
             return Ok(lines);
         }
-        // MCP server 発の notification (notifications/cancelled 等) は daemon⇔MCP 間の
-        // 制御情報であり、クライアントの JSON-RPC ストリームに混ぜると誤解を生む。
+        // Notifications from the MCP server (notifications/cancelled etc.) are control messages
+        // between the daemon and MCP; mixing them into the client's JSON-RPC stream would mislead
+        // the client.
         if json_method_starts_with(&response_line, "notifications/") {
             eprintln!("mcp_notification dropped={response_line}");
             continue;
@@ -1372,8 +1375,8 @@ fn ensure_session_page(
             return Ok(page_id);
         }
     }
-    // new_page の前後で CDP target を差分し、割り当てられたタブの target id を確定する。
-    // about:blank のタブは複数並びうるので URL 一致では特定できない。
+    // Diff the CDP targets before and after new_page to pin down the target id of the assigned tab.
+    // Several about:blank tabs can coexist, so matching by URL cannot identify it.
     let before = port
         .and_then(|port| cdp::page_target_ids(port).ok())
         .unwrap_or_default();
@@ -1518,8 +1521,8 @@ fn ensure_session_target(
     Ok(target_id)
 }
 
-/// tab に JavaScript ダイアログの watcher を張る。張れなくても tool の実行は続けたいので、
-/// 失敗は daemon log に残すだけにする。
+/// Attaches a JavaScript dialog watcher to the tab. The tool should still run even if attaching
+/// fails, so failures are only recorded in the daemon log.
 fn attach_dialog_watcher(sessions: &SharedSessions, session_id: &str, port: u16, target_id: &str) {
     {
         let (lock, _) = &**sessions;
@@ -2051,8 +2054,8 @@ pub(crate) fn try_native_tool(
     // one once; after that, native tools can keep bypassing the MCP queue.
     let session_id = session_id?;
     session_page(sessions, session_id)?;
-    // target id が未解決の session は MCP の page id から解決する必要があり、MCP の
-    // queue に載せる経路 (route_request) に任せる。
+    // A session whose target id is unresolved has to resolve it from MCP's page id, so leave it to
+    // the path that queues it on MCP (route_request).
     let target_id = session_target_id(sessions, session_id)?;
     let id = value.get("id").cloned().unwrap_or(serde_json::Value::Null);
     let empty_args = serde_json::json!({});
@@ -2557,8 +2560,9 @@ fn route_request(
                 match current_port(profile)
                     .ok_or_else(|| "missing DevTools port".to_string())
                     .and_then(|port| {
-                        // fallback も session のタブに固定する。target id が取れない
-                        // ときは別タブへ渡さず失敗させる (projects メモの session 境界要件)。
+                        // Pin the fallback to the session's tab as well. When the target id is
+                        // unavailable, fail rather than hand off to another tab (the
+                        // session-boundary requirement from the project notes).
                         let target_id = session_target_id(sessions, session_id)
                             .ok_or_else(|| "session page target is not resolved".to_string())?;
                         cdp::set_file_input_files(port, &target_id, &upload_paths)
@@ -2947,8 +2951,8 @@ pub(crate) fn handle_daemon_client(
             }
             continue;
         }
-        // daemon-native tool は MCP を経由せず接続スレッド上で CDP 直実行する。
-        // 重い tool が MCP の直列キューを塞いでいても native tool は並行して動く。
+        // Daemon-native tools bypass MCP and run CDP directly on the connection thread, so they run
+        // concurrently even while a heavy tool is blocking MCP's serial queue.
         if let Some(lines) = try_native_tool(profile, sessions, bound.id.as_deref(), &forwarded) {
             for response_line in lines {
                 stream
@@ -3006,8 +3010,8 @@ pub(crate) fn read_mcp_response_line_until(
     mcp_reader: &mut impl BufRead,
     deadline: Instant,
 ) -> Result<String, DaemonError> {
-    // 応答行 (数 MB になりうる) は複数回の read に跨る。WouldBlock を跨いでも
-    // 読みかけの部分行を失わないよう、バッファは retry ループの外で保持する。
+    // A response line (possibly several MB) spans multiple reads. Keep the buffer outside the retry
+    // loop so a partially read line survives across WouldBlock.
     let mut response_line = String::new();
     loop {
         let bytes = match mcp_reader.read_line(&mut response_line) {
@@ -3036,7 +3040,8 @@ pub(crate) fn read_mcp_response_line_until(
             ));
         }
         if !response_line.ends_with('\n') {
-            // 改行なしで Ok が返るのは EOF 直前のみ。次の read で EOF (bytes == 0) を検出する。
+            // Ok without a newline only happens right before EOF; the next read detects EOF (bytes
+            // == 0).
             continue;
         }
         let line = response_line.trim_end().to_string();

@@ -177,7 +177,8 @@ impl TestEnv {
                 "CHROME_DEVTOOLS_MCP_REQUEST_TIMEOUT_SECS",
                 value.to_string(),
             );
-            // heavy tool (take_snapshot 等) の timeout も同値に下げ、timeout 再現テストを成立させる
+            // Lower the timeout of heavy tools (take_snapshot etc.) to the same value so the
+            // timeout reproduction tests work
             command.env(
                 "CHROME_DEVTOOLS_MCP_HEAVY_REQUEST_TIMEOUT_SECS",
                 value.to_string(),
@@ -397,8 +398,8 @@ fn spawn_fake_devtools() -> FakeDevTools {
                 let _ = stream.write_all(
                     b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: fake\r\n\r\n",
                 );
-                // ダイアログ watcher が tab ごとに常設接続を張るので、1 本の接続で
-                // accept ループを塞ぐと後続の /json が読めなくなる。
+                // The dialog watcher keeps a persistent connection per tab, so blocking the accept
+                // loop on a single connection would leave subsequent /json requests unread.
                 let state = Arc::clone(&state_for_thread);
                 thread::spawn(move || handle_fake_cdp(stream, state, target_id));
             } else if let Some(query) = path.strip_prefix("/__fake/add?") {
@@ -465,8 +466,8 @@ fn handle_fake_cdp(mut stream: TcpStream, state: Arc<Mutex<FakeState>>, target_i
                 "result": {}
             }),
             "Runtime.evaluate" if value["params"]["returnByValue"] == serde_json::json!(false) => {
-                // 要素を掴む評価。実 Chrome は remote object を返し、呼び出し側は
-                // objectId を DOM.setFileInputFiles に渡す。
+                // Evaluation that grabs an element. Real Chrome returns a remote object, and the
+                // caller passes its objectId to DOM.setFileInputFiles.
                 serde_json::json!({
                     "id": id,
                     "result": {

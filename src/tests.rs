@@ -338,7 +338,8 @@ fn set_page_drops_target_id_when_the_page_changes() {
         Some("TARGET1")
     );
 
-    // 同じ page への再記録では target id を保つ (goto でページ内遷移しただけのケース)。
+    // Re-recording the same page keeps the target id (the case where goto only navigated within the
+    // page).
     registry
         .set_page(
             &session.id,
@@ -352,7 +353,7 @@ fn set_page_drops_target_id_when_the_page_changes() {
         Some("TARGET1")
     );
 
-    // 別 page に移ったら target id は無効になる。
+    // Moving to another page invalidates the target id.
     registry.set_page(&session.id, 2, false, None).unwrap();
     assert_eq!(registry.sessions[&session.id].target_id, None);
 }
@@ -388,8 +389,8 @@ fn allowed_input_path_requires_an_existing_file_under_home_or_temp() {
 
 #[test]
 fn parse_cdp_value_reads_deeply_nested_json() {
-    // serde_json の既定はネスト 128 段で打ち切る。DOM が深いページの CDP 応答は
-    // これを超えるので、上限を外して読めることを確かめる。
+    // serde_json stops at 128 levels of nesting by default. CDP responses from pages with deep DOMs
+    // exceed that, so check they can be read with the limit lifted.
     let depth = 512;
     let mut text = String::new();
     for _ in 0..depth {
@@ -421,8 +422,9 @@ fn parse_cdp_value_reports_what_failed() {
 
 #[test]
 fn dialog_accepts_only_navigation_and_alerts() {
-    // beforeunload は agent が遷移を意図して出しているので通す。alert は閉じる以外に
-    // 選択肢が無い。confirm / prompt はページの状態を変えうるので承諾しない。
+    // beforeunload is let through because the agent triggered it intending to navigate. alert has
+    // no option other than closing. confirm / prompt can change page state, so they are not
+    // accepted.
     assert!(crate::cdp::dialog_accepts("beforeunload"));
     assert!(crate::cdp::dialog_accepts("alert"));
     assert!(!crate::cdp::dialog_accepts("confirm"));
