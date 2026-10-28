@@ -11,6 +11,6 @@ name = "chrome-devtools"
 path = "src/main.rs"
 
 [dependencies]
-base64 = "0.22"
+base64 = "0.23"
 serde = "1"
 serde_json = { version = "1", features = ["unbounded_depth"] }
