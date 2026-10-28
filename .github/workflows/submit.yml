@@ -81,7 +81,7 @@ jobs:
         with:
           ref: v${{ needs.version-bump.outputs.new_version }}
       - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/cache@v5
+      - uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry/index/
