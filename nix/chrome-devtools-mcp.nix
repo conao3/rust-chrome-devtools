@@ -8,13 +8,13 @@
 
 stdenvNoCC.mkDerivation rec {
   pname = "chrome-devtools-mcp";
-  version = "1.8.0";
+  version = "1.12.0";
 
   src = fetchzip {
     name = "${pname}-${version}.tgz";
     url = "https://registry.npmjs.org/${pname}/-/${pname}-${version}.tgz";
     extension = "tar.gz";
-    hash = "sha256-5072DGsHCLYb50BMUgtjSn/1l8Ua538yPwdS3Ldkjmo=";
+    hash = "sha256-Ignut/iWDRCSZ97YoJMVJC6fINVXDgMi3uSDdHlYAsY=";
   };
 
   nativeBuildInputs = [ makeWrapper ];
@@ -24,7 +24,7 @@ stdenvNoCC.mkDerivation rec {
   # default with the broker's 300-second heavy-tool timeout. The environment
   # variable remains available for callers that need a different value.
   postPatch = ''
-    substituteInPlace build/src/browser.js \
+    substituteInPlace build/src/BrowserManager.js \
       --replace-fail 'const connectOptions = {' \
         'const connectOptions = {
         protocolTimeout: Number(process.env.CHROME_DEVTOOLS_MCP_PROTOCOL_TIMEOUT_MS ?? 300000),'

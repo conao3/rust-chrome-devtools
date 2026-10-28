@@ -26,7 +26,7 @@
           };
           chromeDevtoolsMcp = pkgs.callPackage ./nix/chrome-devtools-mcp.nix { };
           runtimePackages = [
-            pkgs.nodejs_22
+            pkgs.nodejs_latest
           ]
           ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
             pkgs.google-chrome
@@ -45,7 +45,7 @@
             packages = with pkgs; [
               cargo
               clippy
-              nodejs_22
+              nodejs_latest
               pkg-config
               rust-analyzer
               rustc
