@@ -243,7 +243,7 @@ chrome-devtools profile stop --profile conao3
 
 ## Troubleshooting
 
-- If `mcp call` or `mcp batch` exits with `unknown session`, the session expired (30 min idle) or the daemon restarted. Mint a new id via `session create` and retry.
+- If `mcp call` or `mcp batch` exits with `unknown session`, the message says why the session is gone (idle reap after 30 minutes with a tab, `session close`, an MCP respawn, or an id this daemon never had). Mint a new id via `session create` and retry. A session that owns no tab is kept for 24 hours.
 - If `mcp call` or `mcp batch` exits with `session in use: <id> (held by pid <pid> for <n>s)`, another invocation is currently bound to that id; the pid is the holding `chrome-devtools` process (`session list` shows it as `owner_pid`). Wait for it to finish or mint a separate session for the new agent.
 - File-writing tool arguments (`take_screenshot` `filePath` etc.) accept paths under your home directory and the OS tempdir.
 - `upload_file` falls back to Chrome DevTools Protocol when MCP cannot trigger the file chooser; check daemon logs for `upload_file_fallback` or `upload_file_fallback_failed`.

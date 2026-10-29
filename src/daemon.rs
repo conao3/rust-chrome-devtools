@@ -442,7 +442,7 @@ pub(crate) fn bind_session(
     if let Some(message) = response.strip_prefix("error=") {
         if message.starts_with("unknown session") {
             return Err(format!(
-                "{message}; sessions are dropped after 30 minutes idle or when the daemon restarts, mint a new one: chrome-devtools session create --profile {profile_name}"
+                "{message}; mint a new one: chrome-devtools session create --profile {profile_name}"
             ));
         }
         if message.starts_with("session in use") {

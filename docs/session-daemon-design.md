@@ -26,7 +26,7 @@ The daemon owns:
 - one long-lived `chrome-devtools-mcp` child process;
 - per-profile concurrency control;
 - in-memory session metadata (id, created/last-used timestamps, owned flag);
-- a background reaper that drops sessions idle for more than 30 minutes.
+- a background reaper that drops sessions idle for more than 30 minutes (24 hours when the session owns no tab).
 - MCP respawn and Chrome endpoint recovery.
 
 ## Implemented behavior
@@ -58,7 +58,7 @@ A session records:
 - last-used timestamp;
 - `owned` flag (whether a client connection currently holds it).
 
-Sessions live in-memory on the daemon. A reaper thread wakes up every 60 seconds and drops sessions whose `last_used_at` is more than 30 minutes old and that are not currently owned. When an expired or closed session owns a daemon-created page, the daemon closes that page while preserving Chrome's last tab rule. Sessions are also dropped when the daemon stops (`daemon stop` or process exit).
+Sessions live in-memory on the daemon. A reaper thread wakes up every 60 seconds and drops sessions whose `last_used_at` is more than 30 minutes old (24 hours if the session owns no tab) and that are not currently owned. The registry remembers the last 256 removed sessions with their reason, so an `unknown session` error names the cause. When an expired or closed session owns a daemon-created page, the daemon closes that page while preserving Chrome's last tab rule. Sessions are also dropped when the daemon stops (`daemon stop` or process exit).
 
 ## Daemon control protocol
 

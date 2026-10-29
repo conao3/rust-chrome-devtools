@@ -537,11 +537,9 @@ fn session_registry_reap_expired_drops_only_expired_unowned_sessions() {
     let expired_idle = registry.create();
     let expired_owned = registry.create();
     let stale = SystemTime::now() - SESSION_IDLE_TTL - Duration::from_secs(60);
-    registry
-        .sessions
-        .get_mut(&expired_idle.id)
-        .unwrap()
-        .last_used_at = stale;
+    let idle = registry.sessions.get_mut(&expired_idle.id).unwrap();
+    idle.last_used_at = stale;
+    idle.page_id = Some(1);
     let owned = registry.sessions.get_mut(&expired_owned.id).unwrap();
     owned.last_used_at = stale;
     owned.owned = true;
@@ -554,6 +552,69 @@ fn session_registry_reap_expired_drops_only_expired_unowned_sessions() {
     assert!(remaining.contains(&fresh.id));
     assert!(remaining.contains(&expired_owned.id));
     assert!(!remaining.contains(&expired_idle.id));
+}
+
+#[test]
+fn session_registry_reap_expired_keeps_pageless_sessions_longer() {
+    let mut registry = SessionRegistry::default();
+    let pageless = registry.create();
+    let with_page = registry.create();
+    let stale = SystemTime::now() - SESSION_IDLE_TTL - Duration::from_secs(60);
+    registry
+        .sessions
+        .get_mut(&pageless.id)
+        .unwrap()
+        .last_used_at = stale;
+    let page_session = registry.sessions.get_mut(&with_page.id).unwrap();
+    page_session.last_used_at = stale;
+    page_session.page_id = Some(7);
+    registry.reap_expired(SESSION_IDLE_TTL);
+    assert!(registry.sessions.contains_key(&pageless.id));
+    assert!(!registry.sessions.contains_key(&with_page.id));
+
+    let ancient = SystemTime::now() - PAGELESS_SESSION_IDLE_TTL - Duration::from_secs(60);
+    registry
+        .sessions
+        .get_mut(&pageless.id)
+        .unwrap()
+        .last_used_at = ancient;
+    registry.reap_expired(SESSION_IDLE_TTL);
+    assert!(!registry.sessions.contains_key(&pageless.id));
+}
+
+#[test]
+fn unknown_session_message_names_why_the_session_is_gone() {
+    let mut registry = SessionRegistry::default();
+    let reaped = registry.create();
+    let closed = registry.create();
+    let dropped = registry.create();
+    let stale = SystemTime::now() - SESSION_IDLE_TTL - Duration::from_secs(60);
+    let reaped_state = registry.sessions.get_mut(&reaped.id).unwrap();
+    reaped_state.last_used_at = stale;
+    reaped_state.page_id = Some(3);
+    registry.reap_expired(SESSION_IDLE_TTL);
+    registry.close(&closed.id).unwrap();
+    registry.clear_sessions("devtools unreachable");
+
+    let message = registry.unknown_session_message(&reaped.id);
+    assert!(message.starts_with(&format!("unknown session: {}", reaped.id)));
+    assert!(message.contains("reaped after 31m idle"), "{message}");
+    assert!(message.contains("reaped after 30m"), "{message}");
+
+    let message = registry.unknown_session_message(&closed.id);
+    assert!(message.contains("closed by session close"), "{message}");
+
+    let message = registry.unknown_session_message(&dropped.id);
+    assert!(message.contains("`devtools unreachable`"), "{message}");
+
+    let message = registry.unknown_session_message("sess-never");
+    assert!(message.contains("no record"), "{message}");
+    assert!(
+        registry
+            .bind(&reaped.id, None)
+            .unwrap_err()
+            .contains("reaped")
+    );
 }
 
 #[test]
