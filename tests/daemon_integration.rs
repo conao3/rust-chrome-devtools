@@ -2440,10 +2440,12 @@ fn devtools_port_change_respawns_mcp_and_drops_sessions() {
         "evaluate_script",
         serde_json::json!({"function": "() => location.href"}),
     );
-    assert_eq!(
-        response["error"]["message"],
-        format!("unknown session: {session}")
+    let message = response["error"]["message"].as_str().unwrap();
+    assert!(
+        message.starts_with(&format!("unknown session: {session} (removed ")),
+        "{message}"
     );
+    assert!(message.contains("MCP respawn"), "{message}");
 
     let next_session = env.create_session();
     let mut next_stream = env.connect();
@@ -2487,10 +2489,12 @@ fn respawn_closes_daemon_created_pages() {
         "evaluate_script",
         serde_json::json!({"function": "() => location.href"}),
     );
-    assert_eq!(
-        response["error"]["message"],
-        format!("unknown session: {session}")
+    let message = response["error"]["message"].as_str().unwrap();
+    assert!(
+        message.starts_with(&format!("unknown session: {session} (removed ")),
+        "{message}"
     );
+    assert!(message.contains("MCP respawn"), "{message}");
 
     let next_session = env.create_session();
     let mut next_stream = env.connect();

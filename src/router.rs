@@ -45,6 +45,11 @@ const POLLHUP: i16 = 0x10;
 
 pub(crate) const SESSION_IDLE_TTL: Duration = Duration::from_secs(30 * 60);
 
+/// A session that owns no tab costs nothing to keep, so it outlives `SESSION_IDLE_TTL`.
+pub(crate) const PAGELESS_SESSION_IDLE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+
+const REMOVED_SESSION_HISTORY: usize = 256;
+
 pub(crate) const SESSION_REAPER_INTERVAL: Duration = Duration::from_secs(60);
 
 pub(crate) const MCP_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
@@ -181,12 +186,95 @@ pub(crate) struct SessionState {
     pub(crate) uid_bindings: HashMap<String, UidBinding>,
 }
 
-#[derive(Default)]
+/// What is left of a session after the daemon dropped it, so a later call with its id can say why
+/// it is gone.
+#[derive(Clone, Debug)]
+pub(crate) struct RemovedSession {
+    id: String,
+    reason: String,
+    removed_at: SystemTime,
+    last_used_at: SystemTime,
+}
+
 pub(crate) struct SessionRegistry {
     pub(crate) sessions: HashMap<String, SessionState>,
+    removed: VecDeque<RemovedSession>,
+    started_at: SystemTime,
+}
+
+impl Default for SessionRegistry {
+    fn default() -> Self {
+        Self {
+            sessions: HashMap::new(),
+            removed: VecDeque::new(),
+            started_at: SystemTime::now(),
+        }
+    }
+}
+
+fn format_elapsed(duration: Duration) -> String {
+    let secs = duration.as_secs();
+    if secs < 90 {
+        format!("{secs}s")
+    } else if secs < 90 * 60 {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{}h{:02}m", secs / 3600, secs % 3600 / 60)
+    }
+}
+
+fn unknown_session_message(
+    removed: &VecDeque<RemovedSession>,
+    started_at: SystemTime,
+    id: &str,
+) -> String {
+    let now = SystemTime::now();
+    let ago = |time: SystemTime| format_elapsed(now.duration_since(time).unwrap_or_default());
+    let Some(entry) = removed.iter().rev().find(|entry| entry.id == id) else {
+        return format!(
+            "unknown session: {id} (this daemon has no record of it; the daemon started {} ago, so the id comes from an earlier daemon or another profile)",
+            ago(started_at)
+        );
+    };
+    let cause = match entry.reason.as_str() {
+        "idle_reap" => format!(
+            "reaped after {} idle; idle sessions that own a tab are reaped after {} (CHROME_DEVTOOLS_SESSION_IDLE_TTL_SECS on the daemon)",
+            format_elapsed(
+                entry
+                    .removed_at
+                    .duration_since(entry.last_used_at)
+                    .unwrap_or_default()
+            ),
+            format_elapsed(session_idle_ttl())
+        ),
+        "session_close" => "closed by session close".to_string(),
+        reason => format!(
+            "dropped when the daemon recovered from `{reason}`; every in-memory session is dropped on an MCP respawn"
+        ),
+    };
+    format!(
+        "unknown session: {id} (removed {} ago: {cause})",
+        ago(entry.removed_at)
+    )
 }
 
 impl SessionRegistry {
+    pub(crate) fn unknown_session_message(&self, id: &str) -> String {
+        unknown_session_message(&self.removed, self.started_at, id)
+    }
+
+    fn remember_removed(&mut self, reason: &str, session: &SessionState) {
+        if self.removed.len() == REMOVED_SESSION_HISTORY {
+            self.removed.pop_front();
+        }
+        self.removed.push_back(RemovedSession {
+            id: session.id.clone(),
+            reason: reason.to_string(),
+            removed_at: SystemTime::now(),
+            last_used_at: session.last_used_at,
+        });
+    }
+
     pub(crate) fn create(&mut self) -> SessionState {
         let now = SystemTime::now();
         let id = generate_session_id();
@@ -217,7 +305,7 @@ impl SessionRegistry {
 
     pub(crate) fn close(&mut self, id: &str) -> Result<Option<PageCleanup>, String> {
         let Some(session) = self.sessions.get(id) else {
-            return Err(format!("unknown session: {id}"));
+            return Err(self.unknown_session_message(id));
         };
         if session.owned {
             return Err(session_in_use_message(session));
@@ -225,8 +313,9 @@ impl SessionRegistry {
         let session = self
             .sessions
             .remove(id)
-            .ok_or_else(|| format!("unknown session: {id}"))?;
+            .ok_or_else(|| unknown_session_message(&self.removed, self.started_at, id))?;
         log_session_removed("session_close", &session);
+        self.remember_removed("session_close", &session);
         Ok(page_cleanup_for_session(session))
     }
 
@@ -234,7 +323,7 @@ impl SessionRegistry {
         let session = self
             .sessions
             .get_mut(id)
-            .ok_or_else(|| format!("unknown session: {id}"))?;
+            .ok_or_else(|| unknown_session_message(&self.removed, self.started_at, id))?;
         if session.owned {
             return Err(session_in_use_message(session));
         }
@@ -264,22 +353,32 @@ impl SessionRegistry {
     pub(crate) fn reap_expired(&mut self, ttl: Duration) -> Vec<PageCleanup> {
         let now = SystemTime::now();
         let mut cleanup = Vec::new();
+        let mut reaped = Vec::new();
         self.sessions.retain(|_, session| {
             if session.owned {
                 return true;
             }
+            let limit = if session.page_id.is_some() {
+                ttl
+            } else {
+                ttl.max(PAGELESS_SESSION_IDLE_TTL)
+            };
             let keep = match now.duration_since(session.last_used_at) {
-                Ok(elapsed) => elapsed < ttl,
+                Ok(elapsed) => elapsed < limit,
                 Err(_) => true,
             };
             if !keep {
                 log_session_removed("idle_reap", session);
+                reaped.push(session.clone());
                 if let Some(page) = page_cleanup_for_session(session.clone()) {
                     cleanup.push(page);
                 }
             }
             keep
         });
+        for session in &reaped {
+            self.remember_removed("idle_reap", session);
+        }
         cleanup
     }
 
@@ -297,7 +396,7 @@ impl SessionRegistry {
         let session = self
             .sessions
             .get_mut(id)
-            .ok_or_else(|| format!("unknown session: {id}"))?;
+            .ok_or_else(|| unknown_session_message(&self.removed, self.started_at, id))?;
         if session.page_id != Some(page_id) {
             session.snapshot_epoch = session.snapshot_epoch.wrapping_add(1);
             session.uid_bindings.clear();
@@ -351,10 +450,15 @@ impl SessionRegistry {
     }
 
     pub(crate) fn clear_sessions(&mut self, reason: &str) {
-        for session in self.sessions.values() {
+        let dropped = self
+            .sessions
+            .drain()
+            .map(|(_, session)| session)
+            .collect::<Vec<_>>();
+        for session in &dropped {
             log_session_removed(reason, session);
+            self.remember_removed(reason, session);
         }
-        self.sessions.clear();
     }
 
     pub(crate) fn record_snapshot_uids(
@@ -366,7 +470,7 @@ impl SessionRegistry {
         let session = self
             .sessions
             .get_mut(id)
-            .ok_or_else(|| format!("unknown session: {id}"))?;
+            .ok_or_else(|| unknown_session_message(&self.removed, self.started_at, id))?;
         session.snapshot_epoch = session.snapshot_epoch.wrapping_add(1);
         session.uid_bindings.clear();
         let mut replacements = HashMap::new();
@@ -400,7 +504,7 @@ impl SessionRegistry {
         let session = self
             .sessions
             .get(id)
-            .ok_or_else(|| format!("unknown session: {id}"))?;
+            .ok_or_else(|| unknown_session_message(&self.removed, self.started_at, id))?;
         let Some(rest) = token.strip_prefix("u:") else {
             return Err("session uid token is required".to_string());
         };
@@ -1369,7 +1473,7 @@ fn ensure_session_page(
             .lock()
             .map_err(|_| "session registry poisoned".to_string())?;
         if !registry.sessions.contains_key(session_id) {
-            return Err(format!("unknown session: {session_id}"));
+            return Err(registry.unknown_session_message(session_id));
         }
         if let Some(page_id) = registry.page_id(session_id) {
             return Ok(page_id);
@@ -3192,7 +3296,7 @@ pub(crate) fn handle_control_command(
             let page = snapshot
                 .sessions
                 .get(&id)
-                .ok_or_else(|| DaemonError::Client(format!("unknown session: {id}")))?
+                .ok_or_else(|| DaemonError::Client(snapshot.unknown_session_message(&id)))?
                 .page_id
                 .map(|page_id| page_id.to_string())
                 .unwrap_or_default();
