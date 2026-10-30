@@ -943,3 +943,11 @@ fn drain_pending_mcp_response_skips_read_when_already_consumed() {
     let mut written: Vec<u8> = Vec::new();
     drain_pending_mcp_response(&mut written, &mut reader, 7, r#"{"id":7,"result":{}}"#).unwrap();
 }
+
+#[test]
+fn systemd_scope_unit_name_formats_profile_role_and_nonce() {
+    assert_eq!(
+        systemd_scope_unit_name("agent.001", "chrome", 42),
+        "chrome-devtools-agent_001-chrome-42.scope"
+    );
+}

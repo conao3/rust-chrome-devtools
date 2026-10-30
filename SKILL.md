@@ -254,5 +254,6 @@ chrome-devtools profile stop --profile conao3
 - If `fill` or `click` fails with a stale or foreign uid token, take a fresh snapshot in the same session and use the new token.
 - If the page is not the expected page, run an `evaluate_script` step that returns `window.location.href` and verify before acting.
 - If the profile's Chrome is not running, `mcp call` / `mcp batch` / `mcp list` will start it on first use.
+- When Chrome exits unexpectedly, read `~/.cache/chrome-devtools/daemons/<profile>.chrome.log.1` (the previous Chrome's output) for the `FATAL` line.
 - If login state is missing, verify the profile name and `user_data_dir`; login cookies are profile-specific.
 - If `mcp batch` reports `unknown step type`, check the `type` field; only `tool` and `sleep_ms` are supported.

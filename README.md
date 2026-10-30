@@ -36,6 +36,8 @@ npx skills add ./rust-chrome-devtools
 
 - Profiles are explicit: every operation that targets a browser profile requires `--profile <name>`.
 - Profiles own their Chrome user data directory. The daemon picks a free DevTools port at start time and records it under `~/.cache/chrome-devtools/daemons/<profile>.port`.
+- On Linux with a systemd user manager, the daemon and the Chrome it launches each run in their own transient scope (`chrome-devtools-<profile>-daemon-<n>.scope` / `chrome-devtools-<profile>-chrome-<n>.scope`) via `systemd-run --user --scope`. Chrome's browser process moves itself to `app-com.google.Chrome-<pid>.scope`, but its zygote, GPU, renderer and utility processes stay in the cgroup of whatever started Chrome; giving them a scope of their own keeps them alive when the agent session that ran `daemon start` ends and its unit is stopped. Without that, Chrome cannot relaunch its GPU process and exits with `GPU process isn't usable. Goodbye.`
+- Chrome's stdout and stderr go to `~/.cache/chrome-devtools/daemons/<profile>.chrome.log`. Each Chrome launch moves the previous file to `<profile>.chrome.log.1`, so the output of a Chrome that just crashed is kept after the daemon relaunches it.
 - Profiles are read from `~/.config/chrome-devtools/config.toml`.
 - If the config file is missing on startup, the CLI creates a `default` profile using `~/.config/chrome-devtools/profiles/default`.
 - `user_data_dir` is optional; when omitted, it defaults to `~/.config/chrome-devtools/profiles/<profile-name>`.

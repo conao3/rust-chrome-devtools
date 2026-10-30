@@ -30,6 +30,7 @@ use std::thread;
 use std::time::Duration;
 use std::time::Instant;
 use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 
 pub(crate) const DAEMON_READY_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -47,6 +48,10 @@ pub(crate) fn daemon_pid_path(profile: &Profile) -> Result<PathBuf, String> {
 
 pub(crate) fn daemon_log_path(profile: &Profile) -> Result<PathBuf, String> {
     Ok(daemon_dir()?.join(format!("{}.log", safe_lock_name(&profile.name))))
+}
+
+pub(crate) fn chrome_log_path(profile: &Profile) -> Result<PathBuf, String> {
+    Ok(daemon_dir()?.join(format!("{}.chrome.log", safe_lock_name(&profile.name))))
 }
 
 pub(crate) fn daemon_port_path(profile: &Profile) -> Result<PathBuf, String> {
@@ -154,7 +159,7 @@ pub(crate) fn start_daemon(profile: &Profile, quiet: bool) -> Result<(), String>
         .try_clone()
         .map_err(|error| format!("failed to clone daemon log handle: {error}"))?;
 
-    let child = Command::new(current_exe)
+    let child = own_scope_command(&current_exe, &profile.name, "daemon")
         .arg("daemon")
         .arg("run")
         .arg("--profile")
@@ -745,6 +750,64 @@ pub(crate) fn chrome_extra_args(raw: Option<&str>) -> Vec<String> {
     .unwrap_or_default()
 }
 
+fn open_chrome_log(profile: &Profile) -> Result<fs::File, String> {
+    let dir = daemon_dir()?;
+    fs::create_dir_all(&dir)
+        .map_err(|error| format!("failed to create {}: {error}", dir.display()))?;
+    let path = chrome_log_path(profile)?;
+    if path.exists() {
+        let previous = path.with_extension("log.1");
+        fs::rename(&path, &previous).map_err(|error| {
+            format!(
+                "failed to rotate {} to {}: {error}",
+                path.display(),
+                previous.display()
+            )
+        })?;
+    }
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|error| format!("failed to open {}: {error}", path.display()))
+}
+
+pub(crate) fn systemd_scope_unit_name(profile_name: &str, role: &str, nonce: u128) -> String {
+    format!(
+        "chrome-devtools-{}-{role}-{nonce}.scope",
+        safe_lock_name(profile_name)
+    )
+}
+
+fn has_systemd_user_manager() -> bool {
+    cfg!(target_os = "linux")
+        && env::var_os("XDG_RUNTIME_DIR")
+            .is_some_and(|dir| Path::new(&dir).join("systemd/private").exists())
+}
+
+fn own_scope_command(program: &Path, profile_name: &str, role: &str) -> Command {
+    if !has_systemd_user_manager() {
+        return Command::new(program);
+    }
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or_default();
+    let mut command = Command::new("systemd-run");
+    command
+        .arg("--user")
+        .arg("--scope")
+        .arg("--collect")
+        .arg("--quiet")
+        .arg(format!(
+            "--unit={}",
+            systemd_scope_unit_name(profile_name, role, nonce)
+        ))
+        .arg("--")
+        .arg(program);
+    command
+}
+
 pub(crate) fn ensure_chrome(profile: &Profile) -> Result<(), String> {
     if let Some(port) = read_runtime_port(profile) {
         if is_devtools_ready(port) {
@@ -762,8 +825,12 @@ pub(crate) fn ensure_chrome(profile: &Profile) -> Result<(), String> {
     let port = pick_free_port()?;
     let chrome = env::var("CHROME").unwrap_or_else(|_| default_chrome_binary());
     let user_data_dir = expand_home(&profile.user_data_dir)?;
+    let log = open_chrome_log(profile)?;
+    let log_for_stderr = log
+        .try_clone()
+        .map_err(|error| format!("failed to clone Chrome log handle: {error}"))?;
 
-    Command::new(chrome)
+    own_scope_command(Path::new(&chrome), &profile.name, "chrome")
         .arg("--remote-debugging-address=127.0.0.1")
         .arg(format!("--remote-debugging-port={port}"))
         .arg(format!("--user-data-dir={}", user_data_dir.display()))
@@ -776,8 +843,8 @@ pub(crate) fn ensure_chrome(profile: &Profile) -> Result<(), String> {
                 .as_deref(),
         ))
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(log_for_stderr))
         .spawn()
         .map_err(|error| format!("failed to start Chrome: {error}"))?;
 
