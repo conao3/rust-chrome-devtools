@@ -247,7 +247,7 @@ fn unknown_session_message(
             ),
             format_elapsed(session_idle_ttl())
         ),
-        "session_close" => "closed by session close".to_string(),
+        "session_close" => "closed by session close-session".to_string(),
         reason => format!(
             "dropped when the daemon recovered from `{reason}`; every in-memory session is dropped on an MCP respawn"
         ),

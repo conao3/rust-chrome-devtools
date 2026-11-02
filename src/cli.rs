@@ -1,942 +1,723 @@
 use crate::batch::*;
 use crate::config::*;
 use crate::daemon::*;
+use crate::error::{Result, other, parameter, target};
+use crate::grammar::{self, CliInputArgs, SkeletonKind};
 use crate::lock::*;
-use std::env;
+use crate::output::{self, OutputFormat, Response};
+use clap::{Args, CommandFactory, Parser, Subcommand};
+use serde_json::{Map, Value, json};
+use std::fs;
+use std::path::PathBuf;
 
-pub(crate) fn run() -> Result<(), String> {
-    let (positional, rest) = split_command_args(env::args().skip(1).collect());
-    let Some(object) = positional.first() else {
-        print_usage();
-        return Err("missing object".to_string());
-    };
+const ROOT_AFTER_HELP: &str = "\
+Profiles are read from ~/.config/chrome-devtools/config.toml (created with a default profile when missing).
+The per-profile daemon assigns each session its own tab and injects pageId for page-scoped MCP tools.
+Different sessions may run concurrently; a second bind on the same session id is rejected.
 
-    if matches!(object.as_str(), "help" | "--help" | "-h") {
-        print_usage();
+Examples:
+  SESSION=$(chrome-devtools session create-session --profile default --query SessionId --output text)
+  chrome-devtools mcp run-batch --profile default --session-id \"$SESSION\" --steps Type=tool,Name=list_pages
+  chrome-devtools mcp run-batch --profile default --session-id \"$SESSION\" --steps file:///tmp/steps.json
+  chrome-devtools session close-session --profile default --session-id \"$SESSION\"";
+
+const RUN_BATCH_AFTER_HELP: &str = "\
+Steps:
+  Each --steps value is a JSON array of steps, one JSON step object, or one step in shorthand syntax.
+  file://<path> reads the value from a file; file:///dev/stdin reads it from standard input.
+    {\"Type\":\"tool\",\"Name\":\"<mcp-tool>\",\"Args\":{...},\"Label\":\"<optional>\",\"OnError\":\"continue|stop\"}
+    {\"Type\":\"sleep_ms\",\"Ms\":<u64>,\"Label\":\"<optional>\"}
+    Type=tool,Name=evaluate_script,Label=title,Args={\"function\":\"() => document.title\"}
+    Type=sleep_ms,Ms=500
+
+Value references inside Args:
+  Replace any value in Args with {\"$ref\":\"<label>.<path>\"} to substitute a previous step's result entry.
+  <path> is dot-separated and numeric segments index arrays: {\"$ref\":\"snap.Result.content.0.text\"}.
+
+Output:
+  {\"Steps\":[{\"Type\":\"tool\",\"Name\":...,\"Label\":...,\"Result\":<MCP tools/call result>,\"Error\":<MCP error or null>}, ...]}
+  A step whose page navigated (Execution context was destroyed) has \"Navigated\":true and Error null.
+  A tool step errored when Error is non-null or Result.isError is true. By default the batch continues;
+  --fail-fast or \"OnError\":\"stop\" stops after that step, prints the partial Steps and exits 254.
+  When the batch fails before the first step, Steps is empty and Error holds the message.
+
+Examples:
+  chrome-devtools mcp run-batch --profile default --session-id \"$SESSION\" \\
+    --steps 'Type=tool,Name=goto,Args={\"url\":\"https://example.com/\"}' \\
+            'Type=tool,Name=evaluate_script,Label=title,Args={\"function\":\"() => document.title\"}' \\
+    --query \"Steps[?Label=='title'].Result.content[0].text | [0]\" --output text";
+
+const FORWARD_AFTER_HELP: &str = "\
+Reads MCP JSON-RPC requests from standard input, one per line, and streams the JSON-RPC responses to
+standard output as they arrive. --output and --query do not apply to this stream.
+
+Example:
+  printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{}}' \\
+    | chrome-devtools mcp forward-requests --profile default --session-id \"$SESSION\"";
+
+#[derive(Parser)]
+#[command(
+    name = "chrome-devtools",
+    version,
+    about = "Profile-aware broker for Chrome DevTools MCP with isolated Chrome user data directories",
+    after_help = ROOT_AFTER_HELP
+)]
+struct Cli {
+    /// Output format
+    #[arg(long, global = true, help_heading = "Global Options", value_enum, default_value_t = OutputFormat::Json)]
+    output: OutputFormat,
+    /// JMESPath expression applied to the output
+    #[arg(
+        long,
+        global = true,
+        help_heading = "Global Options",
+        value_name = "JMESPATH"
+    )]
+    query: Option<String>,
+    /// Print debug logs to stderr
+    #[arg(long, global = true, help_heading = "Global Options")]
+    debug: bool,
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Mint, list, and close daemon sessions (one tab and uid namespace each)
+    #[command(subcommand)]
+    Session(SessionCommand),
+    /// Call Chrome DevTools MCP tools through the profile daemon
+    #[command(subcommand)]
+    Mcp(McpCommand),
+    /// Start, inspect, and stop the per-profile daemon
+    #[command(subcommand)]
+    Daemon(DaemonCommand),
+    /// List profiles and inspect or stop the Chrome bound to a profile
+    #[command(subcommand)]
+    Profile(ProfileCommand),
+}
+
+#[derive(Subcommand)]
+enum SessionCommand {
+    /// Start the profile daemon if needed and mint a new session. Sessions expire after 30 minutes idle (24 hours without a tab)
+    #[command(name = "create-session")]
+    Create(ProfileArgs),
+    /// List the sessions held by the profile daemon (empty when the daemon is not running)
+    #[command(name = "list-sessions")]
+    List(ProfileArgs),
+    /// Drop a session and close its daemon-created tab (Chrome's last tab is kept)
+    #[command(name = "close-session")]
+    Close(SessionArgs),
+}
+
+#[derive(Subcommand)]
+enum McpCommand {
+    /// List the MCP tools (chrome-devtools-mcp tools and daemon-native tools) through the profile daemon
+    #[command(name = "list-tools")]
+    ListTools(ProfileArgs),
+    /// Run steps (tool calls and sleeps) in order on one session and print the result of every step
+    #[command(name = "run-batch", after_help = RUN_BATCH_AFTER_HELP)]
+    RunBatch(RunBatchArgs),
+    /// Bind a session and stream stdin JSON-RPC lines to the daemon's MCP process, printing responses as they arrive
+    #[command(name = "forward-requests", after_help = FORWARD_AFTER_HELP)]
+    ForwardRequests(SessionArgs),
+    /// List the MCP tools by running chrome-devtools-mcp directly (through the daemon while it holds the profile lock)
+    #[command(name = "list-direct-tools")]
+    ListDirectTools(ProfileArgs),
+    /// Bypass the daemon and run chrome-devtools-mcp over stdio. For manual debugging only: snapshot uids do not survive across invocations
+    #[command(name = "forward-direct-requests")]
+    ForwardDirectRequests(ProfileArgs),
+}
+
+#[derive(Subcommand)]
+enum DaemonCommand {
+    /// Start the background daemon for the profile, or report the one already running
+    #[command(name = "start-daemon")]
+    Start(ProfileArgs),
+    /// Show the daemon's version, sessions, tabs, queue, latency, Chrome reachability, and exit history
+    #[command(name = "get-daemon-status")]
+    Status(ProfileArgs),
+    /// Stop the daemon. Refused while sessions exist unless --force (their sessions are destroyed)
+    #[command(name = "stop-daemon")]
+    Stop(ForceArgs),
+    /// Run the daemon in the foreground (spawned by start-daemon)
+    #[command(name = "run-daemon", hide = true)]
+    Run(ProfileArgs),
+}
+
+#[derive(Subcommand)]
+enum ProfileCommand {
+    /// List the profiles defined in the config file
+    #[command(name = "list-profiles")]
+    List(NoArgs),
+    /// Show whether the Chrome DevTools endpoint of the profile responds
+    #[command(name = "get-profile-status")]
+    Status(ProfileArgs),
+    /// Stop the Chrome bound to the profile. Refused while the profile daemon runs unless --force
+    #[command(name = "stop-profile")]
+    Stop(ForceArgs),
+}
+
+#[derive(Args)]
+struct NoArgs {
+    #[command(flatten)]
+    input: CliInputArgs,
+}
+
+#[derive(Args)]
+struct ProfileArgs {
+    /// Profile name from ~/.config/chrome-devtools/config.toml
+    #[arg(long)]
+    profile: String,
+    #[command(flatten)]
+    input: CliInputArgs,
+}
+
+#[derive(Args)]
+struct SessionArgs {
+    /// Profile name from ~/.config/chrome-devtools/config.toml
+    #[arg(long)]
+    profile: String,
+    /// Session id minted by `session create-session`
+    #[arg(long)]
+    session_id: String,
+    #[command(flatten)]
+    input: CliInputArgs,
+}
+
+#[derive(Args)]
+struct ForceArgs {
+    /// Profile name from ~/.config/chrome-devtools/config.toml
+    #[arg(long)]
+    profile: String,
+    /// Stop even while other agents may be using it
+    #[arg(long, overrides_with = "no_force")]
+    force: bool,
+    /// Refuse to stop while other agents may be using it (default)
+    #[arg(long, overrides_with = "force")]
+    no_force: bool,
+    #[command(flatten)]
+    input: CliInputArgs,
+}
+
+#[derive(Args)]
+struct RunBatchArgs {
+    /// Profile name from ~/.config/chrome-devtools/config.toml
+    #[arg(long)]
+    profile: String,
+    /// Session id minted by `session create-session`
+    #[arg(long)]
+    session_id: String,
+    /// Steps: JSON arrays, JSON objects, or shorthand Type=tool,Name=...,Args={...} (space-separated; file:// reads a file)
+    #[arg(long, num_args = 1.., required = true)]
+    steps: Vec<String>,
+    /// Write the output to this file instead of standard output
+    #[arg(long)]
+    output_file: Option<PathBuf>,
+    /// Stop after the first errored tool step
+    #[arg(long, overrides_with = "no_fail_fast")]
+    fail_fast: bool,
+    /// Continue after errored tool steps (default)
+    #[arg(long, overrides_with = "fail_fast")]
+    no_fail_fast: bool,
+    #[command(flatten)]
+    input: CliInputArgs,
+}
+
+fn output_skeleton(path: &[String]) -> Result<Value> {
+    let session = json!({
+        "SessionId": "sess-0123456789abcdef",
+        "Created": 0,
+        "LastUsed": 0,
+        "Owned": false,
+        "OwnerPid": null,
+        "Page": null,
+        "PageCreatedByDaemon": false,
+        "PageUrl": null,
+        "TargetId": null,
+        "SnapshotEpoch": 0
+    });
+    let tools = json!({"Tools": [{"name": "", "description": "", "inputSchema": {}}]});
+    Ok(match path.last().map(String::as_str) {
+        Some("create-session") => session,
+        Some("list-sessions") => json!({ "Sessions": [session] }),
+        Some("close-session") => json!({"SessionId": "", "Closed": true}),
+        Some("list-tools" | "list-direct-tools") => tools,
+        Some("run-batch") => json!({
+            "Steps": [
+                {"Type": "tool", "Name": "", "Label": null, "Result": {"content": [{"type": "text", "text": ""}]}, "Error": null},
+                {"Type": "sleep_ms", "Label": null, "Ms": 0}
+            ],
+            "Error": null
+        }),
+        Some("start-daemon") => {
+            json!({"Profile": "", "Daemon": "started", "Pid": 0, "Socket": ""})
+        }
+        Some("get-daemon-status") => json!({
+            "Profile": "",
+            "Daemon": "ready",
+            "Version": "",
+            "Sessions": 0,
+            "ActiveSessions": 0,
+            "Pages": [0],
+            "QueuedMcpRequests": 0,
+            "MaxControlLatencyMs": 0,
+            "MaxForwardLatencyMs": 0,
+            "DiagnosticWindowSecs": 0,
+            "Chrome": "ready",
+            "ChromePort": 0,
+            "Pid": 0,
+            "Socket": "",
+            "AbnormalExits": 0,
+            "Respawns": 0,
+            "LastEvent": null
+        }),
+        Some("stop-daemon") => json!({"Profile": "", "Daemon": "stopped"}),
+        Some("list-profiles") => json!({"Profiles": [{"Name": "", "UserDataDir": ""}]}),
+        Some("get-profile-status") => {
+            json!({"Profile": "", "Status": "ready", "Port": 0, "UserDataDir": ""})
+        }
+        Some("stop-profile") => json!({"Profile": "", "Stopped": true}),
+        Some(name @ ("forward-requests" | "forward-direct-requests" | "run-daemon")) => {
+            return Err(parameter(format!(
+                "{name} streams JSON-RPC lines and has no output skeleton"
+            )));
+        }
+        _ => {
+            return Err(parameter(
+                "--generate-cli-skeleton needs a command and a subcommand",
+            ));
+        }
+    })
+}
+
+pub(crate) fn run() -> Result<()> {
+    let mut root = Cli::command();
+    root.build();
+    let prepared = grammar::prepare(&root, std::env::args_os().collect())?;
+    if prepared.argv.iter().any(|token| token == "--debug") {
+        eprintln!("debug: argv {:?}", &prepared.argv[1..]);
+    }
+
+    if let Some(kind) = prepared.skeleton {
+        let mut command = &root;
+        for name in &prepared.path {
+            command = command
+                .find_subcommand(name)
+                .ok_or_else(|| other(format!("unknown subcommand {name}")))?;
+        }
+        if command.has_subcommands() {
+            return Err(parameter(
+                "--generate-cli-skeleton needs a command and a subcommand",
+            ));
+        }
+        let value = match kind {
+            SkeletonKind::Input => grammar::input_skeleton(command),
+            SkeletonKind::Output => output_skeleton(&prepared.path)?,
+        };
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&value).map_err(|error| other(error.to_string()))?
+        );
         return Ok(());
     }
-    if matches!(object.as_str(), "version" | "--version" | "-V") {
-        print_version();
-        return Ok(());
+
+    let cli = match Cli::try_parse_from(&prepared.argv) {
+        Ok(cli) => cli,
+        Err(error) => {
+            let code = if error.use_stderr() { 252 } else { 0 };
+            let _ = error.print();
+            std::process::exit(code);
+        }
+    };
+    if let Some(query) = &cli.query {
+        output::compile_query(query)?;
     }
 
     let config = load_or_create_config()?;
-    let Some(action) = positional.get(1) else {
-        print_usage();
-        return Err(format!("missing action for object: {object}"));
-    };
+    let (name, value, output_file) = dispatch(&config, cli.command)?;
+    let rendered = output::render(
+        &grammar::pascal_case(name),
+        Response { value, text: None },
+        cli.output,
+        cli.query.as_deref(),
+    )?;
+    match output_file {
+        Some(path) => fs::write(&path, rendered)
+            .map_err(|error| other(format!("failed to write {}: {error}", path.display()))),
+        None => {
+            print!("{rendered}");
+            Ok(())
+        }
+    }
+}
 
-    match (object.as_str(), action.as_str()) {
-        ("mcp", "help" | "--help" | "-h") => {
-            print_mcp_help();
-            Ok(())
+type Dispatched = (&'static str, Value, Option<PathBuf>);
+
+fn done(name: &'static str, value: Value) -> Result<Dispatched> {
+    Ok((name, value, None))
+}
+
+fn dispatch(config: &Config, command: Command) -> Result<Dispatched> {
+    match command {
+        Command::Session(SessionCommand::Create(args)) => done(
+            "create-session",
+            create_session(&profile(config, &args.profile)?)?,
+        ),
+        Command::Session(SessionCommand::List(args)) => done(
+            "list-sessions",
+            list_sessions(&profile(config, &args.profile)?)?,
+        ),
+        Command::Session(SessionCommand::Close(args)) => done(
+            "close-session",
+            close_session(&profile(config, &args.profile)?, &args.session_id)?,
+        ),
+        Command::Mcp(McpCommand::ListTools(args)) => {
+            let response = list_mcp_tools_via_daemon(&profile(config, &args.profile)?)?;
+            done("list-tools", tools_output(&response)?)
         }
-        ("profile", "help" | "--help" | "-h") => {
-            print_profile_help();
-            Ok(())
-        }
-        ("daemon", "help" | "--help" | "-h") => {
-            print_daemon_help();
-            Ok(())
-        }
-        ("session", "help" | "--help" | "-h") => {
-            print_session_help();
-            Ok(())
-        }
-        ("session", "create") => {
-            if wants_help(&rest) {
-                print_session_create_help();
-                return Ok(());
-            }
-            let profile = require_profile(&config, &rest)?;
-            create_session(&profile)
-        }
-        ("session", "list") => {
-            if wants_help(&rest) {
-                print_session_list_help();
-                return Ok(());
-            }
-            let profile = require_profile(&config, &rest)?;
-            list_sessions(&profile)
-        }
-        ("session", "close") => {
-            if wants_help(&rest) {
-                print_session_close_help();
-                return Ok(());
-            }
-            let (profile, session_id) = require_profile_and_session(&config, &rest)?;
-            close_session(&profile, &session_id)
-        }
-        ("mcp", "call") => {
-            if wants_help(&rest) {
-                print_mcp_call_help();
-                return Ok(());
-            }
-            let (profile, session_id) = require_profile_and_session(&config, &rest)?;
-            call_daemon(&profile, &session_id)
-        }
-        ("mcp", "batch") => {
-            if wants_help(&rest) {
-                print_mcp_batch_help();
-                return Ok(());
-            }
-            run_batch(&config, &rest)
-        }
-        ("mcp", "list") => {
-            if wants_help(&rest) {
-                print_mcp_list_help();
-                return Ok(());
-            }
-            let profile = require_profile(&config, &rest)?;
-            list_mcp_tools_via_daemon(&profile)
-        }
-        ("mcp", "direct-call") => {
-            if wants_help(&rest) {
-                print_mcp_direct_call_help();
-                return Ok(());
-            }
-            let profile = require_profile(&config, &rest)?;
-            let _lock = acquire_profile_lock(&profile)?;
-            ensure_chrome(&profile)?;
-            exec_mcp(&profile)
-        }
-        ("mcp", "direct-list") => {
-            if wants_help(&rest) {
-                print_mcp_direct_list_help();
-                return Ok(());
-            }
-            let profile = require_profile(&config, &rest)?;
-            if is_daemon_ready(&profile)? {
+        Command::Mcp(McpCommand::ListDirectTools(args)) => {
+            let profile = profile(config, &args.profile)?;
+            let response = if is_daemon_ready(&profile)? {
                 eprintln!(
-                    "note: the daemon for profile {} holds the profile lock, so the tools are listed through the daemon (same as `mcp list`)",
+                    "note: the daemon for profile {} holds the profile lock, so the tools are listed through the daemon (same as `mcp list-tools`)",
                     profile.name
                 );
-                return list_mcp_tools_via_daemon(&profile);
-            }
+                list_mcp_tools_via_daemon(&profile)?
+            } else {
+                let _lock = acquire_profile_lock(&profile)?;
+                ensure_chrome(&profile)?;
+                list_mcp_tools(&profile)?
+            };
+            done("list-direct-tools", tools_output(&response)?)
+        }
+        Command::Mcp(McpCommand::RunBatch(args)) => run_batch(config, args),
+        Command::Mcp(McpCommand::ForwardRequests(args)) => {
+            call_daemon(&profile(config, &args.profile)?, &args.session_id)?;
+            std::process::exit(0);
+        }
+        Command::Mcp(McpCommand::ForwardDirectRequests(args)) => {
+            let profile = profile(config, &args.profile)?;
             let _lock = acquire_profile_lock(&profile)?;
             ensure_chrome(&profile)?;
-            list_mcp_tools(&profile)
+            exec_mcp(&profile)?;
+            std::process::exit(0);
         }
-        ("profile", "status") => {
-            if wants_help(&rest) {
-                print_profile_status_help();
-                return Ok(());
+        Command::Daemon(DaemonCommand::Start(args)) => {
+            let profile = profile(config, &args.profile)?;
+            let started = start_daemon(&profile)?;
+            let socket = daemon_socket_path(&profile)?.display().to_string();
+            let value = match started {
+                Some(pid) => {
+                    json!({"Profile": profile.name, "Daemon": "started", "Pid": pid, "Socket": socket})
+                }
+                None => json!({
+                    "Profile": profile.name,
+                    "Daemon": "ready",
+                    "Pid": read_pid_file(&daemon_pid_path(&profile)?),
+                    "Socket": socket
+                }),
+            };
+            done("start-daemon", value)
+        }
+        Command::Daemon(DaemonCommand::Run(args)) => {
+            run_daemon(&profile(config, &args.profile)?)?;
+            std::process::exit(0);
+        }
+        Command::Daemon(DaemonCommand::Status(args)) => done(
+            "get-daemon-status",
+            daemon_status(&profile(config, &args.profile)?)?,
+        ),
+        Command::Daemon(DaemonCommand::Stop(args)) => {
+            let profile = profile(config, &args.profile)?;
+            match stop_daemon(&profile, args.force)? {
+                DaemonStop::Stopped => done(
+                    "stop-daemon",
+                    json!({"Profile": profile.name, "Daemon": "stopped"}),
+                ),
+                DaemonStop::Refused(message) => Err(target(message)),
             }
-            let profile = require_profile(&config, &rest)?;
-            print_status(&profile);
-            Ok(())
         }
-        ("profile", "stop") => {
-            if wants_help(&rest) {
-                print_profile_stop_help();
-                return Ok(());
+        Command::Profile(ProfileCommand::List(_)) => {
+            let profiles: Vec<Value> = config
+                .profiles
+                .iter()
+                .map(|profile| json!({"Name": profile.name, "UserDataDir": profile.user_data_dir}))
+                .collect();
+            done("list-profiles", json!({ "Profiles": profiles }))
+        }
+        Command::Profile(ProfileCommand::Status(args)) => {
+            let profile = profile(config, &args.profile)?;
+            let port = current_port(&profile).filter(|port| is_devtools_ready(*port));
+            done(
+                "get-profile-status",
+                json!({
+                    "Profile": profile.name,
+                    "Status": if port.is_some() { "ready" } else { "stopped" },
+                    "Port": port,
+                    "UserDataDir": profile.user_data_dir
+                }),
+            )
+        }
+        Command::Profile(ProfileCommand::Stop(args)) => {
+            let profile = profile(config, &args.profile)?;
+            if !args.force && is_daemon_ready(&profile)? {
+                return Err(target(format!(
+                    "daemon for profile {} is running and other agents may be using it; stopping Chrome would break their sessions. run 'chrome-devtools daemon stop-daemon --profile {}' first, or pass --force",
+                    profile.name, profile.name
+                )));
             }
-            let (force, rest) = extract_flag(&rest, "--force");
-            let profile = require_profile(&config, &rest)?;
-            stop_profile(&profile, force)
+            let stopped = stop_profile(&profile)?;
+            done(
+                "stop-profile",
+                json!({"Profile": profile.name, "Stopped": stopped}),
+            )
         }
-        ("profile", "list") => {
-            if wants_help(&rest) {
-                print_profile_list_help();
-                return Ok(());
-            }
-            reject_extra_args(&rest)?;
-            list_profiles(&config);
-            Ok(())
-        }
-        ("daemon", "start") => {
-            if wants_help(&rest) {
-                print_daemon_start_help();
-                return Ok(());
-            }
-            let profile = require_profile(&config, &rest)?;
-            start_daemon(&profile, false)
-        }
-        ("daemon", "run") => {
-            if wants_help(&rest) {
-                print_daemon_run_help();
-                return Ok(());
-            }
-            let profile = require_profile(&config, &rest)?;
-            run_daemon(&profile)
-        }
-        ("daemon", "status") => {
-            if wants_help(&rest) {
-                print_daemon_status_help();
-                return Ok(());
-            }
-            let profile = require_profile(&config, &rest)?;
-            print_daemon_status(&profile)
-        }
-        ("daemon", "stop") => {
-            if wants_help(&rest) {
-                print_daemon_stop_help();
-                return Ok(());
-            }
-            let (force, rest) = extract_flag(&rest, "--force");
-            let profile = require_profile(&config, &rest)?;
-            stop_daemon(&profile, force)
-        }
-        _ => Err(format!("unknown command: {object} {action}")),
     }
 }
 
-pub(crate) fn extract_flag(args: &[String], flag: &str) -> (bool, Vec<String>) {
-    let found = args.iter().any(|arg| arg == flag);
-    let remaining = args.iter().filter(|arg| *arg != flag).cloned().collect();
-    (found, remaining)
+fn profile(config: &Config, name: &str) -> Result<Profile> {
+    find_profile(config, name).map_err(target)
 }
 
-pub(crate) fn split_command_args(args: Vec<String>) -> (Vec<String>, Vec<String>) {
-    let mut positional = Vec::new();
-    let mut rest = Vec::new();
-    let mut iter = args.into_iter();
-    while let Some(arg) = iter.next() {
-        if positional.len() >= 2 {
-            rest.push(arg);
-            continue;
-        }
-        if matches!(arg.as_str(), "--profile" | "--session") {
-            rest.push(arg);
-            if let Some(value) = iter.next() {
-                rest.push(value);
-            }
-            continue;
-        }
-        positional.push(arg);
-    }
-    (positional, rest)
-}
-
-pub(crate) fn wants_help(args: &[String]) -> bool {
-    args.iter()
-        .any(|arg| matches!(arg.as_str(), "--help" | "-h" | "help"))
-}
-
-pub(crate) fn reject_extra_args(args: &[String]) -> Result<(), String> {
-    if args.is_empty() {
-        Ok(())
-    } else {
-        Err(format!("unknown argument: {}", args[0]))
-    }
-}
-
-pub(crate) fn require_profile(config: &Config, args: &[String]) -> Result<Profile, String> {
-    let mut profile_name = None;
-    let mut index = 0;
-
-    while index < args.len() {
-        match args[index].as_str() {
-            "--profile" => {
-                let Some(value) = args.get(index + 1) else {
-                    return Err("--profile requires a value".to_string());
-                };
-                profile_name = Some(value.as_str());
-                index += 2;
-            }
-            unknown => return Err(format!("unknown argument: {unknown}")),
-        }
-    }
-
-    let Some(profile_name) = profile_name else {
-        return Err("--profile is required".to_string());
+fn run_batch(config: &Config, args: RunBatchArgs) -> Result<Dispatched> {
+    let steps = parse_steps(&args.steps)?;
+    let options = BatchOptions {
+        profile: profile(config, &args.profile)?,
+        session_id: args.session_id,
+        steps,
+        fail_fast: args.fail_fast,
     };
-
-    find_profile(config, profile_name)
-}
-
-pub(crate) fn require_profile_and_session(
-    config: &Config,
-    args: &[String],
-) -> Result<(Profile, String), String> {
-    let mut profile_name = None;
-    let mut session_id = None;
-    let mut index = 0;
-
-    while index < args.len() {
-        match args[index].as_str() {
-            "--profile" => {
-                let Some(value) = args.get(index + 1) else {
-                    return Err("--profile requires a value".to_string());
-                };
-                profile_name = Some(value.clone());
-                index += 2;
+    let (value, failure) = match execute_batch(&options) {
+        Ok(run) => {
+            let failure = run
+                .stopped_on_error
+                .map(|label| target(format!("batch stopped on error at step: {label}")));
+            (json!({ "Steps": run.results }), failure)
+        }
+        Err(error) => (
+            json!({ "Steps": [], "Error": error.message() }),
+            Some(error),
+        ),
+    };
+    match failure {
+        None => Ok(("run-batch", value, args.output_file)),
+        Some(error) => {
+            let rendered =
+                serde_json::to_string_pretty(&value).map_err(|error| other(error.to_string()))?;
+            match &args.output_file {
+                Some(path) => {
+                    let _ = fs::write(path, format!("{rendered}\n"));
+                }
+                None => println!("{rendered}"),
             }
-            "--session" => {
-                let Some(value) = args.get(index + 1) else {
-                    return Err("--session requires a value".to_string());
-                };
-                session_id = Some(value.clone());
-                index += 2;
-            }
-            unknown => return Err(format!("unknown argument: {unknown}")),
+            Err(error)
         }
     }
-
-    let profile_name = profile_name.ok_or_else(|| "--profile is required".to_string())?;
-    let session_id = session_id.ok_or_else(|| "--session is required".to_string())?;
-    let profile = find_profile(config, &profile_name)?;
-    Ok((profile, session_id))
 }
 
-pub(crate) fn list_profiles(config: &Config) {
-    for profile in &config.profiles {
-        println!("{}\tuser_data_dir={}", profile.name, profile.user_data_dir);
+fn tools_output(response: &str) -> Result<Value> {
+    let value: Value = serde_json::from_str(response)
+        .map_err(|error| other(format!("MCP returned invalid tools/list JSON: {error}")))?;
+    if let Some(error) = value.get("error").filter(|error| !error.is_null()) {
+        return Err(target(format!("MCP tools/list failed: {error}")));
     }
+    let tools = value
+        .pointer("/result/tools")
+        .cloned()
+        .unwrap_or_else(|| json!([]));
+    Ok(json!({ "Tools": tools }))
 }
 
-#[derive(Default)]
-struct Help {
-    lines: Vec<String>,
+fn control_line(profile: &Profile, command: &str) -> Result<String> {
+    let response = send_daemon_control(profile, command)?;
+    let line = response
+        .lines()
+        .next()
+        .ok_or_else(|| other("daemon returned empty response"))?;
+    if let Some(message) = line.strip_prefix("error=") {
+        return Err(target(message));
+    }
+    Ok(line.to_string())
 }
 
-impl Help {
-    fn titled(title: &str) -> Self {
-        Self::default().line(title).blank()
-    }
+fn create_session(profile: &Profile) -> Result<Value> {
+    ensure_daemon(profile)?;
+    Ok(session_value(&control_line(profile, "session_create")?))
+}
 
-    fn line(mut self, line: &str) -> Self {
-        self.lines.push(line.to_string());
-        self
+fn list_sessions(profile: &Profile) -> Result<Value> {
+    if !is_daemon_ready(profile)? {
+        return Ok(json!({ "Sessions": [] }));
     }
+    let response = send_daemon_control(profile, "session_list")?;
+    let sessions: Vec<Value> = response
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(session_value)
+        .collect();
+    Ok(json!({ "Sessions": sessions }))
+}
 
-    fn blank(mut self) -> Self {
-        self.lines.push(String::new());
-        self
+fn close_session(profile: &Profile, session_id: &str) -> Result<Value> {
+    if !is_daemon_ready(profile)? {
+        return Err(target(format!(
+            "unknown session: {session_id} (the daemon for profile {} is not running)",
+            profile.name
+        )));
     }
+    control_line(profile, &format!("session_close session={session_id}"))?;
+    Ok(json!({"SessionId": session_id, "Closed": true}))
+}
 
-    fn section(mut self, title: &str, lines: &[&str]) -> Self {
-        if !self.lines.is_empty() && self.lines.last().is_some_and(|line| !line.is_empty()) {
-            self.lines.push(String::new());
+/// Splits a daemon `key=value key=value` line; a token without `=` continues the previous value.
+pub(crate) fn parse_fields(line: &str) -> Vec<(String, String)> {
+    let mut fields: Vec<(String, String)> = Vec::new();
+    for token in line.split_whitespace() {
+        match token.split_once('=') {
+            Some((key, value))
+                if !key.is_empty()
+                    && key.chars().all(|ch| ch.is_ascii_lowercase() || ch == '_') =>
+            {
+                fields.push((key.to_string(), value.to_string()))
+            }
+            _ => {
+                if let Some((_, value)) = fields.last_mut() {
+                    value.push(' ');
+                    value.push_str(token);
+                }
+            }
         }
-        self.lines.push(title.to_string());
-        for line in lines {
-            if line.is_empty() {
-                self.lines.push(String::new());
+    }
+    fields
+}
+
+pub(crate) fn snake_to_pascal(key: &str) -> String {
+    grammar::pascal_case(&key.replace('_', "-"))
+}
+
+pub(crate) fn typed_value(raw: &str) -> Value {
+    if raw.is_empty() {
+        return Value::Null;
+    }
+    match raw {
+        "true" => return Value::Bool(true),
+        "false" => return Value::Bool(false),
+        _ => {}
+    }
+    match raw.parse::<u64>() {
+        Ok(number) => Value::from(number),
+        Err(_) => Value::String(raw.to_string()),
+    }
+}
+
+pub(crate) fn session_value(line: &str) -> Value {
+    let mut map = Map::new();
+    for (key, raw) in parse_fields(line) {
+        let key = match key.as_str() {
+            "session" => "SessionId".to_string(),
+            other => snake_to_pascal(other),
+        };
+        let value = if key == "SessionId" || key == "PageUrl" || key == "TargetId" {
+            if raw.is_empty() {
+                Value::Null
             } else {
-                self.lines.push(format!("  {line}"));
+                Value::String(raw)
             }
+        } else {
+            typed_value(&raw)
+        };
+        map.insert(key, value);
+    }
+    Value::Object(map)
+}
+
+fn daemon_status(profile: &Profile) -> Result<Value> {
+    let socket_path = daemon_socket_path(profile)?;
+    let pid = read_pid_file(&daemon_pid_path(profile)?);
+    let status_response = if socket_path.exists() {
+        send_daemon_control(profile, "status").ok()
+    } else {
+        None
+    };
+    let (last_event, abnormal_exits, respawns) = match read_daemon_health(profile) {
+        Some((last, abnormal, respawns)) => (Value::String(last), abnormal, respawns),
+        None => (Value::Null, 0, 0),
+    };
+    let mut map = Map::new();
+    map.insert("Profile".to_string(), json!(profile.name));
+    match status_response.filter(|response| response.contains("daemon=ready")) {
+        None => {
+            map.insert("Daemon".to_string(), json!("stopped"));
         }
-        self
-    }
-
-    fn section_raw(mut self, title: &str, lines: &[&str]) -> Self {
-        if !self.lines.is_empty() && self.lines.last().is_some_and(|line| !line.is_empty()) {
-            self.lines.push(String::new());
+        Some(response) => {
+            let fields: Map<String, Value> = parse_fields(response.trim())
+                .into_iter()
+                .map(|(key, raw)| (key, Value::String(raw)))
+                .collect();
+            let field = |key: &str| {
+                fields
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .map(typed_value)
+                    .unwrap_or(Value::Null)
+            };
+            map.insert("Daemon".to_string(), json!("ready"));
+            map.insert(
+                "Version".to_string(),
+                fields
+                    .get("version")
+                    .cloned()
+                    .unwrap_or_else(|| json!("pre-0.3.1")),
+            );
+            map.insert("Sessions".to_string(), field("sessions"));
+            map.insert("ActiveSessions".to_string(), field("active_sessions"));
+            let pages: Vec<Value> = fields
+                .get("pages")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .split(',')
+                .filter(|page| !page.is_empty())
+                .map(typed_value)
+                .collect();
+            map.insert("Pages".to_string(), Value::Array(pages));
+            map.insert(
+                "QueuedMcpRequests".to_string(),
+                field("queued_mcp_requests"),
+            );
+            map.insert(
+                "MaxControlLatencyMs".to_string(),
+                field("max_control_latency_ms"),
+            );
+            map.insert(
+                "MaxForwardLatencyMs".to_string(),
+                field("max_forward_latency_ms"),
+            );
+            map.insert(
+                "DiagnosticWindowSecs".to_string(),
+                field("diagnostic_window_secs"),
+            );
+            let port = fields
+                .get("mcp_port")
+                .and_then(Value::as_str)
+                .and_then(|port| port.parse::<u16>().ok())
+                .filter(|port| *port != 0);
+            let chrome = match port {
+                Some(port) if is_devtools_ready(port) => "ready",
+                Some(_) => "unreachable",
+                None => "unknown",
+            };
+            map.insert("Chrome".to_string(), json!(chrome));
+            map.insert("ChromePort".to_string(), json!(port));
         }
-        self.lines.push(title.to_string());
-        for line in lines {
-            self.lines.push((*line).to_string());
-        }
-        self
     }
-
-    fn print_stdout(self) {
-        println!("{}", self.lines.join("\n"));
-    }
-
-    fn print_stderr(self) {
-        eprintln!("{}", self.lines.join("\n"));
-    }
-}
-
-pub(crate) fn print_usage() {
-    Help::default()
-        .section(
-            "Usage:",
-            &[
-                "chrome-devtools --version",
-                "chrome-devtools mcp list --profile <profile>",
-                "chrome-devtools mcp call --profile <profile> --session <id>",
-                "chrome-devtools mcp batch --profile <profile> --session <id> --script <path>",
-                "chrome-devtools mcp direct-list --profile <profile>",
-                "chrome-devtools mcp direct-call --profile <profile>",
-                "chrome-devtools mcp help",
-                "chrome-devtools session create --profile <profile>",
-                "chrome-devtools session list --profile <profile>",
-                "chrome-devtools session close --profile <profile> --session <id>",
-                "chrome-devtools daemon start --profile <profile>",
-                "chrome-devtools daemon status --profile <profile>",
-                "chrome-devtools daemon stop --profile <profile>",
-                "chrome-devtools profile status --profile <profile>",
-                "chrome-devtools profile stop --profile <profile>",
-                "chrome-devtools profile list",
-            ],
-        )
-        .section(
-            "Config:",
-            &["~/.config/chrome-devtools/config.toml is created on startup if missing."],
-        )
-        .section(
-            "Concurrency:",
-            &[
-                "The daemon assigns each session to a page and injects pageId for page-scoped",
-                "MCP tools. Different sessions may run concurrently; a second bind on the same",
-                "session id is rejected. Direct MCP commands take a per-profile lock under",
-                "~/.cache/chrome-devtools/locks.",
-            ],
-        )
-        .print_stderr();
-}
-
-pub(crate) fn print_version() {
-    println!("chrome-devtools {}", env!("CARGO_PKG_VERSION"));
-}
-
-pub(crate) fn print_mcp_help() {
-    Help::titled("chrome-devtools mcp")
-        .section(
-            "Usage:",
-            &[
-                "chrome-devtools mcp list --profile <profile>",
-                "chrome-devtools mcp call --profile <profile> --session <id>",
-                "chrome-devtools mcp batch --profile <profile> --session <id> --script <path>",
-                "chrome-devtools mcp direct-list --profile <profile>",
-                "chrome-devtools mcp direct-call --profile <profile>",
-                "chrome-devtools mcp help",
-            ],
-        )
-        .section(
-            "Commands:",
-            &[
-                "list         Start the selected profile daemon if needed, query tools/list through it, and print the raw MCP JSON response.",
-                "",
-                "call         Start the selected profile daemon if needed, bind the named session, and forward stdin MCP JSON-RPC lines through its long-lived MCP process.",
-                "",
-                "batch        Bind the named session and run a JSON batch file of tool/sleep steps through the profile daemon. Prints a JSON array of results.",
-                "",
-                "direct-list  Bypass the daemon, run chrome-devtools-mcp directly, query tools/list, and print the raw MCP JSON response.",
-                "",
-                "direct-call  Bypass the daemon, run chrome-devtools-mcp directly over stdio. Use only for fallback/manual debugging.",
-                "",
-                "help         Show this help.",
-            ],
-        )
-        .section("Options:", &["-h, --help   Show this help and exit."])
-        .section(
-            "Examples:",
-            &[
-                "chrome-devtools daemon start --profile default",
-                "chrome-devtools mcp list --profile default",
-                "ID=$(chrome-devtools session create --profile default | awk -F= '{print $2}' | awk '{print $1}')",
-                "chrome-devtools mcp call --profile default --session \"$ID\"",
-                "chrome-devtools mcp batch --profile default --session \"$ID\" --script /tmp/batch.json",
-            ],
-        )
-        .section(
-            "Config:",
-            &[
-                "Profiles are read from ~/.config/chrome-devtools/config.toml.",
-                "If the config file is missing, chrome-devtools creates a default profile using ~/.config/chrome-devtools/profiles/default.",
-                "user_data_dir is optional; when omitted, it defaults to ~/.config/chrome-devtools/profiles/<profile-name>.",
-                "Prefer user_data_dir values under ~/.config/chrome-devtools/profiles/<profile-name>.",
-            ],
-        )
-        .section(
-            "Sessions:",
-            &[
-                "mcp call and mcp batch require --session <id>. Mint one with `session create`.",
-                "Sessions live in-memory on the daemon and expire after 30 minutes of inactivity.",
-                "Each session gets its own page target. Different sessions may bind at the same time.",
-            ],
-        )
-        .section(
-            "Daemon:",
-            &[
-                "mcp call, mcp list and mcp batch route through one long-lived per-profile daemon by default.",
-                "Daemon sockets and pid files live under ~/.cache/chrome-devtools/daemons.",
-                "direct-call and direct-list bypass the daemon and take a per-profile lock under ~/.cache/chrome-devtools/locks.",
-                "Set CHROME_DEVTOOLS_LOCK_TIMEOUT_SECS to override the direct-mode/default daemon lock wait.",
-            ],
-        )
-        .section(
-            "Notes:",
-            &[
-                "Profiles define the Chrome user data directory. The daemon picks a free DevTools port automatically.",
-                "The call/batch commands do not reimplement MCP tools; they delegate to a daemon-owned chrome-devtools-mcp process.",
-                "The daemon injects pageId for page-scoped tools so each session uses its assigned page.",
-                "Snapshot uid values are returned as session uid tokens and are valid for the latest snapshot on that session page.",
-                "Daemon-routed calls preserve that MCP process across invocations until the daemon stops.",
-            ],
-        )
-        .print_stdout();
-}
-
-pub(crate) fn print_profile_help() {
-    Help::titled("chrome-devtools profile")
-        .section(
-            "Usage:",
-            &[
-                "chrome-devtools profile list",
-                "chrome-devtools profile status --profile <profile>",
-                "chrome-devtools profile stop --profile <profile>",
-            ],
-        )
-        .section(
-            "Commands:",
-            &[
-                "list    List all profiles defined in the config file.",
-                "status  Show whether the Chrome instance bound to the given profile is running.",
-                "stop    Stop the Chrome instance bound to the given profile.",
-            ],
-        )
-        .section("Options:", &["-h, --help  Show this help and exit."])
-        .print_stdout();
-}
-
-pub(crate) fn print_daemon_help() {
-    Help::titled("chrome-devtools daemon")
-        .section(
-            "Usage:",
-            &[
-                "chrome-devtools daemon start --profile <profile>",
-                "chrome-devtools daemon status --profile <profile>",
-                "chrome-devtools daemon stop --profile <profile>",
-            ],
-        )
-        .section(
-            "Commands:",
-            &[
-                "start   Start a background daemon for the profile, or report that one is already ready.",
-                "status  Show whether the per-profile daemon is ready, along with its pid and socket path.",
-                "stop    Ask the per-profile daemon to stop and clean up its socket/pid files.",
-            ],
-        )
-        .section("Options:", &["-h, --help  Show this help and exit."])
-        .section(
-            "Notes:",
-            &["Daemon metadata lives under ~/.cache/chrome-devtools/daemons."],
-        )
-        .print_stdout();
-}
-
-pub(crate) fn print_mcp_call_help() {
-    Help::titled("chrome-devtools mcp call")
-        .section("Usage:", &["chrome-devtools mcp call --profile <profile> --session <id>"])
-        .section(
-            "Description:",
-            &[
-                "Start the selected profile daemon if needed, bind the named session, then",
-                "forward stdin MCP JSON-RPC lines through its long-lived chrome-devtools-mcp",
-                "process and print responses. The daemon assigns the session to a page and",
-                "injects pageId for page-scoped tools. Activity refreshes the session's",
-                "30 minute idle timer.",
-            ],
-        )
-        .section(
-            "Options:",
-            &[
-                "--profile <name>  Required. Profile name from ~/.config/chrome-devtools/config.toml.",
-                "--session <id>    Required. Session id minted by `session create`.",
-                "-h, --help        Show this help and exit.",
-            ],
-        )
-        .section(
-            "Examples:",
-            &[
-                "ID=$(chrome-devtools session create --profile default | awk -F= '{print $2}' | awk '{print $1}')",
-                "printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{}}' \\",
-                "  | chrome-devtools mcp call --profile default --session \"$ID\"",
-            ],
-        )
-        .print_stdout();
-}
-
-pub(crate) fn print_mcp_batch_help() {
-    Help::titled("chrome-devtools mcp batch")
-        .section(
-            "Usage:",
-            &["chrome-devtools mcp batch --profile <profile> --session <id> --script <path> [--output <path>] [--fail-fast]"],
-        )
-        .section(
-            "Description:",
-            &[
-                "Read a JSON array of steps from --script, bind the named session, and",
-                "execute each step in order through the profile daemon (one initialize",
-                "handshake, then a tools/call per tool step). Prints a JSON array of",
-                "results to stdout. Activity refreshes the session's 30 minute idle timer.",
-            ],
-        )
-        .section(
-            "Step shapes:",
-            &[
-                "{\"type\":\"tool\",\"name\":\"<mcp-tool>\",\"args\":{...},\"label\":\"<optional>\",\"on_error\":\"continue|stop\"}",
-                "{\"type\":\"sleep_ms\",\"ms\":<u64>,\"label\":\"<optional>\"}",
-            ],
-        )
-        .section(
-            "Value references inside args:",
-            &[
-                "Replace any value in args with {\"$ref\":\"<label>.<path>\"} to substitute it",
-                "with a previous result. <path> is dot-separated; numeric segments index",
-                "arrays. Example: {\"$ref\":\"snap.result.content.0.text\"} resolves to the",
-                "text of the first content entry returned by the step labelled 'snap'.",
-            ],
-        )
-        .section(
-            "Result shape (per step):",
-            &[
-                "{\"type\":\"tool\",\"name\":\"...\",\"label\":\"...\",\"result\":<mcp tools/call result>,\"error\":<mcp error or null>}",
-                "A step whose page navigated (error 'Execution context was destroyed') adds \"navigated\":true and has error null.",
-                "{\"type\":\"sleep_ms\",\"ms\":<u64>,\"label\":\"...\"}",
-            ],
-        )
-        .section(
-            "Error handling:",
-            &[
-                "A tool step is considered to have errored if the MCP response carries a",
-                "non-null 'error' field or the result has isError=true (a navigated step is",
-                "not an error). By default the",
-                "batch continues; pass --fail-fast or set on_error=stop on a step to",
-                "stop execution after that error. When stopped, batch writes the partial",
-                "results to stdout/--output and exits non-zero.",
-            ],
-        )
-        .section(
-            "Options:",
-            &[
-                "--profile <name>  Required. Profile name from ~/.config/chrome-devtools/config.toml.",
-                "--session <id>    Required. Session id minted by `session create`.",
-                "--script <path>   Required. Path to a JSON file with the step array, or `-` for stdin.",
-                "--output <path>   Optional. Write the JSON results to <path> instead of stdout.",
-                "--fail-fast       Optional. Stop on the first errored tool step.",
-                "-h, --help        Show this help and exit.",
-            ],
-        )
-        .section_raw(
-            "Examples:",
-            &[
-                "  cat > /tmp/batch.json <<'EOF'",
-                "  [",
-                "    {\"type\":\"tool\",\"name\":\"navigate_page\",\"args\":{\"type\":\"reload\",\"timeout\":15000}},",
-                "    {\"type\":\"sleep_ms\",\"ms\":5000},",
-                "    {\"type\":\"tool\",\"name\":\"evaluate_script\",\"label\":\"title\",\"args\":{\"function\":\"() => document.title\"}}",
-                "  ]",
-                "  EOF",
-                "  ID=$(chrome-devtools session create --profile default | awk -F= '{print $2}' | awk '{print $1}')",
-                "  chrome-devtools mcp batch --profile default --session \"$ID\" --script /tmp/batch.json",
-            ],
-        )
-        .print_stdout();
-}
-
-pub(crate) fn print_mcp_list_help() {
-    Help::titled("chrome-devtools mcp list")
-        .section("Usage:", &["chrome-devtools mcp list --profile <profile>"])
-        .section(
-            "Description:",
-            &[
-                "Start the selected profile daemon if needed, query tools/list through it,",
-                "and print the raw MCP JSON response.",
-            ],
-        )
-        .section(
-            "Options:",
-            &[
-                "--profile <name>  Required. Profile name from ~/.config/chrome-devtools/config.toml.",
-                "-h, --help        Show this help and exit.",
-            ],
-        )
-        .print_stdout();
-}
-
-pub(crate) fn print_mcp_direct_call_help() {
-    Help::titled("chrome-devtools mcp direct-call")
-        .section("Usage:", &["chrome-devtools mcp direct-call --profile <profile>"])
-        .section(
-            "Description:",
-            &[
-                "Bypass the daemon and run chrome-devtools-mcp directly over stdio.",
-                "Use only for fallback/manual debugging; this mode cannot preserve snapshot",
-                "state across independent process invocations.",
-            ],
-        )
-        .section(
-            "Options:",
-            &[
-                "--profile <name>  Required. Profile name from ~/.config/chrome-devtools/config.toml.",
-                "-h, --help        Show this help and exit.",
-            ],
-        )
-        .section(
-            "Notes:",
-            &[
-                "Acquires a per-profile lock under ~/.cache/chrome-devtools/locks.",
-                "Set CHROME_DEVTOOLS_LOCK_TIMEOUT_SECS to override the 300 second wait.",
-            ],
-        )
-        .print_stdout();
-}
-
-pub(crate) fn print_mcp_direct_list_help() {
-    Help::titled("chrome-devtools mcp direct-list")
-        .section("Usage:", &["chrome-devtools mcp direct-list --profile <profile>"])
-        .section(
-            "Description:",
-            &[
-                "Bypass the daemon, run chrome-devtools-mcp directly, query tools/list, and",
-                "print the raw MCP JSON response.",
-            ],
-        )
-        .section(
-            "Options:",
-            &[
-                "--profile <name>  Required. Profile name from ~/.config/chrome-devtools/config.toml.",
-                "-h, --help        Show this help and exit.",
-            ],
-        )
-        .section(
-            "Notes:",
-            &[
-                "Acquires a per-profile lock under ~/.cache/chrome-devtools/locks.",
-                "While the profile daemon is running it holds that lock, so direct-list lists the",
-                "tools through the daemon instead (same output as `mcp list`).",
-            ],
-        )
-        .print_stdout();
-}
-
-pub(crate) fn print_profile_status_help() {
-    Help::titled("chrome-devtools profile status")
-        .section("Usage:", &["chrome-devtools profile status --profile <profile>"])
-        .section(
-            "Description:",
-            &[
-                "Show whether the Chrome DevTools endpoint for the given profile is reachable,",
-                "along with its runtime port and user_data_dir.",
-            ],
-        )
-        .section(
-            "Options:",
-            &[
-                "--profile <name>  Required. Profile name from ~/.config/chrome-devtools/config.toml.",
-                "-h, --help        Show this help and exit.",
-            ],
-        )
-        .print_stdout();
-}
-
-pub(crate) fn print_profile_stop_help() {
-    Help::titled("chrome-devtools profile stop")
-        .section("Usage:", &["chrome-devtools profile stop --profile <profile> [--force]"])
-        .section(
-            "Description:",
-            &[
-                "Stop the Chrome instance bound to the given profile by matching processes",
-                "whose command line contains --user-data-dir=<profile user_data_dir>.",
-                "Refused while the profile daemon is running, because other agents may be",
-                "driving that Chrome through it; stop the daemon first or pass --force.",
-            ],
-        )
-        .section(
-            "Options:",
-            &[
-                "--profile <name>  Required. Profile name from ~/.config/chrome-devtools/config.toml.",
-                "--force           Stop Chrome even while the profile daemon is running.",
-                "-h, --help        Show this help and exit.",
-            ],
-        )
-        .print_stdout();
-}
-
-pub(crate) fn print_profile_list_help() {
-    Help::titled("chrome-devtools profile list")
-        .section("Usage:", &["chrome-devtools profile list"])
-        .section(
-            "Description:",
-            &[
-                "Print all profiles defined in ~/.config/chrome-devtools/config.toml, one per",
-                "line, as: <name>\\tuser_data_dir=<path>.",
-            ],
-        )
-        .section("Options:", &["-h, --help  Show this help and exit."])
-        .print_stdout();
-}
-
-pub(crate) fn print_daemon_start_help() {
-    Help::titled("chrome-devtools daemon start")
-        .section("Usage:", &["chrome-devtools daemon start --profile <profile>"])
-        .section(
-            "Description:",
-            &[
-                "Start a background daemon for the profile if one is not already running.",
-                "The daemon owns one chrome-devtools-mcp process and routes MCP calls",
-                "over a Unix socket under ~/.cache/chrome-devtools/daemons.",
-            ],
-        )
-        .section(
-            "Options:",
-            &[
-                "--profile <name>  Required. Profile name from ~/.config/chrome-devtools/config.toml.",
-                "-h, --help        Show this help and exit.",
-            ],
-        )
-        .print_stdout();
-}
-
-pub(crate) fn print_daemon_run_help() {
-    Help::titled("chrome-devtools daemon run")
-        .section("Usage:", &["chrome-devtools daemon run --profile <profile>"])
-        .section(
-            "Description:",
-            &[
-                "Run the per-profile broker in the foreground. This subcommand is normally",
-                "spawned by `daemon start` and is not intended to be invoked directly.",
-            ],
-        )
-        .section(
-            "Options:",
-            &[
-                "--profile <name>  Required. Profile name from ~/.config/chrome-devtools/config.toml.",
-                "-h, --help        Show this help and exit.",
-            ],
-        )
-        .print_stdout();
-}
-
-pub(crate) fn print_daemon_status_help() {
-    Help::titled("chrome-devtools daemon status")
-        .section("Usage:", &["chrome-devtools daemon status --profile <profile>"])
-        .section(
-            "Description:",
-            &[
-                "Print whether the per-profile daemon is ready or stopped. Ready output:",
-                "",
-                "  profile=<p> daemon=ready version=<v> sessions=<n> active_sessions=<n> pages=<ids> queued_mcp_requests=<n> max_control_latency_ms=<n> max_forward_latency_ms=<n> diagnostic_window_secs=<n> chrome=<state> respawns=<n> pid=<pid> socket=<path>",
-                "",
-                "chrome=ready means the DevTools endpoint currently responds.",
-                "respawns=<n> counts daemon-managed MCP respawns; mint a new session after it changes.",
-            ],
-        )
-        .section(
-            "Options:",
-            &[
-                "--profile <name>  Required. Profile name from ~/.config/chrome-devtools/config.toml.",
-                "-h, --help        Show this help and exit.",
-            ],
-        )
-        .print_stdout();
-}
-
-pub(crate) fn print_daemon_stop_help() {
-    Help::titled("chrome-devtools daemon stop")
-        .section("Usage:", &["chrome-devtools daemon stop --profile <profile> [--force]"])
-        .section(
-            "Description:",
-            &[
-                "Ask the per-profile daemon to stop and clean up its socket and pid files.",
-                "Refused while sessions are active, because other agents may own them;",
-                "pass --force to stop anyway (their sessions are destroyed).",
-                "If the daemon is unreachable but a pid file exists, fall back to sending it",
-                "a TERM signal via kill.",
-            ],
-        )
-        .section(
-            "Options:",
-            &[
-                "--profile <name>  Required. Profile name from ~/.config/chrome-devtools/config.toml.",
-                "--force           Stop even while sessions are active.",
-                "-h, --help        Show this help and exit.",
-            ],
-        )
-        .print_stdout();
-}
-
-pub(crate) fn print_session_help() {
-    Help::titled("chrome-devtools session")
-        .section(
-            "Usage:",
-            &[
-                "chrome-devtools session create --profile <profile>",
-                "chrome-devtools session list --profile <profile>",
-                "chrome-devtools session close --profile <profile> --session <id>",
-            ],
-        )
-        .section(
-            "Commands:",
-            &[
-                "create  Mint a new session id on the profile daemon.",
-                "list    List active sessions held by the profile daemon.",
-                "close   Close (drop) the named session and its daemon-created page.",
-            ],
-        )
-        .section("Options:", &["-h, --help  Show this help and exit."])
-        .section(
-            "Notes:",
-            &[
-                "Sessions live in-memory on the profile daemon. They are dropped after",
-                "30 minutes of inactivity or when the daemon stops.",
-                "mcp call and mcp batch require --session <id>; use session create to mint it.",
-            ],
-        )
-        .print_stdout();
-}
-
-pub(crate) fn print_session_create_help() {
-    Help::titled("chrome-devtools session create")
-        .section("Usage:", &["chrome-devtools session create --profile <profile>"])
-        .section(
-            "Description:",
-            &[
-                "Start the profile daemon if needed, then ask it to mint a new in-memory",
-                "session id. The session is dropped after 30 minutes of inactivity or when",
-                "the daemon stops. Prints one line to stdout:",
-                "",
-                "  session=<id> created=<unix-ts> last_used=<unix-ts> owned=false",
-            ],
-        )
-        .section(
-            "Options:",
-            &[
-                "--profile <name>  Required. Profile name from ~/.config/chrome-devtools/config.toml.",
-                "-h, --help        Show this help and exit.",
-            ],
-        )
-        .print_stdout();
-}
-
-pub(crate) fn print_session_list_help() {
-    Help::titled("chrome-devtools session list")
-        .section("Usage:", &["chrome-devtools session list --profile <profile>"])
-        .section(
-            "Description:",
-            &[
-                "List active sessions held by the profile daemon. Each session is printed",
-                "on one line as:",
-                "",
-                "  session=<id> created=<unix-ts> last_used=<unix-ts> owned=<true|false> owner_pid=<pid or empty> page=<id>",
-                "",
-                "Prints nothing when the daemon is not running.",
-            ],
-        )
-        .section(
-            "Options:",
-            &[
-                "--profile <name>  Required. Profile name from ~/.config/chrome-devtools/config.toml.",
-                "-h, --help        Show this help and exit.",
-            ],
-        )
-        .print_stdout();
-}
-
-pub(crate) fn print_session_close_help() {
-    Help::titled("chrome-devtools session close")
-        .section("Usage:", &["chrome-devtools session close --profile <profile> --session <id>"])
-        .section(
-            "Description:",
-            &[
-                "Ask the profile daemon to drop the named session. If the session owns a",
-                "daemon-created page, the daemon closes that page while preserving Chrome's",
-                "last tab. Fails if the session is unknown or the daemon is not running.",
-            ],
-        )
-        .section(
-            "Options:",
-            &[
-                "--profile <name>  Required. Profile name from ~/.config/chrome-devtools/config.toml.",
-                "--session <id>    Required. Session id minted by `session create`.",
-                "-h, --help        Show this help and exit.",
-            ],
-        )
-        .print_stdout();
+    map.insert("Pid".to_string(), json!(pid));
+    map.insert(
+        "Socket".to_string(),
+        json!(socket_path.display().to_string()),
+    );
+    map.insert("AbnormalExits".to_string(), json!(abnormal_exits));
+    map.insert("Respawns".to_string(), json!(respawns));
+    map.insert("LastEvent".to_string(), last_event);
+    Ok(Value::Object(map))
 }

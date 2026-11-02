@@ -36,7 +36,7 @@ npx skills add ./rust-chrome-devtools
 
 - Profiles are explicit: every operation that targets a browser profile requires `--profile <name>`.
 - Profiles own their Chrome user data directory. The daemon picks a free DevTools port at start time and records it under `~/.cache/chrome-devtools/daemons/<profile>.port`.
-- On Linux with a systemd user manager, the daemon and the Chrome it launches each run in their own transient scope (`chrome-devtools-<profile>-daemon-<n>.scope` / `chrome-devtools-<profile>-chrome-<n>.scope`) via `systemd-run --user --scope`. Chrome's browser process moves itself to `app-com.google.Chrome-<pid>.scope`, but its zygote, GPU, renderer and utility processes stay in the cgroup of whatever started Chrome; giving them a scope of their own keeps them alive when the agent session that ran `daemon start` ends and its unit is stopped. Without that, Chrome cannot relaunch its GPU process and exits with `GPU process isn't usable. Goodbye.`
+- On Linux with a systemd user manager, the daemon and the Chrome it launches each run in their own transient scope (`chrome-devtools-<profile>-daemon-<n>.scope` / `chrome-devtools-<profile>-chrome-<n>.scope`) via `systemd-run --user --scope`. Chrome's browser process moves itself to `app-com.google.Chrome-<pid>.scope`, but its zygote, GPU, renderer and utility processes stay in the cgroup of whatever started Chrome; giving them a scope of their own keeps them alive when the agent session that ran `daemon start-daemon` ends and its unit is stopped. Without that, Chrome cannot relaunch its GPU process and exits with `GPU process isn't usable. Goodbye.`
 - Chrome's stdout and stderr go to `~/.cache/chrome-devtools/daemons/<profile>.chrome.log`. Each Chrome launch moves the previous file to `<profile>.chrome.log.1`, so the output of a Chrome that just crashed is kept after the daemon relaunches it.
 - Profiles are read from `~/.config/chrome-devtools/config.toml`.
 - If the config file is missing on startup, the CLI creates a `default` profile using `~/.config/chrome-devtools/profiles/default`.
@@ -47,10 +47,10 @@ npx skills add ./rust-chrome-devtools
 - Hermes-side Chrome DevTools MCP registration is not required for this workflow.
 - Daemon-routed snapshot `uid` values are session uid tokens. Keep `take_snapshot -> click/fill` on the same daemon session.
 - The daemon owns one `chrome-devtools-mcp` process per profile, so multiple CLI invocations do not create competing MCP processes for the same Chrome profile. If Chrome's DevTools endpoint or MCP probe fails, the daemon respawns MCP and drops in-memory sessions so clients can mint fresh ones.
-- The daemon accepts control commands independently of MCP forwarding, so `session create`, `session list`, `session close`, `daemon status`, and `daemon stop` respond while clients are bound.
+- The daemon accepts control commands independently of MCP forwarding, so `session create-session`, `session list-sessions`, `session close-session`, `daemon get-daemon-status`, and `daemon stop-daemon` respond while clients are bound.
 - The daemon rewrites client JSON-RPC ids internally and restores the original id in responses, including string ids.
-- `mcp direct-call` and `mcp direct-list` remain available as a fallback and take a per-profile lock under `~/.cache/chrome-devtools/locks`.
-- `mcp call` and `mcp batch` require an explicit `--session <id>` minted by `session create`. Sessions live in-memory on the daemon and expire after 30 minutes of inactivity (24 hours for a session that owns no tab); an `unknown session` error says whether the session was reaped, closed, dropped by an MCP respawn, or never existed on this daemon. Concurrent agents must mint and use their own session ids; the daemon assigns each session to a page and injects `pageId` for page-scoped tools.
+- `mcp forward-direct-requests` and `mcp list-direct-tools` remain available as a fallback and take a per-profile lock under `~/.cache/chrome-devtools/locks`.
+- `mcp forward-requests` and `mcp run-batch` require an explicit `--session-id <id>` minted by `session create-session`. Sessions live in-memory on the daemon and expire after 30 minutes of inactivity (24 hours for a session that owns no tab); an `unknown session` error says whether the session was reaped, closed, dropped by an MCP respawn, or never existed on this daemon. Concurrent agents must mint and use their own session ids; the daemon assigns each session to a page and injects `pageId` for page-scoped tools.
 
 ## Configuration
 
@@ -64,13 +64,13 @@ Environment overrides:
 - `CHROME_DEVTOOLS_MCP_MAX_OLD_SPACE_MB`: Node heap limit for the daemon-owned `chrome-devtools-mcp` process. Default: `2048`.
 - `CHROME_DEVTOOLS_CONTROL_WARN_LATENCY_MS`: control command warn threshold. Default: `1000`.
 - `CHROME_DEVTOOLS_FORWARD_WARN_LATENCY_MS`: MCP forward warn threshold. Default: `30000`.
-- `CHROME_DEVTOOLS_DIAGNOSTIC_WINDOW_SECS`: daemon status latency window. Default: `600`.
+- `CHROME_DEVTOOLS_DIAGNOSTIC_WINDOW_SECS`: `daemon get-daemon-status` latency window. Default: `600`.
 - `CHROME_DEVTOOLS_CHROME_EXTRA_ARGS`: extra whitespace-separated flags appended to the Chrome command line at launch.
 - `CHROME_DEVTOOLS_MCP_HEAVY_REQUEST_TIMEOUT_SECS`: request timeout for heavy tools (`take_snapshot`, `take_screenshot`, `performance_*`). Default: `300`.
 
 Heavy-tool note: Chrome's `Accessibility.getFullAXTree` (used by `take_snapshot`) scales super-linearly with DOM size — pages with 100k+ nodes can take minutes. Timing out early does not help: chrome-devtools-mcp does not abort a cancelled tool call and holds its internal tool mutex until the call finishes, so subsequent tools of the same daemon queue behind it anyway. That is why heavy tools get a longer deadline. On very large pages prefer `evaluate_script` for targeted inspection over full snapshots.
 
-Chrome is always launched with `--disable-features=PasswordLeakDetection`: the native "Change your password" dialog is invisible to MCP snapshots and blocks page input, which makes automated actions appear to hang. Chrome flags only apply when the daemon starts a new Chrome process — an already-running Chrome for the profile is reused as-is, so after upgrading run `chrome-devtools daemon stop --profile <name>` followed by `chrome-devtools profile stop --profile <name>` (kills Chrome) once.
+Chrome is always launched with `--disable-features=PasswordLeakDetection`: the native "Change your password" dialog is invisible to MCP snapshots and blocks page input, which makes automated actions appear to hang. Chrome flags only apply when the daemon starts a new Chrome process — an already-running Chrome for the profile is reused as-is, so after upgrading run `chrome-devtools daemon stop-daemon --profile <name>` followed by `chrome-devtools profile stop-profile --profile <name>` (kills Chrome) once.
 
 ## Daemon-native tools
 
@@ -101,59 +101,73 @@ Each session is pinned to the CDP target id of its tab, which stays the same for
 
 ## Commands
 
+The CLI takes input in the AWS CLI grammar: `chrome-devtools [global options] <command> <subcommand> [--parameter value ...]`. Every parameter is named, booleans come in `--flag` / `--no-flag` pairs, a value starting with `file://` is read from that file (`file:///dev/stdin` reads standard input), `--cli-input-json` takes all parameters as one JSON object keyed by the PascalCase parameter names, and `--generate-cli-skeleton input|output` prints the input or output shape. The global options are `--output json|text|table` (default `json`), `--query <JMESPath>`, `--debug` and `--version`. `help` works at every level (`chrome-devtools help`, `chrome-devtools mcp help`, `chrome-devtools mcp run-batch help`).
+
 ```sh
-chrome-devtools session create --profile default
-chrome-devtools session list --profile default
-chrome-devtools session close --profile default --session <id>
-chrome-devtools mcp list --profile default
-chrome-devtools mcp call --profile default --session <id>
-chrome-devtools mcp batch --profile default --session <id> --script batch.json
-chrome-devtools mcp help
-chrome-devtools daemon start --profile default
-chrome-devtools daemon status --profile default
-chrome-devtools daemon stop --profile default
-chrome-devtools profile list
-chrome-devtools profile status --profile default
-chrome-devtools profile stop --profile default
+chrome-devtools session create-session --profile default
+chrome-devtools session list-sessions --profile default
+chrome-devtools session close-session --profile default --session-id <id>
+chrome-devtools mcp list-tools --profile default
+chrome-devtools mcp run-batch --profile default --session-id <id> --steps file://steps.json
+chrome-devtools mcp forward-requests --profile default --session-id <id>
+chrome-devtools mcp list-direct-tools --profile default
+chrome-devtools mcp forward-direct-requests --profile default
+chrome-devtools daemon start-daemon --profile default
+chrome-devtools daemon get-daemon-status --profile default
+chrome-devtools daemon stop-daemon --profile default
+chrome-devtools profile list-profiles
+chrome-devtools profile get-profile-status --profile default
+chrome-devtools profile stop-profile --profile default
 ```
 
-`session create` starts the profile daemon when needed and mints a new in-memory session id. The session expires after 30 minutes of inactivity or when the daemon stops. Output looks like `session=sess-xxxxxxxxxxxxxxxx created=<ts> last_used=<ts> owned=false`.
+Output is JSON with PascalCase keys. Exit codes: `0` success, `252` a syntax or parameter error (including an invalid step), `254` an error on the target side (unknown profile, unknown or busy session, a refused stop, an MCP error that stopped a batch), `255` any other failure.
 
-`session list` prints one line per active session. `session close` drops the named session when it is idle and closes its daemon-created page when Chrome has another tab.
+`session create-session` starts the profile daemon when needed and mints a new in-memory session id. The session expires after 30 minutes of inactivity or when the daemon stops. Output looks like `{"SessionId": "sess-xxxxxxxxxxxxxxxx", "Created": <ts>, "LastUsed": <ts>, "Owned": false, ...}`; take the id with `--query SessionId --output text`.
 
-`mcp list` starts the profile daemon when needed, queries `tools/list` through that daemon, and prints the raw MCP JSON response.
+`session list-sessions` prints `{"Sessions": [...]}` with one object per active session (`SessionId`, `Owned`, `OwnerPid`, `Page`, `PageUrl`, `TargetId`, ...). `session close-session` drops the named session when it is idle and closes its daemon-created page when Chrome has another tab.
 
-`mcp call` binds the given session, forwards stdin JSON-RPC lines to the daemon-owned `chrome-devtools-mcp` process, waits for the matching JSON-RPC responses, and prints them to stdout. The session is held for the lifetime of this invocation; other clients can use control commands while the bind is active, and another MCP bind waits up to `CHROME_DEVTOOLS_BIND_TIMEOUT_SECS`. Activity refreshes the session's idle timer.
+`mcp list-tools` starts the profile daemon when needed, queries `tools/list` through that daemon, and prints `{"Tools": [...]}` with the MCP tool objects as MCP returns them.
 
-`daemon status` includes `queued_mcp_requests`, `max_control_latency_ms`, and `max_forward_latency_ms` for the recent diagnostic window. The default window is 600 seconds and can be changed with `CHROME_DEVTOOLS_DIAGNOSTIC_WINDOW_SECS`.
+`mcp forward-requests` binds the given session, forwards stdin JSON-RPC lines to the daemon-owned `chrome-devtools-mcp` process, and streams the JSON-RPC responses to stdout as they arrive (`--output` and `--query` do not apply to the stream). The session is held for the lifetime of this invocation; other clients can use control commands while the bind is active, and another MCP bind waits up to `CHROME_DEVTOOLS_BIND_TIMEOUT_SECS`. Activity refreshes the session's idle timer.
+
+`daemon get-daemon-status` includes `QueuedMcpRequests`, `MaxControlLatencyMs`, and `MaxForwardLatencyMs` for the recent diagnostic window, `Chrome` (`ready`, `unreachable` or `unknown`) with `ChromePort`, and `Respawns`, `AbnormalExits` and `LastEvent` from the health file. The default window is 600 seconds and can be changed with `CHROME_DEVTOOLS_DIAGNOSTIC_WINDOW_SECS`. When Chrome is `unreachable`, restart the daemon to reattach it.
 
 `upload_file` first uses `chrome-devtools-mcp`. When MCP reports that direct upload and file chooser triggering both failed, the daemon sets the page's `input[type=file]` through Chrome DevTools Protocol as a fallback and logs `upload_file_fallback`.
 
-`mcp batch` binds the given session and reads a JSON array of steps from `--script`, running each step in order through the profile daemon. One `initialize` handshake is performed; then each `tool` step is issued as a `tools/call` and each `sleep_ms` step pauses the runner. Results are printed as a JSON array to stdout (or to `--output <path>`), so callers can inspect them programmatically without parsing line-delimited JSON-RPC. Step shapes:
+`mcp run-batch` binds the given session and runs the `--steps` in order through the profile daemon. One `initialize` handshake is performed; then each `tool` step is issued as a `tools/call` and each `sleep_ms` step pauses the runner. Each `--steps` value is a JSON array of steps, one JSON step object, or one step in shorthand syntax, and several values are run in the order given:
+
+```sh
+chrome-devtools mcp run-batch --profile default --session-id "$SESSION" --steps \
+  'Type=tool,Name=navigate_page,Args={"type":"reload"}' \
+  Type=sleep_ms,Ms=5000,Label=wait-load \
+  'Type=tool,Name=evaluate_script,Label=title,Args={"function":"() => document.title"}'
+```
+
+The same steps as a JSON file passed with `--steps file://steps.json`:
 
 ```json
 [
-  { "type": "tool", "name": "navigate_page", "args": { "type": "reload" } },
-  { "type": "sleep_ms", "ms": 5000, "label": "wait-load" },
-  { "type": "tool", "name": "evaluate_script", "label": "title", "args": { "function": "() => document.title" } }
+  { "Type": "tool", "Name": "navigate_page", "Args": { "type": "reload" } },
+  { "Type": "sleep_ms", "Ms": 5000, "Label": "wait-load" },
+  { "Type": "tool", "Name": "evaluate_script", "Label": "title", "Args": { "function": "() => document.title" } }
 ]
 ```
 
-Inside `args`, replace any value with `{"$ref":"<label>.<path>"}` to substitute it with a previous step's result. `<path>` is dot-separated; numeric segments index arrays. For example, `{"$ref":"snap.result.content.0.text"}` resolves to the text of the first content entry of the result whose `label` was `snap`.
+The output is `{"Steps": [...]}` with one entry per step: `{"Type": "tool", "Name": ..., "Label": ..., "Result": <MCP tools/call result>, "Error": <MCP error or null>}` or `{"Type": "sleep_ms", "Label": ..., "Ms": ...}`. `Result` is the MCP result as MCP returns it, so the text of a tool result is `Result.content[0].text`. Select a step with `--query`, e.g. `--query "Steps[?Label=='title'].Result.content[0].text | [0]" --output text`.
 
-By default a tool step that returns an error (non-null `error` field or `isError: true`) is recorded and the batch continues. An `Execution context was destroyed` error (the step navigated the page) is recorded as `"navigated": true` with `error: null` and `result.isError: false` instead. The script is validated before the first step runs, so a `tool` step named `sleep_ms`, `sleep` or `wait`, or a step without `type`, fails the batch up front with the list of step types. Pass `--fail-fast` (or `"on_error": "stop"` on a step) to abort on the first error; partial results are still written and `chrome-devtools` exits non-zero.
+Inside `Args`, replace any value with `{"$ref":"<label>.<path>"}` to substitute it with a previous step's output entry. `<path>` is dot-separated; numeric segments index arrays. For example, `{"$ref":"snap.Result.content.0.text"}` resolves to the text of the first content entry of the step whose `Label` was `snap`.
 
-Use `--script -` to read the batch from stdin instead of a file, and `--output <path>` to write the JSON results to a file instead of stdout.
+By default a tool step that returns an error (non-null `Error` or `Result.isError: true`) is recorded and the batch continues. An `Execution context was destroyed` error (the step navigated the page) is recorded as `"Navigated": true` with `Error: null` and `Result.isError: false` instead. The steps are validated before the first one runs, so an unknown key, a `tool` step named `sleep_ms`, `sleep` or `wait`, or a step without `Type` fails with exit code 252 and the list of step types. Pass `--fail-fast` (or `"OnError": "stop"` on a step) to abort on the first error; the partial `Steps` are still printed and `chrome-devtools` exits with 254. When the batch fails before the first step (an unknown session, say), the output is `{"Steps": [], "Error": "<message>"}`, so `jq '.Steps[]'` keeps working.
+
+Use `--steps file:///dev/stdin` to read the steps from stdin (a heredoc, say), and `--output-file <path>` to write the output to a file instead of stdout.
 
 Important: daemon-routed `take_snapshot` result `uid` values use the form `u:<session>:<epoch>:<raw-uid>`. Pass those tokens back to later `click`/`fill` calls in the same session. Tokens from another session or an older snapshot are rejected before the request reaches MCP.
 
-`daemon start` starts one background broker for the profile. Daemon metadata lives under `~/.cache/chrome-devtools/daemons`. `daemon stop` asks the broker to stop and cleans up its socket/pid files.
+`daemon start-daemon` starts one background broker for the profile. Daemon metadata lives under `~/.cache/chrome-devtools/daemons`. `daemon stop-daemon` asks the broker to stop and cleans up its socket/pid files.
 
-`mcp direct-call` and `mcp direct-list` bypass the daemon and run `chrome-devtools-mcp` directly (while the profile daemon runs it holds the profile lock, so `direct-list` lists the tools through the daemon instead). Use them only for fallback/manual debugging; they cannot preserve snapshot state across independent process invocations.
+`mcp forward-direct-requests` and `mcp list-direct-tools` bypass the daemon and run `chrome-devtools-mcp` directly (while the profile daemon runs it holds the profile lock, so `list-direct-tools` lists the tools through the daemon instead). Use them only for fallback/manual debugging; they cannot preserve snapshot state across independent process invocations.
 
 See [`docs/session-daemon-design.md`](docs/session-daemon-design.md) for the per-profile daemon/broker design and future session ownership direction.
-
-`mcp help` prints MCP-specific usage, examples, and notes about stdio JSON-RPC forwarding.
 
 ## Development
 

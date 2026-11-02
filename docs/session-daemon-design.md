@@ -31,11 +31,11 @@ The daemon owns:
 
 ## Implemented behavior
 
-1. Start one daemon per profile with `chrome-devtools daemon start --profile <name>`.
+1. Start one daemon per profile with `chrome-devtools daemon start-daemon --profile <name>`.
 2. Keep one `chrome-devtools-mcp` process alive inside the daemon.
-3. Route `chrome-devtools mcp call --profile <name> --session <id>`, `mcp batch --profile <name> --session <id> --script <path>`, and `mcp list --profile <name>` through the daemon by default.
+3. Route `chrome-devtools mcp forward-requests --profile <name> --session-id <id>`, `mcp run-batch --profile <name> --session-id <id> --steps <steps>`, and `mcp list-tools --profile <name>` through the daemon by default.
 4. Route page-scoped tools through session-owned pages so `take_snapshot -> click` stays on the session page.
-5. Keep `mcp direct-call` and `mcp direct-list` as fallbacks for simple/manual debugging.
+5. Keep `mcp forward-direct-requests` and `mcp list-direct-tools` as fallbacks for simple/manual debugging.
 
 The daemon uses a Unix domain socket under `~/.cache/chrome-devtools/daemons/<profile>.sock` and a pid file next to it. The profile-level lock under `~/.cache/chrome-devtools/locks` is held for the daemon lifetime, so direct fallback MCP commands do not run concurrently with the profile daemon.
 
@@ -44,12 +44,12 @@ The daemon uses a Unix domain socket under `~/.cache/chrome-devtools/daemons/<pr
 Sessions are minted, listed, and dropped over the daemon control protocol:
 
 ```text
-chrome-devtools session create --profile <name>
-chrome-devtools session list   --profile <name>
-chrome-devtools session close  --profile <name> --session <id>
+chrome-devtools session create-session --profile <name>
+chrome-devtools session list-sessions --profile <name>
+chrome-devtools session close-session --profile <name> --session-id <id>
 ```
 
-`mcp call` and `mcp batch` require `--session <id>`. The CLI sends `__chrome_devtools_daemon__:bind session=<id>` as the first line on its daemon connection. The daemon validates the session, waits for the profile bind slot, marks the session owned for the lifetime of that connection, and returns `bound=<id>` after the bind is active. JSON-RPC tool calls on a bound connection refresh the session's `last_used_at` timestamp; on disconnect, the daemon releases ownership and updates `last_used_at` one more time.
+`mcp forward-requests` and `mcp run-batch` require `--session-id <id>`. The CLI sends `__chrome_devtools_daemon__:bind session=<id>` as the first line on its daemon connection. The daemon validates the session, waits for the profile bind slot, marks the session owned for the lifetime of that connection, and returns `bound=<id>` after the bind is active. JSON-RPC tool calls on a bound connection refresh the session's `last_used_at` timestamp; on disconnect, the daemon releases ownership and updates `last_used_at` one more time.
 
 A session records:
 

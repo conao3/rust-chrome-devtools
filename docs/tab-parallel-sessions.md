@@ -36,7 +36,7 @@ Agent B session=sess-b -> daemon router -> MCP tools/call pageId=2 -> Chrome tab
 Agent C session=sess-c -> daemon router -> MCP tools/call pageId=3 -> Chrome tab 3
 ```
 
-The daemon owns the mapping from session id to page id. Clients keep using `chrome-devtools mcp call --session <id>` and `mcp batch --session <id>`; the daemon injects `pageId` internally.
+The daemon owns the mapping from session id to page id. Clients keep using `chrome-devtools mcp forward-requests --session-id <id>` and `mcp run-batch --session-id <id>`; the daemon injects `pageId` internally.
 
 The router becomes the session adapter:
 
@@ -153,8 +153,8 @@ A session-owned page is idle-managed with the session.
 
 - When the session expires, pages created by the daemon are closed when Chrome has another tab.
 - Pages attached from an existing tab stay open when the session expires.
-- `session close` closes daemon-created pages when they are idle.
-- `daemon stop` keeps Chrome ownership behavior unchanged: stopping the daemon ends in-memory sessions and leaves Chrome cleanup to existing profile/daemon commands.
+- `session close-session` closes daemon-created pages when they are idle.
+- `daemon stop-daemon` keeps Chrome ownership behavior unchanged: stopping the daemon ends in-memory sessions and leaves Chrome cleanup to existing profile/daemon commands.
 
 The page close policy should preserve the last browser tab rule used by MCP's `close_page`: the last open page remains open.
 
@@ -202,7 +202,7 @@ Acceptance checks:
 
 - A daemon-created page is closed when its session expires.
 - An attached page stays open when its session expires.
-- `daemon status` reports active sessions, page ids, and queued MCP requests.
+- `daemon get-daemon-status` reports active sessions, page ids, and queued MCP requests.
 
 ## Open questions
 

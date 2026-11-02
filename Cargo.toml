@@ -12,5 +12,8 @@ path = "src/main.rs"
 
 [dependencies]
 base64 = "0.23"
+clap = { version = "4", features = ["derive"] }
+jmespath = "0.5.0"
 serde = "1"
-serde_json = { version = "1", features = ["unbounded_depth"] }
+serde_json = { version = "1", features = ["preserve_order", "unbounded_depth"] }
+unicode-width = "0.2.3"

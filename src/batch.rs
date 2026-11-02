@@ -1,73 +1,122 @@
 use crate::config::*;
 use crate::daemon::*;
+use crate::error::{Result, parameter, target};
 use crate::router::*;
-use std::fs;
+use serde_json::Value;
 use std::io::BufReader;
-use std::io::Read;
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 use std::thread;
 use std::time::Duration;
 
 pub(crate) struct BatchOptions {
-    pub(crate) profile_name: String,
+    pub(crate) profile: Profile,
     pub(crate) session_id: String,
-    pub(crate) script_path: String,
-    pub(crate) output_path: Option<String>,
+    pub(crate) steps: Vec<Value>,
     pub(crate) fail_fast: bool,
 }
 
-pub(crate) const STEP_SHAPE_HINT: &str = r#"one of the step types "tool" or "sleep_ms": {"type":"tool","name":"<mcp-tool>","args":{...}} or {"type":"sleep_ms","ms":<u64>}"#;
+pub(crate) struct BatchRun {
+    pub(crate) results: Vec<Value>,
+    pub(crate) stopped_on_error: Option<String>,
+}
+
+pub(crate) const STEP_SHAPE_HINT: &str = r#"one of the step types "tool" or "sleep_ms": {"Type":"tool","Name":"<mcp-tool>","Args":{...}} or {"Type":"sleep_ms","Ms":<u64>} (shorthand: Type=tool,Name=<mcp-tool>,Args={...} or Type=sleep_ms,Ms=<u64>)"#;
 
 const SLEEP_LIKE_TOOL_NAMES: [&str; 3] = ["sleep_ms", "sleep", "wait"];
 
-pub(crate) enum BatchOutcome {
-    Completed,
-    StoppedOnError(String),
-}
-
-pub(crate) fn run_batch(config: &Config, args: &[String]) -> Result<(), String> {
-    let options = parse_batch_args(args)?;
-    match execute_batch(config, &options) {
-        Ok(BatchOutcome::Completed) => Ok(()),
-        Ok(BatchOutcome::StoppedOnError(label)) => {
-            Err(format!("scenario stopped on error at step: {label}"))
-        }
-        Err(error) => {
-            let results = serde_json::json!([{ "type": "error", "error": error }]);
-            let output =
-                serde_json::to_string_pretty(&results).unwrap_or_else(|_| "[]".to_string());
-            let _ = write_batch_output(&options.output_path, &output);
-            Err(error)
+/// Each value is a JSON array of steps, one JSON step object, or one step in shorthand syntax.
+pub(crate) fn parse_steps(values: &[String]) -> Result<Vec<Value>> {
+    let mut steps = Vec::new();
+    for value in values {
+        let trimmed = value.trim();
+        if trimmed.starts_with('[') || trimmed.starts_with('{') {
+            let parsed: Value = serde_json::from_str(trimmed)
+                .map_err(|error| parameter(format!("--steps is not valid JSON: {error}")))?;
+            match parsed {
+                Value::Array(items) => steps.extend(items),
+                object => steps.push(object),
+            }
+        } else {
+            steps.push(parse_shorthand_step(trimmed)?);
         }
     }
-}
-
-pub(crate) fn write_batch_output(output_path: &Option<String>, output: &str) -> Result<(), String> {
-    if let Some(path) = output_path {
-        fs::write(path, output).map_err(|error| format!("failed to write {path}: {error}"))
-    } else {
-        println!("{output}");
-        Ok(())
+    if steps.is_empty() {
+        return Err(parameter("--steps needs at least one step"));
     }
+    validate_steps(&steps)?;
+    Ok(steps)
 }
 
-pub(crate) fn execute_batch(
-    config: &Config,
-    options: &BatchOptions,
-) -> Result<BatchOutcome, String> {
-    let profile = find_profile(config, &options.profile_name)?;
-    let script_content = read_script_source(&options.script_path)?;
-    let steps_value: serde_json::Value = serde_json::from_str(&script_content)
-        .map_err(|error| format!("failed to parse {}: {error}", options.script_path))?;
-    let steps = steps_value
-        .as_array()
-        .ok_or_else(|| "script must be a JSON array of steps".to_string())?;
+fn split_top_level(input: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for ch in input.chars() {
+        if in_string {
+            current.push(ch);
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => {
+                in_string = true;
+                current.push(ch);
+            }
+            '{' | '[' => {
+                depth += 1;
+                current.push(ch);
+            }
+            '}' | ']' => {
+                depth = depth.saturating_sub(1);
+                current.push(ch);
+            }
+            ',' if depth == 0 => parts.push(std::mem::take(&mut current)),
+            _ => current.push(ch),
+        }
+    }
+    parts.push(current);
+    parts
+}
 
-    validate_steps(steps)?;
+pub(crate) fn parse_shorthand_step(input: &str) -> Result<Value> {
+    let mut step = serde_json::Map::new();
+    for part in split_top_level(input) {
+        let Some((key, raw)) = part.split_once('=') else {
+            return Err(parameter(format!(
+                "--steps shorthand expects Key=Value pairs separated by commas, got: {part}"
+            )));
+        };
+        let raw = raw.trim();
+        let value = if raw.starts_with('{') || raw.starts_with('[') {
+            serde_json::from_str(raw)
+                .map_err(|error| parameter(format!("--steps: {key} is not valid JSON: {error}")))?
+        } else if key == "Ms" {
+            Value::from(raw.parse::<u64>().map_err(|_| {
+                parameter(format!(
+                    "--steps: Ms must be a non-negative integer, got {raw}"
+                ))
+            })?)
+        } else {
+            Value::String(raw.to_string())
+        };
+        step.insert(key.trim().to_string(), value);
+    }
+    Ok(Value::Object(step))
+}
 
-    ensure_daemon(&profile)?;
-    let socket_path = daemon_socket_path(&profile)?;
+pub(crate) fn execute_batch(options: &BatchOptions) -> Result<BatchRun> {
+    let profile = &options.profile;
+    ensure_daemon(profile)?;
+    let socket_path = daemon_socket_path(profile)?;
     let mut stream = UnixStream::connect(&socket_path)
         .map_err(|error| format!("failed to connect {}: {error}", socket_path.display()))?;
     let mut read_stream = stream
@@ -75,7 +124,7 @@ pub(crate) fn execute_batch(
         .map_err(|error| format!("failed to clone daemon stream: {error}"))?;
     let mut reader = BufReader::new(&mut read_stream);
 
-    bind_session(&mut stream, &mut reader, &options.session_id, &profile.name)?;
+    bind_session(&mut stream, &mut reader, &options.session_id, &profile.name).map_err(target)?;
 
     write_json_line(
         &mut stream,
@@ -87,53 +136,34 @@ pub(crate) fn execute_batch(
     )?;
     read_response(&mut reader, &mut stream, 1)?;
 
-    let mut results: Vec<serde_json::Value> = Vec::new();
+    let mut results: Vec<Value> = Vec::new();
     let mut next_id: u64 = 2;
     let mut stopped_on_error: Option<String> = None;
 
-    for step in steps {
-        let step_type = step
-            .get("type")
-            .and_then(|value| value.as_str())
-            .ok_or_else(|| format!("step missing 'type': expected {STEP_SHAPE_HINT}"))?;
-        let label = step.get("label").cloned();
-        let on_error = step
-            .get("on_error")
-            .and_then(|value| value.as_str())
-            .map(|value| value.to_string())
-            .unwrap_or_else(|| {
-                if options.fail_fast {
-                    "stop".to_string()
-                } else {
-                    "continue".to_string()
-                }
-            });
+    for step in &options.steps {
+        let step_type = step.get("Type").and_then(Value::as_str).unwrap_or_default();
+        let label = step.get("Label").cloned().unwrap_or(Value::Null);
+        let stop_on_error = match step.get("OnError").and_then(Value::as_str) {
+            Some(value) => value == "stop",
+            None => options.fail_fast,
+        };
         match step_type {
             "sleep_ms" => {
-                let ms = step
-                    .get("ms")
-                    .and_then(|value| value.as_u64())
-                    .ok_or_else(|| "sleep_ms requires 'ms' (non-negative integer)".to_string())?;
+                let ms = step.get("Ms").and_then(Value::as_u64).unwrap_or_default();
                 thread::sleep(Duration::from_millis(ms));
                 results.push(serde_json::json!({
-                    "type": "sleep_ms",
-                    "label": label,
-                    "ms": ms,
+                    "Type": "sleep_ms",
+                    "Label": label,
+                    "Ms": ms,
                 }));
             }
-            "tool" => {
-                let name = step
-                    .get("name")
-                    .and_then(|value| value.as_str())
-                    .ok_or_else(|| {
-                        "tool step requires 'name' (the MCP tool name, e.g. take_snapshot)"
-                            .to_string()
-                    })?;
+            _ => {
+                let name = step.get("Name").and_then(Value::as_str).unwrap_or_default();
                 let raw_arguments = step
-                    .get("args")
+                    .get("Args")
                     .cloned()
                     .unwrap_or_else(|| serde_json::json!({}));
-                let arguments = resolve_refs(raw_arguments, &results)?;
+                let arguments = resolve_refs(raw_arguments, &results).map_err(parameter)?;
                 let id = next_id;
                 next_id += 1;
                 let request = serde_json::json!({
@@ -147,13 +177,13 @@ pub(crate) fn execute_batch(
                 });
                 write_json_line(&mut stream, &request.to_string())?;
                 let response_line = read_response(&mut reader, &mut stream, id)?;
-                let response_value: serde_json::Value =
-                    serde_json::from_str(&response_line).unwrap_or(serde_json::Value::Null);
+                let response_value: Value =
+                    serde_json::from_str(&response_line).unwrap_or(Value::Null);
                 let result_value = response_value.get("result").cloned();
                 let error_value = response_value.get("error").cloned();
                 let is_error_result = matches!(
                     result_value.as_ref().and_then(|value| value.get("isError")),
-                    Some(serde_json::Value::Bool(true))
+                    Some(Value::Bool(true))
                 );
                 let navigated = (is_error_result || error_value.is_some())
                     && is_navigation_context_loss(result_value.as_ref(), error_value.as_ref());
@@ -161,87 +191,93 @@ pub(crate) fn execute_batch(
                     && (error_value.as_ref().is_some_and(|value| !value.is_null())
                         || is_error_result);
                 let mut entry = serde_json::json!({
-                    "type": "tool",
-                    "name": name,
-                    "label": label,
-                    "result": result_value,
-                    "error": error_value,
+                    "Type": "tool",
+                    "Name": name,
+                    "Label": label,
+                    "Result": result_value,
+                    "Error": error_value,
                 });
                 if navigated {
-                    entry["navigated"] = serde_json::json!(true);
-                    entry["error"] = serde_json::Value::Null;
-                    if let Some(result) = entry["result"].as_object_mut() {
+                    entry["Navigated"] = serde_json::json!(true);
+                    entry["Error"] = Value::Null;
+                    if let Some(result) = entry["Result"].as_object_mut() {
                         result.insert("isError".to_string(), serde_json::json!(false));
                     }
                 }
                 results.push(entry);
-                if has_error && on_error == "stop" {
+                if has_error && stop_on_error {
                     stopped_on_error = Some(
                         label
-                            .as_ref()
-                            .and_then(|value| value.as_str())
-                            .map(|value| value.to_string())
+                            .as_str()
+                            .map(str::to_string)
                             .unwrap_or_else(|| name.to_string()),
                     );
                     break;
                 }
-            }
-            other => {
-                return Err(format!(
-                    "unknown step type: {other}: expected {STEP_SHAPE_HINT}"
-                ));
             }
         }
     }
 
     let _ = stream.shutdown(Shutdown::Write);
 
-    let output = serde_json::to_string_pretty(&serde_json::Value::Array(results))
-        .map_err(|error| format!("failed to serialize results: {error}"))?;
-    write_batch_output(&options.output_path, &output)?;
-
-    match stopped_on_error {
-        Some(label) => Ok(BatchOutcome::StoppedOnError(label)),
-        None => Ok(BatchOutcome::Completed),
-    }
+    Ok(BatchRun {
+        results,
+        stopped_on_error,
+    })
 }
 
-fn validate_steps(steps: &[serde_json::Value]) -> Result<(), String> {
+pub(crate) fn validate_steps(steps: &[Value]) -> Result<()> {
     for (index, step) in steps.iter().enumerate() {
         let position = index + 1;
-        let Some(step_type) = step.get("type").and_then(|value| value.as_str()) else {
-            let keys = step
-                .as_object()
-                .map(|object| object.keys().cloned().collect::<Vec<_>>().join(", "))
-                .unwrap_or_else(|| "not an object".to_string());
-            return Err(format!(
-                "step {position} missing 'type' (found: {keys}): expected {STEP_SHAPE_HINT}"
-            ));
+        let Some(object) = step.as_object() else {
+            return Err(parameter(format!(
+                "step {position} is not an object: expected {STEP_SHAPE_HINT}"
+            )));
         };
+        let allowed = ["Type", "Name", "Args", "Label", "OnError", "Ms"];
+        if let Some(unknown) = object.keys().find(|key| !allowed.contains(&key.as_str())) {
+            return Err(parameter(format!(
+                "step {position} has unknown key '{unknown}' (keys: {}): expected {STEP_SHAPE_HINT}",
+                allowed.join(", ")
+            )));
+        }
+        let Some(step_type) = step.get("Type").and_then(Value::as_str) else {
+            let keys = object.keys().cloned().collect::<Vec<_>>().join(", ");
+            return Err(parameter(format!(
+                "step {position} missing 'Type' (found: {keys}): expected {STEP_SHAPE_HINT}"
+            )));
+        };
+        if let Some(on_error) = step.get("OnError") {
+            if !matches!(on_error.as_str(), Some("continue" | "stop")) {
+                return Err(parameter(format!(
+                    "step {position}: OnError must be continue or stop"
+                )));
+            }
+        }
         match step_type {
             "sleep_ms" => {
-                if step.get("ms").and_then(|value| value.as_u64()).is_none() {
-                    return Err(format!(
-                        "step {position}: sleep_ms requires 'ms' (non-negative integer)"
-                    ));
+                if step.get("Ms").and_then(Value::as_u64).is_none() {
+                    return Err(parameter(format!(
+                        "step {position}: sleep_ms requires 'Ms' (non-negative integer)"
+                    )));
                 }
             }
             "tool" => {
-                let Some(name) = step.get("name").and_then(|value| value.as_str()) else {
-                    return Err(format!(
-                        "step {position}: tool step requires 'name' (the MCP tool name, e.g. take_snapshot)"
-                    ));
+                let Some(name) = step.get("Name").and_then(Value::as_str) else {
+                    return Err(parameter(format!(
+                        "step {position}: tool step requires 'Name' (the MCP tool name, e.g. take_snapshot)"
+                    )));
                 };
                 if SLEEP_LIKE_TOOL_NAMES.contains(&name) {
-                    return Err(format!(
-                        "step {position}: '{name}' is a step type, not a tool. Use {{\"type\":\"sleep_ms\",\"ms\":<u64>}} to pause, or the daemon-native wait_for_js / goto to wait for a page condition. Step types: tool, sleep_ms"
-                    ));
+                    return Err(parameter(format!(
+                        "step {position}: '{name}' is a step type, not a tool. Use {{\"Type\":\"sleep_ms\",\"Ms\":<u64>}} to pause, or the daemon-native wait_for_js / goto to wait for a page condition. Step types: tool, sleep_ms"
+                    )));
                 }
             }
             other => {
-                return Err(format!(
+                return Err(parameter(format!(
                     "step {position}: unknown step type: {other}: expected {STEP_SHAPE_HINT}"
-                ));
+                )));
             }
         }
     }
@@ -270,79 +306,11 @@ fn is_navigation_context_loss(
     in_result || in_error
 }
 
-pub(crate) fn read_script_source(path: &str) -> Result<String, String> {
-    if path == "-" {
-        let mut content = String::new();
-        std::io::stdin()
-            .read_to_string(&mut content)
-            .map_err(|error| format!("failed to read script from stdin: {error}"))?;
-        Ok(content)
-    } else {
-        fs::read_to_string(path).map_err(|error| format!("failed to read {path}: {error}"))
-    }
-}
-
-pub(crate) fn parse_batch_args(args: &[String]) -> Result<BatchOptions, String> {
-    let mut profile_name = None;
-    let mut session_id = None;
-    let mut script_path = None;
-    let mut output_path = None;
-    let mut fail_fast = false;
-    let mut index = 0;
-    while index < args.len() {
-        match args[index].as_str() {
-            "--profile" => {
-                let Some(value) = args.get(index + 1) else {
-                    return Err("--profile requires a value".to_string());
-                };
-                profile_name = Some(value.clone());
-                index += 2;
-            }
-            "--session" => {
-                let Some(value) = args.get(index + 1) else {
-                    return Err("--session requires a value".to_string());
-                };
-                session_id = Some(value.clone());
-                index += 2;
-            }
-            "--script" => {
-                let Some(value) = args.get(index + 1) else {
-                    return Err("--script requires a value".to_string());
-                };
-                script_path = Some(value.clone());
-                index += 2;
-            }
-            "--output" => {
-                let Some(value) = args.get(index + 1) else {
-                    return Err("--output requires a value".to_string());
-                };
-                output_path = Some(value.clone());
-                index += 2;
-            }
-            "--fail-fast" => {
-                fail_fast = true;
-                index += 1;
-            }
-            unknown => return Err(format!("unknown argument: {unknown}")),
-        }
-    }
-    let profile_name = profile_name.ok_or_else(|| "--profile is required".to_string())?;
-    let session_id = session_id.ok_or_else(|| "--session is required".to_string())?;
-    let script_path = script_path.ok_or_else(|| "--script is required".to_string())?;
-    Ok(BatchOptions {
-        profile_name,
-        session_id,
-        script_path,
-        output_path,
-        fail_fast,
-    })
-}
-
 /// `path` segments are dot-separated; numeric segments index into arrays.
 pub(crate) fn resolve_refs(
     value: serde_json::Value,
     results: &[serde_json::Value],
-) -> Result<serde_json::Value, String> {
+) -> std::result::Result<serde_json::Value, String> {
     match value {
         serde_json::Value::Object(map) if map.len() == 1 && map.contains_key("$ref") => {
             let path = map
@@ -376,7 +344,7 @@ pub(crate) fn resolve_path(path: &str, results: &[serde_json::Value]) -> serde_j
     };
     let Some(entry) = results
         .iter()
-        .find(|entry| entry.get("label").and_then(|value| value.as_str()) == Some(label))
+        .find(|entry| entry.get("Label").and_then(|value| value.as_str()) == Some(label))
     else {
         return serde_json::Value::Null;
     };

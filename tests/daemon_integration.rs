@@ -227,7 +227,7 @@ impl TestEnv {
         let stderr = fs::File::create(&stderr_path).unwrap();
         let child = self
             .cli()
-            .args(["daemon", "run", "--profile", "default"])
+            .args(["daemon", "run-daemon", "--profile", "default"])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::from(stderr))
@@ -273,48 +273,92 @@ impl TestEnv {
         (output.status.success(), combined)
     }
 
-    fn wait_status_field_at_least(&self, prefix: &str, expected: u128) -> String {
+    fn run_json(&self, args: &[&str]) -> (bool, serde_json::Value, String) {
+        let output = self.cli().args(args).output().unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let combined = format!("{stdout}{}", String::from_utf8_lossy(&output.stderr));
+        let value = serde_json::from_str(&stdout).unwrap_or(serde_json::Value::Null);
+        (output.status.success(), value, combined)
+    }
+
+    fn daemon_status(&self) -> serde_json::Value {
+        let (ok, value, output) =
+            self.run_json(&["daemon", "get-daemon-status", "--profile", "default"]);
+        assert!(ok, "status failed: {output}");
+        value
+    }
+
+    fn session_ids(&self) -> Vec<String> {
+        let (ok, value, output) =
+            self.run_json(&["session", "list-sessions", "--profile", "default"]);
+        assert!(ok, "session list-sessions failed: {output}");
+        value["Sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|session| session["SessionId"].as_str().map(str::to_string))
+            .collect()
+    }
+
+    fn wait_status_field_at_least(&self, key: &str, expected: u64) -> serde_json::Value {
         let started = Instant::now();
         loop {
-            let (ok, output) = self.run_cli(&["daemon", "status", "--profile", "default"]);
-            assert!(ok, "status failed: {output}");
-            if status_field(&output, prefix)
-                .and_then(|value| value.parse::<u128>().ok())
-                .map(|value| value >= expected)
-                == Some(true)
-            {
-                return output;
+            let status = self.daemon_status();
+            if status[key].as_u64().is_some_and(|value| value >= expected) {
+                return status;
             }
             if started.elapsed() >= Duration::from_secs(5) {
-                panic!("{prefix} did not reach {expected}: {output}");
+                panic!("{key} did not reach {expected}: {status}");
             }
             thread::sleep(Duration::from_millis(50));
         }
     }
 
-    fn wait_session_contains(&self, session: &str, expected: &str) -> String {
+    fn wait_session(
+        &self,
+        session: &str,
+        check: impl Fn(&serde_json::Value) -> bool,
+    ) -> serde_json::Value {
         let started = Instant::now();
         loop {
-            let (ok, output) = self.run_cli(&["session", "list", "--profile", "default"]);
-            assert!(ok, "session list failed: {output}");
-            if output.contains(session) && output.contains(expected) {
-                return output;
+            let (ok, value, output) =
+                self.run_json(&["session", "list-sessions", "--profile", "default"]);
+            assert!(ok, "session list-sessions failed: {output}");
+            if let Some(state) = value["Sessions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|state| state["SessionId"] == session && check(state))
+            {
+                return state.clone();
             }
             if started.elapsed() >= Duration::from_secs(5) {
-                panic!("session {session} did not contain {expected}: {output}");
+                panic!("session {session} did not reach the expected state: {value}");
             }
             thread::sleep(Duration::from_millis(50));
         }
     }
 
     fn create_session(&self) -> String {
-        let (ok, output) = self.run_cli(&["session", "create", "--profile", "default"]);
-        assert!(ok, "session create failed: {output}");
-        output
-            .split_whitespace()
-            .find_map(|part| part.strip_prefix("session="))
+        let (ok, value, output) =
+            self.run_json(&["session", "create-session", "--profile", "default"]);
+        assert!(ok, "session create-session failed: {output}");
+        value["SessionId"]
+            .as_str()
             .expect("session id in output")
             .to_string()
+    }
+
+    fn close_session(&self, session: &str) {
+        let (ok, output) = self.run_cli(&[
+            "session",
+            "close-session",
+            "--profile",
+            "default",
+            "--session-id",
+            session,
+        ]);
+        assert!(ok, "session close-session failed: {output}");
     }
 }
 
@@ -714,12 +758,6 @@ fn page_ids(response: &serde_json::Value) -> Vec<u64> {
         .collect()
 }
 
-fn status_field<'a>(output: &'a str, prefix: &str) -> Option<&'a str> {
-    output
-        .split_whitespace()
-        .find_map(|field| field.strip_prefix(prefix))
-}
-
 #[test]
 fn smoke_session_create_and_batch() {
     let mut env = TestEnv::new("smoke");
@@ -729,18 +767,19 @@ fn smoke_session_create_and_batch() {
     let script = env.home.join("batch.json");
     fs::write(
         &script,
-        r#"[{"type":"tool","name":"take_snapshot","args":{}}]"#,
+        r#"[{"Type":"tool","Name":"take_snapshot","Args":{}}]"#,
     )
     .unwrap();
+    let steps = format!("file://{}", script.display());
     let (ok, output) = env.run_cli(&[
         "mcp",
-        "batch",
+        "run-batch",
         "--profile",
         "default",
-        "--session",
+        "--session-id",
         &session,
-        "--script",
-        script.to_str().unwrap(),
+        "--steps",
+        &steps,
     ]);
     assert!(ok, "batch failed: {output}");
     assert!(output.contains("snapshot page="), "batch output: {output}");
@@ -753,29 +792,30 @@ fn batch_failure_emits_json_error_on_stdout() {
     let script = env.home.join("batch.json");
     fs::write(
         &script,
-        r#"[{"type":"tool","name":"take_snapshot","args":{}}]"#,
+        r#"[{"Type":"tool","Name":"take_snapshot","Args":{}}]"#,
     )
     .unwrap();
+    let steps = format!("file://{}", script.display());
     let output = env
         .cli()
         .args([
             "mcp",
-            "batch",
+            "run-batch",
             "--profile",
             "default",
-            "--session",
+            "--session-id",
             "sess-bogus",
-            "--script",
-            script.to_str().unwrap(),
+            "--steps",
+            &steps,
         ])
         .output()
         .unwrap();
-    assert!(!output.status.success());
+    assert_eq!(output.status.code(), Some(254));
     let stdout = String::from_utf8_lossy(&output.stdout);
     let parsed: serde_json::Value = serde_json::from_str(&stdout).expect("stdout is JSON");
-    assert_eq!(parsed[0]["type"], "error");
+    assert_eq!(parsed["Steps"], serde_json::json!([]));
     assert!(
-        parsed[0]["error"]
+        parsed["Error"]
             .as_str()
             .unwrap()
             .contains("unknown session")
@@ -788,17 +828,24 @@ fn write_script(env: &TestEnv, body: &str) -> PathBuf {
     script
 }
 
-fn batch_args<'a>(session: &'a str, script: &'a Path) -> Vec<&'a str> {
-    vec![
+fn batch_args(session: &str, script: &Path) -> Vec<String> {
+    [
         "mcp",
-        "batch",
+        "run-batch",
         "--profile",
         "default",
-        "--session",
+        "--session-id",
         session,
-        "--script",
-        script.to_str().unwrap(),
+        "--steps",
+        &format!("file://{}", script.display()),
     ]
+    .iter()
+    .map(|arg| arg.to_string())
+    .collect()
+}
+
+fn arg_refs(args: &[String]) -> Vec<&str> {
+    args.iter().map(String::as_str).collect()
 }
 
 #[test]
@@ -808,24 +855,24 @@ fn batch_treats_a_navigation_context_loss_as_navigated() {
     let session = env.create_session();
     let script = write_script(
         &env,
-        r#"[{"type":"tool","name":"navigating_click","label":"nav"},{"type":"tool","name":"take_snapshot","label":"after"}]"#,
+        r#"[{"Type":"tool","Name":"navigating_click","Label":"nav"},{"Type":"tool","Name":"take_snapshot","Label":"after"}]"#,
     );
     let mut args = batch_args(&session, &script);
-    args.push("--fail-fast");
-    let (ok, output) = env.run_cli(&args);
+    args.push("--fail-fast".to_string());
+    let (ok, value, output) = env.run_json(&arg_refs(&args));
     assert!(ok, "batch failed: {output}");
-    let results: serde_json::Value = serde_json::from_str(&output).unwrap();
-    assert_eq!(results[0]["navigated"], serde_json::json!(true));
-    assert_eq!(results[0]["error"], serde_json::Value::Null);
-    assert_eq!(results[0]["result"]["isError"], serde_json::json!(false));
+    let results = &value["Steps"];
+    assert_eq!(results[0]["Navigated"], serde_json::json!(true));
+    assert_eq!(results[0]["Error"], serde_json::Value::Null);
+    assert_eq!(results[0]["Result"]["isError"], serde_json::json!(false));
     assert!(
-        results[1]["result"]["content"][0]["text"]
+        results[1]["Result"]["content"][0]["text"]
             .as_str()
             .unwrap()
             .contains("snapshot page="),
         "output: {output}"
     );
-    assert!(results[1].get("navigated").is_none());
+    assert!(results[1].get("Navigated").is_none());
 }
 
 #[test]
@@ -834,17 +881,15 @@ fn batch_rejects_a_sleep_tool_step_before_running_anything() {
     env.start_daemon();
     let script = write_script(
         &env,
-        r#"[{"type":"tool","name":"take_snapshot"},{"type":"tool","name":"sleep_ms","args":{"ms":1000}}]"#,
+        r#"[{"Type":"tool","Name":"take_snapshot"},{"Type":"tool","Name":"sleep_ms","Args":{"ms":1000}}]"#,
     );
     let output = env
         .cli()
         .args(batch_args("sess-bogus", &script))
         .output()
         .unwrap();
-    assert!(!output.status.success());
-    let parsed: serde_json::Value =
-        serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).unwrap();
-    let error = parsed[0]["error"].as_str().unwrap();
+    assert_eq!(output.status.code(), Some(252));
+    let error = String::from_utf8_lossy(&output.stderr);
     assert!(
         error.contains("step 2: 'sleep_ms' is a step type, not a tool")
             && error.contains("Step types: tool, sleep_ms"),
@@ -856,11 +901,11 @@ fn batch_rejects_a_sleep_tool_step_before_running_anything() {
 fn batch_reports_the_keys_of_a_step_without_type() {
     let mut env = TestEnv::new("batchkeys");
     env.start_daemon();
-    let script = write_script(&env, r#"[{"tool":"take_snapshot","arguments":{}}]"#);
-    let (ok, output) = env.run_cli(&batch_args("sess-bogus", &script));
+    let script = write_script(&env, r#"[{"Name":"take_snapshot","Args":{}}]"#);
+    let (ok, output) = env.run_cli(&arg_refs(&batch_args("sess-bogus", &script)));
     assert!(!ok);
     assert!(
-        output.contains("step 1 missing 'type' (found: arguments, tool)"),
+        output.contains("step 1 missing 'Type' (found: Name, Args)"),
         "output: {output}"
     );
 }
@@ -874,15 +919,15 @@ fn session_in_use_names_the_holder() {
     let bound = control_roundtrip(&mut holder, &format!("bind session={session} pid=4242"));
     assert_eq!(bound, format!("bound={session}"));
 
-    let script = write_script(&env, r#"[{"type":"tool","name":"take_snapshot"}]"#);
-    let (ok, output) = env.run_cli(&batch_args(&session, &script));
+    let script = write_script(&env, r#"[{"Type":"tool","Name":"take_snapshot"}]"#);
+    let (ok, output) = env.run_cli(&arg_refs(&batch_args(&session, &script)));
     assert!(!ok);
     assert!(
         output.contains(&format!("session in use: {session} (held by pid 4242 for ")),
         "output: {output}"
     );
-    let (_, listed) = env.run_cli(&["session", "list", "--profile", "default"]);
-    assert!(listed.contains("owner_pid=4242"), "list: {listed}");
+    let state = env.wait_session(&session, |_| true);
+    assert_eq!(state["OwnerPid"], 4242, "state: {state}");
 }
 
 #[test]
@@ -924,10 +969,10 @@ fn goto_and_wait_failures_report_the_page_state() {
 fn direct_list_goes_through_the_running_daemon() {
     let mut env = TestEnv::new("directlist");
     env.start_daemon();
-    let (ok, output) = env.run_cli(&["mcp", "direct-list", "--profile", "default"]);
-    assert!(ok, "direct-list failed: {output}");
+    let (ok, output) = env.run_cli(&["mcp", "list-direct-tools", "--profile", "default"]);
+    assert!(ok, "list-direct-tools failed: {output}");
     assert!(
-        output.contains("holds the profile lock") && output.contains("\"tools\""),
+        output.contains("holds the profile lock") && output.contains("\"Tools\""),
         "output: {output}"
     );
 }
@@ -959,11 +1004,10 @@ fn client_disconnect_does_not_kill_daemon() {
         "daemon died after client disconnect: {status}"
     );
 
-    let (ok, output) = env.run_cli(&["session", "list", "--profile", "default"]);
-    assert!(ok, "session list failed: {output}");
+    let sessions = env.session_ids();
     assert!(
-        output.contains(&session),
-        "session lost after another client's disconnect: {output}"
+        sessions.contains(&session),
+        "session lost after another client's disconnect: {sessions:?}"
     );
 }
 
@@ -986,14 +1030,11 @@ fn client_kill_during_bound_tool_keeps_session() {
         stream.flush().unwrap();
     }
 
-    let output = env.wait_session_contains(&session, "owned=false");
-    assert!(output.contains(&session), "output: {output}");
+    env.wait_session(&session, |state| state["Owned"] == false);
     thread::sleep(Duration::from_secs(2));
-    let (ok, output) = env.run_cli(&["daemon", "status", "--profile", "default"]);
-    assert!(ok, "status failed: {output}");
-    assert!(!output.contains("respawns="), "output: {output}");
-    let output = env.wait_session_contains(&session, "owned=false");
-    assert!(output.contains(&session), "output: {output}");
+    let status = env.daemon_status();
+    assert_eq!(status["Respawns"], 0, "status: {status}");
+    env.wait_session(&session, |state| state["Owned"] == false);
 }
 
 #[test]
@@ -1083,10 +1124,9 @@ fn daemon_starts_mcp_with_page_id_routing_and_hides_page_id_schema() {
     let args = fs::read_to_string(env.home.join("fake-mcp-args")).unwrap();
     assert!(args.contains("--pageIdRouting"), "args: {args}");
 
-    let (ok, output) = env.run_cli(&["mcp", "list", "--profile", "default"]);
-    assert!(ok, "mcp list failed: {output}");
-    let value: serde_json::Value = serde_json::from_str(output.trim()).unwrap();
-    let tools = value["result"]["tools"].as_array().unwrap();
+    let (ok, value, output) = env.run_json(&["mcp", "list-tools", "--profile", "default"]);
+    assert!(ok, "mcp list-tools failed: {output}");
+    let tools = value["Tools"].as_array().unwrap();
     let click = tools.iter().find(|tool| tool["name"] == "click").unwrap();
     let select_page = tools
         .iter()
@@ -1472,13 +1512,13 @@ fn native_tools_run_via_cdp_without_mcp() {
         content_text(&navigated).contains("navigated to https://navigated.test/"),
         "response: {navigated}"
     );
-    let session_state = env.wait_session_contains(&session, "page=2");
+    let session_state = env.wait_session(&session, |state| state["Page"] == 2);
     assert!(
-        session_state.contains("page_created_by_daemon=true"),
+        session_state["PageCreatedByDaemon"] == true,
         "fresh native call did not allocate a session page: {session_state}"
     );
     assert!(
-        session_state.contains("page_url=https://navigated.test/"),
+        session_state["PageUrl"] == "https://navigated.test/",
         "native navigation URL was not recorded: {session_state}"
     );
 
@@ -2200,15 +2240,7 @@ fn session_close_closes_daemon_created_page() {
     ));
     drop(stream);
 
-    let (ok, output) = env.run_cli(&[
-        "session",
-        "close",
-        "--profile",
-        "default",
-        "--session",
-        &session,
-    ]);
-    assert!(ok, "session close failed: {output}");
+    env.close_session(&session);
 
     let probe = env.create_session();
     let mut probe_stream = env.connect();
@@ -2229,15 +2261,7 @@ fn session_close_keeps_attached_page() {
     );
     assert_eq!(attached, format!("session={session} page=1"));
 
-    let (ok, output) = env.run_cli(&[
-        "session",
-        "close",
-        "--profile",
-        "default",
-        "--session",
-        &session,
-    ]);
-    assert!(ok, "session close failed: {output}");
+    env.close_session(&session);
 
     let probe = env.create_session();
     let mut probe_stream = env.connect();
@@ -2263,14 +2287,13 @@ fn session_expiry_closes_daemon_created_page() {
 
     let started = Instant::now();
     loop {
-        let (ok, output) = env.run_cli(&["session", "list", "--profile", "default"]);
-        assert!(ok, "session list failed: {output}");
-        if !output.contains(&session) {
+        let sessions = env.session_ids();
+        if !sessions.contains(&session) {
             break;
         }
         assert!(
             started.elapsed() < Duration::from_secs(5),
-            "session did not expire: {output}"
+            "session did not expire: {sessions:?}"
         );
         thread::sleep(Duration::from_millis(100));
     }
@@ -2292,15 +2315,7 @@ fn last_tab_is_kept_when_daemon_created_page_is_closed() {
     tool_call(&mut stream, 130, "take_snapshot", serde_json::json!({}));
     drop(stream);
 
-    let (ok, output) = env.run_cli(&[
-        "session",
-        "close",
-        "--profile",
-        "default",
-        "--session",
-        &session,
-    ]);
-    assert!(ok, "session close failed: {output}");
+    env.close_session(&session);
 
     let probe = env.create_session();
     let mut probe_stream = env.connect();
@@ -2323,26 +2338,17 @@ fn daemon_status_reports_pages_and_queue() {
         serde_json::json!({"url": "https://status.test/"}),
     ));
 
-    let (ok, output) = env.run_cli(&["daemon", "status", "--profile", "default"]);
-    assert!(ok, "status failed: {output}");
-    assert!(output.contains("active_sessions=1"), "output: {output}");
-    assert!(
-        output.contains(&format!("pages={page}")),
-        "output: {output}"
+    let status = env.daemon_status();
+    assert_eq!(status["ActiveSessions"], 1, "status: {status}");
+    assert_eq!(
+        status["Pages"],
+        serde_json::json!([page]),
+        "status: {status}"
     );
-    assert!(output.contains("queued_mcp_requests=0"), "output: {output}");
-    assert!(
-        output.contains("max_control_latency_ms="),
-        "output: {output}"
-    );
-    assert!(
-        output.contains("max_forward_latency_ms="),
-        "output: {output}"
-    );
-    assert!(
-        output.contains("diagnostic_window_secs="),
-        "output: {output}"
-    );
+    assert_eq!(status["QueuedMcpRequests"], 0, "status: {status}");
+    assert!(status["MaxControlLatencyMs"].is_u64(), "status: {status}");
+    assert!(status["MaxForwardLatencyMs"].is_u64(), "status: {status}");
+    assert!(status["DiagnosticWindowSecs"].is_u64(), "status: {status}");
 }
 
 #[test]
@@ -2362,9 +2368,8 @@ fn mcp_request_timeout_keeps_session_when_probe_succeeds() {
         "response: {response}"
     );
 
-    let (ok, output) = env.run_cli(&["session", "list", "--profile", "default"]);
-    assert!(ok, "session list failed: {output}");
-    assert!(output.contains(&session), "output: {output}");
+    let sessions = env.session_ids();
+    assert!(sessions.contains(&session), "sessions: {sessions:?}");
 
     let eval = tool_call(
         &mut stream,
@@ -2374,8 +2379,8 @@ fn mcp_request_timeout_keeps_session_when_probe_succeeds() {
     );
     assert!(content_text(&eval).contains("evaluated page="));
 
-    let output = env.wait_status_field_at_least("max_forward_latency_ms=", 1000);
-    assert!(!output.contains("respawns="), "output: {output}");
+    let status = env.wait_status_field_at_least("MaxForwardLatencyMs", 1000);
+    assert_eq!(status["Respawns"], 0, "status: {status}");
 }
 
 #[test]
@@ -2396,18 +2401,16 @@ fn mcp_request_timeout_respawns_when_probe_fails() {
     );
 
     let started = Instant::now();
-    let output = loop {
-        let (ok, output) = env.run_cli(&["session", "list", "--profile", "default"]);
-        assert!(ok, "session list failed: {output}");
-        if !output.contains(&session) {
-            break output;
+    loop {
+        let sessions = env.session_ids();
+        if !sessions.contains(&session) {
+            break;
         }
         if started.elapsed() > Duration::from_secs(5) {
-            panic!("session stayed alive after respawn: {output}");
+            panic!("session stayed alive after respawn: {sessions:?}");
         }
         thread::sleep(Duration::from_millis(100));
-    };
-    assert!(!output.contains(&session), "output: {output}");
+    }
 
     let next_session = env.create_session();
     let mut next_stream = env.connect();
@@ -2420,9 +2423,8 @@ fn mcp_request_timeout_respawns_when_probe_fails() {
     );
     assert!(content_text(&eval).contains("evaluated page="));
 
-    let (ok, output) = env.run_cli(&["daemon", "status", "--profile", "default"]);
-    assert!(ok, "status failed: {output}");
-    assert!(output.contains("respawns=1"), "output: {output}");
+    let status = env.daemon_status();
+    assert_eq!(status["Respawns"], 1, "status: {status}");
 }
 
 #[test]
@@ -2458,13 +2460,9 @@ fn devtools_port_change_respawns_mcp_and_drops_sessions() {
     );
     assert!(content_text(&eval).contains("evaluated page="));
 
-    let (ok, output) = env.run_cli(&["daemon", "status", "--profile", "default"]);
-    assert!(ok, "status failed: {output}");
-    assert!(
-        output.contains(&format!("port={new_port}")),
-        "output: {output}"
-    );
-    assert!(output.contains("respawns=1"), "output: {output}");
+    let status = env.daemon_status();
+    assert_eq!(status["ChromePort"], new_port, "status: {status}");
+    assert_eq!(status["Respawns"], 1, "status: {status}");
 }
 
 #[test]
@@ -2509,24 +2507,16 @@ fn stop_refused_while_sessions_active() {
     env.start_daemon();
     let session = env.create_session();
 
-    let (ok, output) = env.run_cli(&["daemon", "stop", "--profile", "default"]);
+    let (ok, output) = env.run_cli(&["daemon", "stop-daemon", "--profile", "default"]);
     assert!(!ok, "stop should be refused: {output}");
     assert!(output.contains("active session(s)"), "output: {output}");
 
-    let (ok, output) = env.run_cli(&["profile", "stop", "--profile", "default"]);
+    let (ok, output) = env.run_cli(&["profile", "stop-profile", "--profile", "default"]);
     assert!(!ok, "profile stop should be refused: {output}");
     assert!(output.contains("is running"), "output: {output}");
 
-    let (ok, output) = env.run_cli(&[
-        "session",
-        "close",
-        "--profile",
-        "default",
-        "--session",
-        &session,
-    ]);
-    assert!(ok, "session close failed: {output}");
-    let (ok, output) = env.run_cli(&["daemon", "stop", "--profile", "default"]);
+    env.close_session(&session);
+    let (ok, output) = env.run_cli(&["daemon", "stop-daemon", "--profile", "default"]);
     assert!(ok, "stop after close failed: {output}");
 }
 
@@ -2536,24 +2526,26 @@ fn status_reports_version_sessions_and_health() {
     env.start_daemon();
     env.create_session();
 
-    let (ok, output) = env.run_cli(&["daemon", "status", "--profile", "default"]);
-    assert!(ok, "status failed: {output}");
-    assert!(
-        output.contains(&format!("version={}", env!("CARGO_PKG_VERSION"))),
-        "output: {output}"
+    let status = env.daemon_status();
+    assert_eq!(
+        status["Version"],
+        env!("CARGO_PKG_VERSION"),
+        "status: {status}"
     );
-    assert!(output.contains("sessions=1"), "output: {output}");
-    assert!(output.contains("chrome=ready"), "output: {output}");
+    assert_eq!(status["Sessions"], 1, "status: {status}");
+    assert_eq!(status["Chrome"], "ready", "status: {status}");
 
-    let (ok, output) = env.run_cli(&["daemon", "stop", "--profile", "default", "--force"]);
+    let (ok, output) = env.run_cli(&["daemon", "stop-daemon", "--profile", "default", "--force"]);
     assert!(ok, "forced stop failed: {output}");
     let started = Instant::now();
     while env.socket_path().exists() && started.elapsed() < Duration::from_secs(5) {
         thread::sleep(Duration::from_millis(100));
     }
 
-    let (ok, output) = env.run_cli(&["daemon", "status", "--profile", "default"]);
-    assert!(ok, "status after stop failed: {output}");
-    assert!(output.contains("daemon=stopped"), "output: {output}");
-    assert!(output.contains("exit=ok"), "output: {output}");
+    let status = env.daemon_status();
+    assert_eq!(status["Daemon"], "stopped", "status: {status}");
+    assert!(
+        status["LastEvent"].as_str().unwrap().contains("exit=ok"),
+        "status: {status}"
+    );
 }

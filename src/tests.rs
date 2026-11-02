@@ -602,7 +602,10 @@ fn unknown_session_message_names_why_the_session_is_gone() {
     assert!(message.contains("reaped after 30m"), "{message}");
 
     let message = registry.unknown_session_message(&closed.id);
-    assert!(message.contains("closed by session close"), "{message}");
+    assert!(
+        message.contains("closed by session close-session"),
+        "{message}"
+    );
 
     let message = registry.unknown_session_message(&dropped.id);
     assert!(message.contains("`devtools unreachable`"), "{message}");
@@ -620,11 +623,11 @@ fn unknown_session_message_names_why_the_session_is_gone() {
 #[test]
 fn resolve_refs_substitutes_ref_with_previous_result() {
     let results = vec![serde_json::json!({
-        "label": "snap",
-        "result": {"content": [{"text": "hello"}]}
+        "Label": "snap",
+        "Result": {"content": [{"text": "hello"}]}
     })];
     let template = serde_json::json!({
-        "value": {"$ref": "snap.result.content.0.text"}
+        "value": {"$ref": "snap.Result.content.0.text"}
     });
     let resolved = resolve_refs(template, &results).unwrap();
     assert_eq!(resolved, serde_json::json!({"value": "hello"}));
@@ -645,14 +648,6 @@ fn resolve_refs_passes_through_non_refs() {
     assert_eq!(resolved, template);
 }
 
-#[test]
-fn wants_help_detects_help_flags() {
-    assert!(wants_help(&args(&["--help"])));
-    assert!(wants_help(&args(&["-h"])));
-    assert!(wants_help(&args(&["help"])));
-    assert!(!wants_help(&args(&["--profile", "default"])));
-}
-
 fn dummy_config() -> Config {
     Config {
         profiles: vec![Profile {
@@ -663,61 +658,46 @@ fn dummy_config() -> Config {
 }
 
 #[test]
-fn require_profile_returns_named_profile() {
-    let profile = require_profile(&dummy_config(), &args(&["--profile", "default"])).unwrap();
-    assert_eq!(profile.name, "default");
-}
-
-#[test]
-fn require_profile_rejects_missing_flag_and_unknown_name() {
-    assert!(require_profile(&dummy_config(), &[]).is_err());
-    assert!(require_profile(&dummy_config(), &args(&["--profile", "other"])).is_err());
-}
-
-#[test]
-fn require_profile_and_session_returns_both() {
-    let (profile, session) = require_profile_and_session(
-        &dummy_config(),
-        &args(&["--profile", "default", "--session", "sess-x"]),
-    )
-    .unwrap();
-    assert_eq!(profile.name, "default");
-    assert_eq!(session, "sess-x");
-}
-
-#[test]
-fn require_profile_and_session_rejects_missing_session() {
-    assert!(
-        require_profile_and_session(&dummy_config(), &args(&["--profile", "default"]),).is_err()
-    );
-}
-
-#[test]
-fn parse_batch_args_collects_all_flags() {
-    let options = parse_batch_args(&args(&[
-        "--profile",
-        "default",
-        "--session",
-        "sess-1",
-        "--script",
-        "/tmp/x.json",
-        "--output",
-        "/tmp/out.json",
-        "--fail-fast",
+fn parse_steps_reads_json_arrays_objects_and_shorthand() {
+    let steps = parse_steps(&args(&[
+        r#"[{"Type":"tool","Name":"list_pages"}]"#,
+        r#"{"Type":"sleep_ms","Ms":10}"#,
+        r#"Type=tool,Name=evaluate_script,Label=t,Args={"function":"() => [1, 2]"}"#,
+        "Type=sleep_ms,Ms=5,OnError=stop",
     ]))
     .unwrap();
-    assert_eq!(options.profile_name, "default");
-    assert_eq!(options.session_id, "sess-1");
-    assert_eq!(options.script_path, "/tmp/x.json");
-    assert_eq!(options.output_path.as_deref(), Some("/tmp/out.json"));
-    assert!(options.fail_fast);
+    assert_eq!(steps.len(), 4);
+    assert_eq!(steps[0]["Name"], "list_pages");
+    assert_eq!(steps[1]["Ms"], 10);
+    assert_eq!(steps[2]["Args"]["function"], "() => [1, 2]");
+    assert_eq!(steps[2]["Label"], "t");
+    assert_eq!(steps[3]["Ms"], 5);
 }
 
 #[test]
-fn parse_batch_args_rejects_missing_required_flags() {
-    assert!(parse_batch_args(&args(&["--session", "sess-1", "--script", "/tmp/x.json"])).is_err());
-    assert!(parse_batch_args(&args(&["--profile", "default", "--script", "/tmp/x.json"])).is_err());
-    assert!(parse_batch_args(&args(&["--profile", "default", "--session", "sess-1"])).is_err());
+fn parse_steps_rejects_lowercase_keys_and_bad_values() {
+    let error = parse_steps(&args(&[r#"[{"type":"tool","name":"x"}]"#])).unwrap_err();
+    assert_eq!(error.exit_code(), 252);
+    assert!(error.message().contains("unknown key 'type'"), "{error}");
+    assert!(parse_steps(&args(&["Type=sleep_ms,Ms=soon"])).is_err());
+    assert!(parse_steps(&args(&["Type=tool,Name=sleep"])).is_err());
+    assert!(parse_steps(&args(&["Type=tool,Name=x,OnError=retry"])).is_err());
+    assert!(parse_steps(&args(&["not a step"])).is_err());
+}
+
+#[test]
+fn session_value_turns_daemon_fields_into_pascal_case() {
+    let value = session_value(
+        "session=sess-1 created=10 last_used=11 owned=true owner_pid= page=2 page_created_by_daemon=false page_url=https://example.com/a b target_id=ABC snapshot_epoch=3",
+    );
+    assert_eq!(value["SessionId"], "sess-1");
+    assert_eq!(value["Created"], 10);
+    assert_eq!(value["Owned"], true);
+    assert_eq!(value["OwnerPid"], serde_json::Value::Null);
+    assert_eq!(value["Page"], 2);
+    assert_eq!(value["PageUrl"], "https://example.com/a b");
+    assert_eq!(value["TargetId"], "ABC");
+    assert_eq!(value["SnapshotEpoch"], 3);
 }
 
 #[test]
@@ -838,53 +818,6 @@ fn sanitize_outgoing_request_passes_through_invalid_json() {
 }
 
 #[test]
-fn split_command_args_accepts_leading_global_flags() {
-    let (positional, rest) = split_command_args(args(&["--profile", "conao3", "session", "list"]));
-    assert_eq!(positional, args(&["session", "list"]));
-    assert_eq!(rest, args(&["--profile", "conao3"]));
-}
-
-#[test]
-fn split_command_args_accepts_flags_between_object_and_action() {
-    let (positional, rest) = split_command_args(args(&[
-        "mcp",
-        "--profile",
-        "x",
-        "--session",
-        "sess-1",
-        "batch",
-        "--script",
-        "/tmp/a.json",
-    ]));
-    assert_eq!(positional, args(&["mcp", "batch"]));
-    assert_eq!(
-        rest,
-        args(&[
-            "--profile",
-            "x",
-            "--session",
-            "sess-1",
-            "--script",
-            "/tmp/a.json"
-        ])
-    );
-}
-
-#[test]
-fn split_command_args_keeps_plain_invocation_unchanged() {
-    let (positional, rest) = split_command_args(args(&[
-        "session",
-        "close",
-        "--profile",
-        "x",
-        "--session",
-        "sess-1",
-    ]));
-    assert_eq!(positional, args(&["session", "close"]));
-    assert_eq!(rest, args(&["--profile", "x", "--session", "sess-1"]));
-}
-
-#[test]
 fn find_profile_error_lists_available_profiles() {
     let error = find_profile(&dummy_config(), "missing").unwrap_err();
     assert!(error.contains("unknown profile: missing"));
@@ -968,16 +901,6 @@ fn drain_pending_mcp_response_consumes_until_pending_id() {
     let mut remaining = String::new();
     reader.read_line(&mut remaining).unwrap();
     assert!(remaining.contains("\"id\":8"));
-}
-
-#[test]
-fn extract_flag_detects_and_removes_flag() {
-    let (found, rest) = extract_flag(&args(&["--profile", "x", "--force"]), "--force");
-    assert!(found);
-    assert_eq!(rest, args(&["--profile", "x"]));
-    let (found, rest) = extract_flag(&args(&["--profile", "x"]), "--force");
-    assert!(!found);
-    assert_eq!(rest, args(&["--profile", "x"]));
 }
 
 #[test]

@@ -130,16 +130,9 @@ pub(crate) fn pick_free_port() -> Result<u16, String> {
     Ok(addr.port())
 }
 
-pub(crate) fn start_daemon(profile: &Profile, quiet: bool) -> Result<(), String> {
+pub(crate) fn start_daemon(profile: &Profile) -> Result<Option<u32>, String> {
     if is_daemon_ready(profile)? {
-        if !quiet {
-            println!(
-                "profile={} daemon=ready socket={}",
-                profile.name,
-                daemon_socket_path(profile)?.display()
-            );
-        }
-        return Ok(());
+        return Ok(None);
     }
 
     let dir = daemon_dir()?;
@@ -161,7 +154,7 @@ pub(crate) fn start_daemon(profile: &Profile, quiet: bool) -> Result<(), String>
 
     let child = own_scope_command(&current_exe, &profile.name, "daemon")
         .arg("daemon")
-        .arg("run")
+        .arg("run-daemon")
         .arg("--profile")
         .arg(&profile.name)
         .process_group(0)
@@ -180,15 +173,7 @@ pub(crate) fn start_daemon(profile: &Profile, quiet: bool) -> Result<(), String>
         )
     })?;
 
-    if !quiet {
-        println!(
-            "profile={} daemon=started pid={} socket={}",
-            profile.name,
-            child.id(),
-            daemon_socket_path(profile)?.display()
-        );
-    }
-    Ok(())
+    Ok(Some(child.id()))
 }
 
 pub(crate) fn run_daemon(profile: &Profile) -> Result<(), String> {
@@ -325,46 +310,7 @@ pub(crate) fn initialize_daemon_mcp(
     )
 }
 
-pub(crate) fn create_session(profile: &Profile) -> Result<(), String> {
-    ensure_daemon(profile)?;
-    let response = send_daemon_control(profile, "session_create")?;
-    let line = response
-        .lines()
-        .next()
-        .ok_or_else(|| "daemon returned empty response".to_string())?;
-    if let Some(message) = line.strip_prefix("error=") {
-        return Err(message.to_string());
-    }
-    println!("{line}");
-    Ok(())
-}
-
-pub(crate) fn list_sessions(profile: &Profile) -> Result<(), String> {
-    if !is_daemon_ready(profile)? {
-        return Ok(());
-    }
-    let response = send_daemon_control(profile, "session_list")?;
-    print!("{response}");
-    Ok(())
-}
-
-pub(crate) fn close_session(profile: &Profile, session_id: &str) -> Result<(), String> {
-    if !is_daemon_ready(profile)? {
-        return Err(format!("unknown session: {session_id}"));
-    }
-    let response = send_daemon_control(profile, &format!("session_close session={session_id}"))?;
-    let line = response
-        .lines()
-        .next()
-        .ok_or_else(|| "daemon returned empty response".to_string())?;
-    if let Some(message) = line.strip_prefix("error=") {
-        return Err(message.to_string());
-    }
-    println!("{line}");
-    Ok(())
-}
-
-pub(crate) fn call_daemon(profile: &Profile, session_id: &str) -> Result<(), String> {
+pub(crate) fn call_daemon(profile: &Profile, session_id: &str) -> crate::error::Result<()> {
     ensure_daemon(profile)?;
     let socket_path = daemon_socket_path(profile)?;
     let mut stream = UnixStream::connect(&socket_path)
@@ -374,7 +320,8 @@ pub(crate) fn call_daemon(profile: &Profile, session_id: &str) -> Result<(), Str
         .map_err(|error| format!("failed to clone daemon stream: {error}"))?;
     let mut daemon_reader = BufReader::new(&mut read_stream);
 
-    bind_session(&mut stream, &mut daemon_reader, session_id, &profile.name)?;
+    bind_session(&mut stream, &mut daemon_reader, session_id, &profile.name)
+        .map_err(crate::error::target)?;
 
     let stdin_to_daemon = thread::spawn(move || -> Result<(), String> {
         let mut stdin = std::io::stdin().lock();
@@ -442,12 +389,12 @@ pub(crate) fn bind_session(
     if let Some(message) = response.strip_prefix("error=") {
         if message.starts_with("unknown session") {
             return Err(format!(
-                "{message}; mint a new one: chrome-devtools session create --profile {profile_name}"
+                "{message}; mint a new one: chrome-devtools session create-session --profile {profile_name}"
             ));
         }
         if message.starts_with("session in use") {
             return Err(format!(
-                "{message}; another invocation is bound to this session, wait for it or mint a separate one: chrome-devtools session create --profile {profile_name}"
+                "{message}; another invocation is bound to this session, wait for it or mint a separate one: chrome-devtools session create-session --profile {profile_name}"
             ));
         }
         return Err(message.to_string());
@@ -459,7 +406,7 @@ pub(crate) fn bind_session(
     Ok(())
 }
 
-pub(crate) fn list_mcp_tools_via_daemon(profile: &Profile) -> Result<(), String> {
+pub(crate) fn list_mcp_tools_via_daemon(profile: &Profile) -> Result<String, String> {
     ensure_daemon(profile)?;
     let request = concat!(
         r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{"roots":{"listChanged":false}},"clientInfo":{"name":"chrome-devtools","version":"0.1.0"}}}"#,
@@ -470,16 +417,12 @@ pub(crate) fn list_mcp_tools_via_daemon(profile: &Profile) -> Result<(), String>
         "\n",
     );
     let response = send_daemon_request(profile, request)?;
-    if let Some(line) = response
+    response
         .lines()
         .rev()
         .find(|line| extract_jsonrpc_id(line) == Some(2))
-    {
-        println!("{line}");
-    } else {
-        print!("{response}");
-    }
-    Ok(())
+        .map(str::to_string)
+        .ok_or_else(|| format!("daemon returned no tools/list response: {response}"))
 }
 
 pub(crate) fn ensure_daemon(profile: &Profile) -> Result<(), String> {
@@ -493,7 +436,7 @@ pub(crate) fn ensure_daemon(profile: &Profile) -> Result<(), String> {
             _ => {}
         }
     }
-    start_daemon(profile, true)
+    start_daemon(profile).map(|_| ())
 }
 
 pub(crate) fn warn_on_version_mismatch(profile: &Profile, status_response: &str) {
@@ -502,11 +445,11 @@ pub(crate) fn warn_on_version_mismatch(profile: &Profile, status_response: &str)
     match daemon_version {
         Some(version) if version == cli_version => {}
         Some(version) => eprintln!(
-            "warning: daemon for profile {} runs chrome-devtools {version} but this CLI is {cli_version}; restart it when idle: chrome-devtools daemon stop --profile {}",
+            "warning: daemon for profile {} runs chrome-devtools {version} but this CLI is {cli_version}; restart it when idle: chrome-devtools daemon stop-daemon --profile {}",
             profile.name, profile.name
         ),
         None => eprintln!(
-            "warning: daemon for profile {} was started by an older chrome-devtools than this CLI ({cli_version}); restart it when idle: chrome-devtools daemon stop --profile {}",
+            "warning: daemon for profile {} was started by an older chrome-devtools than this CLI ({cli_version}); restart it when idle: chrome-devtools daemon stop-daemon --profile {}",
             profile.name, profile.name
         ),
     }
@@ -544,71 +487,20 @@ pub(crate) fn is_daemon_ready(profile: &Profile) -> Result<bool, String> {
     }
 }
 
-pub(crate) fn print_daemon_status(profile: &Profile) -> Result<(), String> {
-    let socket_path = daemon_socket_path(profile)?;
-    let pid_path = daemon_pid_path(profile)?;
-    let pid = read_pid_file(&pid_path)
-        .map(|pid| pid.to_string())
-        .unwrap_or_else(|| "unknown".to_string());
-
-    let status_response = if socket_path.exists() {
-        send_daemon_control(profile, "status").ok()
-    } else {
-        None
-    };
-    let health = read_daemon_health(profile)
-        .map(|(last, abnormal, respawns)| {
-            format!(" abnormal_exits={abnormal} respawns={respawns} last_event=[{last}]")
-        })
-        .unwrap_or_default();
-
-    let Some(response) = status_response.filter(|response| response.contains("daemon=ready"))
-    else {
-        println!(
-            "profile={} daemon=stopped pid={} socket={}{health}",
-            profile.name,
-            pid,
-            socket_path.display()
-        );
-        return Ok(());
-    };
-
-    let version = parse_status_field(&response, "version=").unwrap_or("pre-0.3.1");
-    let sessions = parse_status_field(&response, "sessions=").unwrap_or("unknown");
-    let active_sessions = parse_status_field(&response, "active_sessions=").unwrap_or("unknown");
-    let pages = parse_status_field(&response, "pages=").unwrap_or("");
-    let queued = parse_status_field(&response, "queued_mcp_requests=").unwrap_or("unknown");
-    let max_control_latency =
-        parse_status_field(&response, "max_control_latency_ms=").unwrap_or("unknown");
-    let max_forward_latency =
-        parse_status_field(&response, "max_forward_latency_ms=").unwrap_or("unknown");
-    let diagnostic_window =
-        parse_status_field(&response, "diagnostic_window_secs=").unwrap_or("unknown");
-    let chrome = match parse_status_field(&response, "mcp_port=")
-        .and_then(|port| port.parse::<u16>().ok())
-    {
-        Some(port) if is_devtools_ready(port) => format!("ready port={port}"),
-        Some(port) => format!("unreachable port={port} (restart the daemon to reattach Chrome)"),
-        None => "unknown".to_string(),
-    };
-    println!(
-        "profile={} daemon=ready version={version} sessions={sessions} active_sessions={active_sessions} pages={pages} queued_mcp_requests={queued} max_control_latency_ms={max_control_latency} max_forward_latency_ms={max_forward_latency} diagnostic_window_secs={diagnostic_window} chrome={chrome} pid={pid} socket={}{health}",
-        profile.name,
-        socket_path.display()
-    );
-    Ok(())
+pub(crate) enum DaemonStop {
+    Stopped,
+    Refused(String),
 }
 
-pub(crate) fn stop_daemon(profile: &Profile, force: bool) -> Result<(), String> {
+pub(crate) fn stop_daemon(profile: &Profile, force: bool) -> Result<DaemonStop, String> {
     if is_daemon_ready(profile)? {
         let command = if force { "stop force" } else { "stop" };
         let response = send_daemon_control(profile, command)?;
         if let Some(message) = response.trim_end().strip_prefix("error=") {
-            return Err(message.to_string());
+            return Ok(DaemonStop::Refused(message.to_string()));
         }
-        print!("{response}");
         wait_for_daemon_stop(profile, Duration::from_secs(5))?;
-        return Ok(());
+        return Ok(DaemonStop::Stopped);
     }
 
     let pid_path = daemon_pid_path(profile)?;
@@ -621,7 +513,8 @@ pub(crate) fn stop_daemon(profile: &Profile, force: bool) -> Result<(), String> 
             return Err(format!("kill exited with {status}"));
         }
     }
-    cleanup_stale_daemon_files(profile)
+    cleanup_stale_daemon_files(profile)?;
+    Ok(DaemonStop::Stopped)
 }
 
 pub(crate) fn wait_for_daemon_stop(profile: &Profile, timeout: Duration) -> Result<(), String> {
@@ -704,23 +597,6 @@ pub(crate) fn cleanup_stale_daemon_files(profile: &Profile) -> Result<(), String
     let _ = fs::remove_file(socket_path);
     let _ = fs::remove_file(pid_path);
     Ok(())
-}
-
-pub(crate) fn print_status(profile: &Profile) {
-    match current_port(profile) {
-        Some(port) if is_devtools_ready(port) => {
-            println!(
-                "profile={} status=ready port={} user_data_dir={}",
-                profile.name, port, profile.user_data_dir
-            );
-        }
-        _ => {
-            println!(
-                "profile={} status=stopped user_data_dir={}",
-                profile.name, profile.user_data_dir
-            );
-        }
-    }
 }
 
 pub(crate) fn default_chrome_binary() -> String {
@@ -867,7 +743,7 @@ pub(crate) fn exec_mcp(profile: &Profile) -> Result<(), String> {
     }
 }
 
-pub(crate) fn list_mcp_tools(profile: &Profile) -> Result<(), String> {
+pub(crate) fn list_mcp_tools(profile: &Profile) -> Result<String, String> {
     let mut child = mcp_command(profile)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -901,10 +777,9 @@ pub(crate) fn list_mcp_tools(profile: &Profile) -> Result<(), String> {
     )?;
 
     let tools = read_response(&mut reader, &mut stdin, 2)?;
-    println!("{tools}");
 
     terminate_child(&mut child);
-    Ok(())
+    Ok(tools)
 }
 
 pub(crate) const DEFAULT_MCP_VERSION: &str = "1.8.0";
@@ -1019,13 +894,7 @@ pub(crate) fn extract_remote_debugging_port(cmdline: &str) -> Option<u16> {
     rest[..end].parse().ok()
 }
 
-pub(crate) fn stop_profile(profile: &Profile, force: bool) -> Result<(), String> {
-    if !force && is_daemon_ready(profile)? {
-        return Err(format!(
-            "daemon for profile {} is running and other agents may be using it; stopping Chrome would break their sessions. run 'chrome-devtools daemon stop --profile {}' first, or pass --force",
-            profile.name, profile.name
-        ));
-    }
+pub(crate) fn stop_profile(profile: &Profile) -> Result<bool, String> {
     let user_data_dir = expand_home(&profile.user_data_dir)?;
     let pattern = format!("--user-data-dir={}", user_data_dir.display());
 
@@ -1036,10 +905,10 @@ pub(crate) fn stop_profile(profile: &Profile, force: bool) -> Result<(), String>
         .status()
         .map_err(|error| format!("failed to run pkill: {error}"))?;
 
-    if status.success() || status.code() == Some(1) {
-        Ok(())
-    } else {
-        Err(format!("pkill exited with {status}"))
+    match status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(format!("pkill exited with {status}")),
     }
 }
 
