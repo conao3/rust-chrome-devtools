@@ -72,7 +72,7 @@ checksum = "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600"
 
 [[package]]
 name = "chrome-devtools"
-version = "1.5.2"
+version = "1.6.0"
 dependencies = [
  "base64",
  "clap",
