@@ -14,10 +14,10 @@ jobs:
       pull-requests: write
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v6.1.0
 
       - name: Install Nix
-        uses: cachix/install-nix-action@v31
+        uses: cachix/install-nix-action@v31.11.3
         with:
           extra_nix_config: |
             experimental-features = nix-command flakes
@@ -47,7 +47,7 @@ jobs:
 
       - name: Create pull request
         if: steps.check.outputs.current != steps.check.outputs.latest
-        uses: peter-evans/create-pull-request@v8
+        uses: peter-evans/create-pull-request@v8.1.1
         with:
           branch: bump-chrome-devtools-mcp
           title: "chrome-devtools-mcp: ${{ steps.check.outputs.current }} -> ${{ steps.check.outputs.latest }}"
