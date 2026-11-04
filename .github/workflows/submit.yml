@@ -93,7 +93,7 @@ jobs:
             ${{ runner.os }}-cargo-publish-
             ${{ runner.os }}-cargo-
       - run: cargo publish --dry-run
-      - uses: rust-lang/crates-io-auth-action@v1.0.4
+      - uses: rust-lang/crates-io-auth-action@v1.0.6
         id: auth
       - run: cargo publish
         env:
