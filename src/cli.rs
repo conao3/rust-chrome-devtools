@@ -91,7 +91,7 @@ enum Command {
 
 #[derive(Subcommand)]
 enum SessionCommand {
-    /// Start the profile daemon if needed and mint a new session. Sessions expire after 30 minutes idle (24 hours without a tab)
+    /// Start the profile daemon if needed and mint a new session. Sessions expire after 2 hours idle (24 hours without a tab)
     #[command(name = "create-session")]
     Create(ProfileArgs),
     /// List the sessions held by the profile daemon (empty when the daemon is not running)

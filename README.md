@@ -50,7 +50,7 @@ npx skills add ./rust-chrome-devtools
 - The daemon accepts control commands independently of MCP forwarding, so `session create-session`, `session list-sessions`, `session close-session`, `daemon get-daemon-status`, and `daemon stop-daemon` respond while clients are bound.
 - The daemon rewrites client JSON-RPC ids internally and restores the original id in responses, including string ids.
 - `mcp forward-direct-requests` and `mcp list-direct-tools` remain available as a fallback and take a per-profile lock under `~/.cache/chrome-devtools/locks`.
-- `mcp forward-requests` and `mcp run-batch` require an explicit `--session-id <id>` minted by `session create-session`. Sessions live in-memory on the daemon and expire after 30 minutes of inactivity (24 hours for a session that owns no tab); an `unknown session` error says whether the session was reaped, closed, dropped by an MCP respawn, or never existed on this daemon. Concurrent agents must mint and use their own session ids; the daemon assigns each session to a page and injects `pageId` for page-scoped tools.
+- `mcp forward-requests` and `mcp run-batch` require an explicit `--session-id <id>` minted by `session create-session`. Sessions live in-memory on the daemon and expire after 2 hours of inactivity (24 hours for a session that owns no tab); an `unknown session` error says whether the session was reaped, closed, dropped by an MCP respawn, or never existed on this daemon. Concurrent agents must mint and use their own session ids; the daemon assigns each session to a page and injects `pageId` for page-scoped tools.
 
 ## Configuration
 
@@ -122,7 +122,7 @@ chrome-devtools profile stop-profile --profile default
 
 Output is JSON with PascalCase keys. Exit codes: `0` success, `252` a syntax or parameter error (including an invalid step), `254` an error on the target side (unknown profile, unknown or busy session, a refused stop, an MCP error that stopped a batch), `255` any other failure.
 
-`session create-session` starts the profile daemon when needed and mints a new in-memory session id. The session expires after 30 minutes of inactivity or when the daemon stops. Output looks like `{"SessionId": "sess-xxxxxxxxxxxxxxxx", "Created": <ts>, "LastUsed": <ts>, "Owned": false, ...}`; take the id with `jq -r .SessionId`.
+`session create-session` starts the profile daemon when needed and mints a new in-memory session id. The session expires after 2 hours of inactivity or when the daemon stops. Output looks like `{"SessionId": "sess-xxxxxxxxxxxxxxxx", "Created": <ts>, "LastUsed": <ts>, "Owned": false, ...}`; take the id with `jq -r .SessionId`.
 
 `session list-sessions` prints `{"Sessions": [...]}` with one object per active session (`SessionId`, `Owned`, `OwnerPid`, `Page`, `PageUrl`, `TargetId`, ...). `session close-session` drops the named session when it is idle and closes its daemon-created page when Chrome has another tab.
 

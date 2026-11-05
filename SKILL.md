@@ -15,7 +15,7 @@ Use `chrome-devtools` when you need browser automation through Chrome DevTools M
 - **For multi-step automation, prefer `chrome-devtools mcp run-batch --profile <name> --session-id <id> --steps file://<path>`.** It executes the steps through the daemon and returns `{"Steps": [...]}` with one result per step, which is far easier to parse than line-delimited JSON-RPC.
 - For ad-hoc/interactive flows (especially `take_snapshot` → inspect uids → follow-up tool call in the same shell session), use `chrome-devtools mcp forward-requests --profile <name> --session-id <id>` with stdin JSON-RPC.
 - Both `mcp run-batch` and `mcp forward-requests` route through one long-lived per-profile daemon. The daemon assigns each session to a page and injects `pageId` for page-scoped tools.
-- Sessions expire after 30 minutes of inactivity. Activity (any tool call) refreshes the timer. After expiry, mint a new id.
+- Sessions expire after 2 hours of inactivity. Activity (any tool call) refreshes the timer. After expiry, mint a new id.
 - A session is held exclusively while bound by a `mcp forward-requests` / `mcp run-batch` invocation. A second concurrent invocation on the same session id is rejected by the daemon. Different session ids may run concurrently.
 - `take_snapshot` result `uid` values are session uid tokens. Reuse them only in the same session and after the latest snapshot.
 - Do not use `mcp forward-direct-requests` for a split `take_snapshot` then `click`/`fill` workflow; direct mode starts a separate MCP process and the snapshot cache is lost.
@@ -99,7 +99,7 @@ chrome-devtools session list-sessions --profile conao3
 chrome-devtools session close-session --profile conao3 --session-id "$SESSION"
 ```
 
-Sessions are in-memory on the daemon. They are dropped after 30 minutes of inactivity or when the daemon stops (`chrome-devtools daemon stop-daemon --profile <name>`). After expiry, mint a new id. When a session first uses a page-scoped tool, the daemon assigns it a background page and routes later page-scoped calls to that page. `session close-session` and expiry close daemon-created pages when Chrome has another tab; attached pages stay open.
+Sessions are in-memory on the daemon. They are dropped after 2 hours of inactivity or when the daemon stops (`chrome-devtools daemon stop-daemon --profile <name>`). After expiry, mint a new id. When a session first uses a page-scoped tool, the daemon assigns it a background page and routes later page-scoped calls to that page. `session close-session` and expiry close daemon-created pages when Chrome has another tab; attached pages stay open.
 
 ## Batch Execution (Preferred for Multi-Step Workflows)
 
@@ -258,7 +258,7 @@ chrome-devtools profile stop-profile --profile conao3
 
 ## Troubleshooting
 
-- If `mcp forward-requests` or `mcp run-batch` exits with `unknown session`, the message says why the session is gone (idle reap after 30 minutes with a tab, `session close-session`, an MCP respawn, or an id this daemon never had). Mint a new id via `session create-session` and retry. A session that owns no tab is kept for 24 hours.
+- If `mcp forward-requests` or `mcp run-batch` exits with `unknown session`, the message says why the session is gone (idle reap after 2 hours with a tab, `session close-session`, an MCP respawn, or an id this daemon never had). Mint a new id via `session create-session` and retry. A session that owns no tab is kept for 24 hours.
 - If `mcp forward-requests` or `mcp run-batch` exits with `session in use: <id> (held by pid <pid> for <n>s)`, another invocation is currently bound to that id; the pid is the holding `chrome-devtools` process (`session list-sessions` shows it as `OwnerPid`). Wait for it to finish or mint a separate session for the new agent.
 - File-writing tool arguments (`take_screenshot` `filePath` etc.) accept paths under your home directory and the OS tempdir.
 - `upload_file` falls back to Chrome DevTools Protocol when MCP cannot trigger the file chooser; check daemon logs for `upload_file_fallback` or `upload_file_fallback_failed`.

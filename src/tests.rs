@@ -598,8 +598,8 @@ fn unknown_session_message_names_why_the_session_is_gone() {
 
     let message = registry.unknown_session_message(&reaped.id);
     assert!(message.starts_with(&format!("unknown session: {}", reaped.id)));
-    assert!(message.contains("reaped after 31m idle"), "{message}");
-    assert!(message.contains("reaped after 30m"), "{message}");
+    assert!(message.contains("reaped after 2h01m idle"), "{message}");
+    assert!(message.contains("reaped after 2h00m"), "{message}");
 
     let message = registry.unknown_session_message(&closed.id);
     assert!(
