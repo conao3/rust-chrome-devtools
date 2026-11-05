@@ -1,8 +1,8 @@
 use crate::batch::*;
 use crate::config::*;
 use crate::daemon::*;
-use crate::error::{Result, other, parameter, target};
-use crate::grammar::{self, CliInputArgs, SkeletonKind};
+use crate::error::{Result, other, target};
+use crate::grammar;
 use crate::lock::*;
 use crate::output::{self, OutputFormat, Response};
 use clap::{Args, CommandFactory, Parser, Subcommand};
@@ -16,7 +16,7 @@ The per-profile daemon assigns each session its own tab and injects pageId for p
 Different sessions may run concurrently; a second bind on the same session id is rejected.
 
 Examples:
-  SESSION=$(chrome-devtools session create-session --profile default --query SessionId --output text)
+  SESSION=$(chrome-devtools session create-session --profile default | jq -r .SessionId)
   chrome-devtools mcp run-batch --profile default --session-id \"$SESSION\" --steps Type=tool,Name=list_pages
   chrome-devtools mcp run-batch --profile default --session-id \"$SESSION\" --steps file:///tmp/steps.json
   chrome-devtools session close-session --profile default --session-id \"$SESSION\"";
@@ -45,11 +45,11 @@ Examples:
   chrome-devtools mcp run-batch --profile default --session-id \"$SESSION\" \\
     --steps 'Type=tool,Name=goto,Args={\"url\":\"https://example.com/\"}' \\
             'Type=tool,Name=evaluate_script,Label=title,Args={\"function\":\"() => document.title\"}' \\
-    --query \"Steps[?Label=='title'].Result.content[0].text | [0]\" --output text";
+    | jq -r '.Steps[] | select(.Label == \"title\") | .Result.content[0].text'";
 
 const FORWARD_AFTER_HELP: &str = "\
 Reads MCP JSON-RPC requests from standard input, one per line, and streams the JSON-RPC responses to
-standard output as they arrive. --output and --query do not apply to this stream.
+standard output as they arrive. --output does not apply to this stream.
 
 Example:
   printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{}}' \\
@@ -66,14 +66,6 @@ struct Cli {
     /// Output format
     #[arg(long, global = true, help_heading = "Global Options", value_enum, default_value_t = OutputFormat::Json)]
     output: OutputFormat,
-    /// JMESPath expression applied to the output
-    #[arg(
-        long,
-        global = true,
-        help_heading = "Global Options",
-        value_name = "JMESPATH"
-    )]
-    query: Option<String>,
     /// Print debug logs to stderr
     #[arg(long, global = true, help_heading = "Global Options")]
     debug: bool,
@@ -149,7 +141,7 @@ enum DaemonCommand {
 enum ProfileCommand {
     /// List the profiles defined in the config file
     #[command(name = "list-profiles")]
-    List(NoArgs),
+    List,
     /// Show whether the Chrome DevTools endpoint of the profile responds
     #[command(name = "get-profile-status")]
     Status(ProfileArgs),
@@ -159,18 +151,10 @@ enum ProfileCommand {
 }
 
 #[derive(Args)]
-struct NoArgs {
-    #[command(flatten)]
-    input: CliInputArgs,
-}
-
-#[derive(Args)]
 struct ProfileArgs {
     /// Profile name from ~/.config/chrome-devtools/config.toml
     #[arg(long)]
     profile: String,
-    #[command(flatten)]
-    input: CliInputArgs,
 }
 
 #[derive(Args)]
@@ -181,8 +165,6 @@ struct SessionArgs {
     /// Session id minted by `session create-session`
     #[arg(long)]
     session_id: String,
-    #[command(flatten)]
-    input: CliInputArgs,
 }
 
 #[derive(Args)]
@@ -196,8 +178,6 @@ struct ForceArgs {
     /// Refuse to stop while other agents may be using it (default)
     #[arg(long, overrides_with = "force")]
     no_force: bool,
-    #[command(flatten)]
-    input: CliInputArgs,
 }
 
 #[derive(Args)]
@@ -220,109 +200,17 @@ struct RunBatchArgs {
     /// Continue after errored tool steps (default)
     #[arg(long, overrides_with = "fail_fast")]
     no_fail_fast: bool,
-    #[command(flatten)]
-    input: CliInputArgs,
-}
-
-fn output_skeleton(path: &[String]) -> Result<Value> {
-    let session = json!({
-        "SessionId": "sess-0123456789abcdef",
-        "Created": 0,
-        "LastUsed": 0,
-        "Owned": false,
-        "OwnerPid": null,
-        "Page": null,
-        "PageCreatedByDaemon": false,
-        "PageUrl": null,
-        "TargetId": null,
-        "SnapshotEpoch": 0
-    });
-    let tools = json!({"Tools": [{"name": "", "description": "", "inputSchema": {}}]});
-    Ok(match path.last().map(String::as_str) {
-        Some("create-session") => session,
-        Some("list-sessions") => json!({ "Sessions": [session] }),
-        Some("close-session") => json!({"SessionId": "", "Closed": true}),
-        Some("list-tools" | "list-direct-tools") => tools,
-        Some("run-batch") => json!({
-            "Steps": [
-                {"Type": "tool", "Name": "", "Label": null, "Result": {"content": [{"type": "text", "text": ""}]}, "Error": null},
-                {"Type": "sleep_ms", "Label": null, "Ms": 0}
-            ],
-            "Error": null
-        }),
-        Some("start-daemon") => {
-            json!({"Profile": "", "Daemon": "started", "Pid": 0, "Socket": ""})
-        }
-        Some("get-daemon-status") => json!({
-            "Profile": "",
-            "Daemon": "ready",
-            "Version": "",
-            "Sessions": 0,
-            "ActiveSessions": 0,
-            "Pages": [0],
-            "QueuedMcpRequests": 0,
-            "MaxControlLatencyMs": 0,
-            "MaxForwardLatencyMs": 0,
-            "DiagnosticWindowSecs": 0,
-            "Chrome": "ready",
-            "ChromePort": 0,
-            "Pid": 0,
-            "Socket": "",
-            "AbnormalExits": 0,
-            "Respawns": 0,
-            "LastEvent": null
-        }),
-        Some("stop-daemon") => json!({"Profile": "", "Daemon": "stopped"}),
-        Some("list-profiles") => json!({"Profiles": [{"Name": "", "UserDataDir": ""}]}),
-        Some("get-profile-status") => {
-            json!({"Profile": "", "Status": "ready", "Port": 0, "UserDataDir": ""})
-        }
-        Some("stop-profile") => json!({"Profile": "", "Stopped": true}),
-        Some(name @ ("forward-requests" | "forward-direct-requests" | "run-daemon")) => {
-            return Err(parameter(format!(
-                "{name} streams JSON-RPC lines and has no output skeleton"
-            )));
-        }
-        _ => {
-            return Err(parameter(
-                "--generate-cli-skeleton needs a command and a subcommand",
-            ));
-        }
-    })
 }
 
 pub(crate) fn run() -> Result<()> {
     let mut root = Cli::command();
     root.build();
-    let prepared = grammar::prepare(&root, std::env::args_os().collect())?;
-    if prepared.argv.iter().any(|token| token == "--debug") {
-        eprintln!("debug: argv {:?}", &prepared.argv[1..]);
+    let argv = grammar::prepare(&root, std::env::args_os().collect())?;
+    if argv.iter().any(|token| token == "--debug") {
+        eprintln!("debug: argv {:?}", &argv[1..]);
     }
 
-    if let Some(kind) = prepared.skeleton {
-        let mut command = &root;
-        for name in &prepared.path {
-            command = command
-                .find_subcommand(name)
-                .ok_or_else(|| other(format!("unknown subcommand {name}")))?;
-        }
-        if command.has_subcommands() {
-            return Err(parameter(
-                "--generate-cli-skeleton needs a command and a subcommand",
-            ));
-        }
-        let value = match kind {
-            SkeletonKind::Input => grammar::input_skeleton(command),
-            SkeletonKind::Output => output_skeleton(&prepared.path)?,
-        };
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&value).map_err(|error| other(error.to_string()))?
-        );
-        return Ok(());
-    }
-
-    let cli = match Cli::try_parse_from(&prepared.argv) {
+    let cli = match Cli::try_parse_from(&argv) {
         Ok(cli) => cli,
         Err(error) => {
             let code = if error.use_stderr() { 252 } else { 0 };
@@ -330,9 +218,6 @@ pub(crate) fn run() -> Result<()> {
             std::process::exit(code);
         }
     };
-    if let Some(query) = &cli.query {
-        output::compile_query(query)?;
-    }
 
     let config = load_or_create_config()?;
     let (name, value, output_file) = dispatch(&config, cli.command)?;
@@ -340,7 +225,6 @@ pub(crate) fn run() -> Result<()> {
         &grammar::pascal_case(name),
         Response { value, text: None },
         cli.output,
-        cli.query.as_deref(),
     )?;
     match output_file {
         Some(path) => fs::write(&path, rendered)
@@ -438,7 +322,7 @@ fn dispatch(config: &Config, command: Command) -> Result<Dispatched> {
                 DaemonStop::Refused(message) => Err(target(message)),
             }
         }
-        Command::Profile(ProfileCommand::List(_)) => {
+        Command::Profile(ProfileCommand::List) => {
             let profiles: Vec<Value> = config
                 .profiles
                 .iter()

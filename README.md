@@ -101,7 +101,7 @@ Each session is pinned to the CDP target id of its tab, which stays the same for
 
 ## Commands
 
-The CLI takes input in the AWS CLI grammar: `chrome-devtools [global options] <command> <subcommand> [--parameter value ...]`. Every parameter is named, booleans come in `--flag` / `--no-flag` pairs, a value starting with `file://` is read from that file (`file:///dev/stdin` reads standard input), `--cli-input-json` takes all parameters as one JSON object keyed by the PascalCase parameter names, and `--generate-cli-skeleton input|output` prints the input or output shape. The global options are `--output json|text|table` (default `json`), `--query <JMESPath>`, `--debug` and `--version`. `help` works at every level (`chrome-devtools help`, `chrome-devtools mcp help`, `chrome-devtools mcp run-batch help`).
+The CLI takes input in the AWS CLI grammar: `chrome-devtools [global options] <command> <subcommand> [--parameter value ...]`. Every parameter is named, booleans come in `--flag` / `--no-flag` pairs, a value starting with `file://` is read from that file (`file:///dev/stdin` reads standard input), and the global options are `--output json|text|table` (default `json`), `--debug` and `--version`. `help` works at every level (`chrome-devtools help`, `chrome-devtools mcp help`, `chrome-devtools mcp run-batch help`).
 
 ```sh
 chrome-devtools session create-session --profile default
@@ -122,13 +122,13 @@ chrome-devtools profile stop-profile --profile default
 
 Output is JSON with PascalCase keys. Exit codes: `0` success, `252` a syntax or parameter error (including an invalid step), `254` an error on the target side (unknown profile, unknown or busy session, a refused stop, an MCP error that stopped a batch), `255` any other failure.
 
-`session create-session` starts the profile daemon when needed and mints a new in-memory session id. The session expires after 30 minutes of inactivity or when the daemon stops. Output looks like `{"SessionId": "sess-xxxxxxxxxxxxxxxx", "Created": <ts>, "LastUsed": <ts>, "Owned": false, ...}`; take the id with `--query SessionId --output text`.
+`session create-session` starts the profile daemon when needed and mints a new in-memory session id. The session expires after 30 minutes of inactivity or when the daemon stops. Output looks like `{"SessionId": "sess-xxxxxxxxxxxxxxxx", "Created": <ts>, "LastUsed": <ts>, "Owned": false, ...}`; take the id with `jq -r .SessionId`.
 
 `session list-sessions` prints `{"Sessions": [...]}` with one object per active session (`SessionId`, `Owned`, `OwnerPid`, `Page`, `PageUrl`, `TargetId`, ...). `session close-session` drops the named session when it is idle and closes its daemon-created page when Chrome has another tab.
 
 `mcp list-tools` starts the profile daemon when needed, queries `tools/list` through that daemon, and prints `{"Tools": [...]}` with the MCP tool objects as MCP returns them.
 
-`mcp forward-requests` binds the given session, forwards stdin JSON-RPC lines to the daemon-owned `chrome-devtools-mcp` process, and streams the JSON-RPC responses to stdout as they arrive (`--output` and `--query` do not apply to the stream). The session is held for the lifetime of this invocation; other clients can use control commands while the bind is active, and another MCP bind waits up to `CHROME_DEVTOOLS_BIND_TIMEOUT_SECS`. Activity refreshes the session's idle timer.
+`mcp forward-requests` binds the given session, forwards stdin JSON-RPC lines to the daemon-owned `chrome-devtools-mcp` process, and streams the JSON-RPC responses to stdout as they arrive (`--output` does not apply to the stream). The session is held for the lifetime of this invocation; other clients can use control commands while the bind is active, and another MCP bind waits up to `CHROME_DEVTOOLS_BIND_TIMEOUT_SECS`. Activity refreshes the session's idle timer.
 
 `daemon get-daemon-status` includes `QueuedMcpRequests`, `MaxControlLatencyMs`, and `MaxForwardLatencyMs` for the recent diagnostic window, `Chrome` (`ready`, `unreachable` or `unknown`) with `ChromePort`, and `Respawns`, `AbnormalExits` and `LastEvent` from the health file. The default window is 600 seconds and can be changed with `CHROME_DEVTOOLS_DIAGNOSTIC_WINDOW_SECS`. When Chrome is `unreachable`, restart the daemon to reattach it.
 
@@ -153,7 +153,7 @@ The same steps as a JSON file passed with `--steps file://steps.json`:
 ]
 ```
 
-The output is `{"Steps": [...]}` with one entry per step: `{"Type": "tool", "Name": ..., "Label": ..., "Result": <MCP tools/call result>, "Error": <MCP error or null>}` or `{"Type": "sleep_ms", "Label": ..., "Ms": ...}`. `Result` is the MCP result as MCP returns it, so the text of a tool result is `Result.content[0].text`. Select a step with `--query`, e.g. `--query "Steps[?Label=='title'].Result.content[0].text | [0]" --output text`.
+The output is `{"Steps": [...]}` with one entry per step: `{"Type": "tool", "Name": ..., "Label": ..., "Result": <MCP tools/call result>, "Error": <MCP error or null>}` or `{"Type": "sleep_ms", "Label": ..., "Ms": ...}`. `Result` is the MCP result as MCP returns it, so the text of a tool result is `Result.content[0].text`. Select a step with `jq`, e.g. `jq -r '.Steps[] | select(.Label == "title") | .Result.content[0].text'`.
 
 Inside `Args`, replace any value with `{"$ref":"<label>.<path>"}` to substitute it with a previous step's output entry. `<path>` is dot-separated; numeric segments index arrays. For example, `{"$ref":"snap.Result.content.0.text"}` resolves to the text of the first content entry of the step whose `Label` was `snap`.
 

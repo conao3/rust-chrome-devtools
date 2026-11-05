@@ -10,8 +10,8 @@ Use `chrome-devtools` when you need browser automation through Chrome DevTools M
 ## Core Rules
 
 - Always choose an explicit profile with `--profile <name>`. Do not rely on an implicit browser instance.
-- The CLI takes the AWS CLI grammar: `chrome-devtools <command> <subcommand> --parameter value`. Output is JSON with PascalCase keys; pick a field with `--query <JMESPath>` and print it bare with `--output text`. `help` works at every level (`chrome-devtools mcp run-batch help`). Exit code 252 is a mistake in the invocation or the steps, 254 is a target-side failure (unknown profile, unknown or busy session, refused stop, a batch stopped on an MCP error).
-- **Mint a session before running `mcp run-batch` or `mcp forward-requests`.** Both subcommands require `--session-id <id>` and refuse to start without it. Use `SESSION=$(chrome-devtools session create-session --profile <name> --query SessionId --output text)` to get an id, then reuse the same id for every related invocation.
+- The CLI takes the AWS CLI grammar: `chrome-devtools <command> <subcommand> --parameter value`. Output is JSON with PascalCase keys; pick a field with `jq` (`| jq -r .SessionId`). `help` works at every level (`chrome-devtools mcp run-batch help`). Exit code 252 is a mistake in the invocation or the steps, 254 is a target-side failure (unknown profile, unknown or busy session, refused stop, a batch stopped on an MCP error).
+- **Mint a session before running `mcp run-batch` or `mcp forward-requests`.** Both subcommands require `--session-id <id>` and refuse to start without it. Use `SESSION=$(chrome-devtools session create-session --profile <name> | jq -r .SessionId)` to get an id, then reuse the same id for every related invocation.
 - **For multi-step automation, prefer `chrome-devtools mcp run-batch --profile <name> --session-id <id> --steps file://<path>`.** It executes the steps through the daemon and returns `{"Steps": [...]}` with one result per step, which is far easier to parse than line-delimited JSON-RPC.
 - For ad-hoc/interactive flows (especially `take_snapshot` → inspect uids → follow-up tool call in the same shell session), use `chrome-devtools mcp forward-requests --profile <name> --session-id <id>` with stdin JSON-RPC.
 - Both `mcp run-batch` and `mcp forward-requests` route through one long-lived per-profile daemon. The daemon assigns each session to a page and injects `pageId` for page-scoped tools.
@@ -90,7 +90,7 @@ Mint, reuse, and tear down sessions explicitly. Every `mcp run-batch` and `mcp f
 chrome-devtools session create-session --profile conao3
 
 # Capture the id for later use
-SESSION=$(chrome-devtools session create-session --profile conao3 --query SessionId --output text)
+SESSION=$(chrome-devtools session create-session --profile conao3 | jq -r .SessionId)
 
 # Inspect active sessions ({"Sessions": [...]}; TargetId is the session's tab)
 chrome-devtools session list-sessions --profile conao3
@@ -114,7 +114,7 @@ Each `--steps` value is a JSON array of steps, one JSON step object, or one step
 
 The steps are validated before anything runs: an unknown key (a lowercase `type`, say), a `tool` step named `sleep_ms` / `sleep` / `wait` (the pause is the `sleep_ms` step type, not a tool) or a step without `Type` exits with 252 and the list of step types, and no step executes. The keys of `Args` are the MCP tool arguments and keep MCP's own names (`filePath`, `waitSelector`).
 
-`Label` is preserved verbatim in the output, which makes it easy to select a step with `--query` or jq.
+`Label` is preserved verbatim in the output, which makes it easy to select a step with jq.
 
 ### Value references inside Args
 
@@ -180,9 +180,6 @@ When the target uid token is not known in advance, split the work: run the `take
 
 ```sh
 chrome-devtools mcp run-batch --profile conao3 --session-id "$SESSION" --steps file:///tmp/steps.json \
-  --query "Steps[?Label=='title'].Result.content[0].text | [0]" --output text
-
-chrome-devtools mcp run-batch --profile conao3 --session-id "$SESSION" --steps file:///tmp/steps.json \
   | jq -r '.Steps[] | select(.Label == "title") | .Result.content[0].text'
 ```
 
@@ -192,7 +189,7 @@ For exploratory or hand-driven JSON-RPC, `mcp forward-requests` forwards stdin l
 
 ```sh
 chrome-devtools daemon start-daemon --profile conao3
-SESSION=$(chrome-devtools session create-session --profile conao3 --query SessionId --output text)
+SESSION=$(chrome-devtools session create-session --profile conao3 | jq -r .SessionId)
 chrome-devtools mcp forward-requests --profile conao3 --session-id "$SESSION"
 ```
 
@@ -218,15 +215,14 @@ List available MCP tools (`{"Tools": [...]}`):
 
 ```sh
 chrome-devtools mcp list-tools --profile conao3
-chrome-devtools mcp list-tools --profile conao3 --query 'Tools[].name' --output text
+chrome-devtools mcp list-tools --profile conao3 | jq -r '.Tools[].name'
 ```
 
-Show help and the input shape of a subcommand:
+Show help of a command or subcommand:
 
 ```sh
 chrome-devtools mcp help
 chrome-devtools mcp run-batch help
-chrome-devtools mcp run-batch --generate-cli-skeleton
 ```
 
 Inspect daemon health (version, session count, active session count, session pages, queued MCP requests, recent latency maxima, whether the daemon-attached Chrome endpoint responds):
