@@ -967,3 +967,30 @@ fn write_tolerating_closed_pipe_writes_the_text() {
     crate::output::write_tolerating_closed_pipe(&mut written, "{}\n").unwrap();
     assert_eq!(written, b"{}\n");
 }
+
+#[test]
+fn parse_steps_suggests_the_pascal_case_key_for_a_lowercase_or_mcp_style_key() {
+    let error = parse_steps(&args(&[
+        r#"[{"type":"tool","name":"goto","args":{"url":"https://example.com/"}}]"#,
+    ]))
+    .unwrap_err();
+    assert!(
+        error
+            .message()
+            .contains("rename the keys: type -> Type, name -> Name, args -> Args"),
+        "{error}"
+    );
+    let error = parse_steps(&args(&[
+        r#"[{"Type":"tool","Name":"goto","Arguments":{"url":"https://example.com/"}}]"#,
+    ]))
+    .unwrap_err();
+    assert!(
+        error
+            .message()
+            .contains("rename the keys: Arguments -> Args"),
+        "{error}"
+    );
+    let error =
+        parse_steps(&args(&[r#"[{"Type":"tool","Name":"goto","Whatever":1}]"#])).unwrap_err();
+    assert!(!error.message().contains("rename the keys"), "{error}");
+}
