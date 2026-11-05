@@ -935,3 +935,35 @@ fn systemd_scope_unit_name_formats_profile_role_and_nonce() {
         "chrome-devtools-agent_001-chrome-42.scope"
     );
 }
+
+struct FailingWriter(std::io::ErrorKind);
+
+impl std::io::Write for FailingWriter {
+    fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+        Err(std::io::Error::from(self.0))
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn write_tolerating_closed_pipe_ignores_a_closed_consumer() {
+    let mut writer = FailingWriter(std::io::ErrorKind::BrokenPipe);
+    crate::output::write_tolerating_closed_pipe(&mut writer, "{}\n").unwrap();
+}
+
+#[test]
+fn write_tolerating_closed_pipe_reports_other_write_errors() {
+    let mut writer = FailingWriter(std::io::ErrorKind::PermissionDenied);
+    let error = crate::output::write_tolerating_closed_pipe(&mut writer, "{}\n").unwrap_err();
+    assert!(error.message().contains("failed to write stdout"));
+}
+
+#[test]
+fn write_tolerating_closed_pipe_writes_the_text() {
+    let mut written: Vec<u8> = Vec::new();
+    crate::output::write_tolerating_closed_pipe(&mut written, "{}\n").unwrap();
+    assert_eq!(written, b"{}\n");
+}

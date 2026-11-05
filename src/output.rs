@@ -1,3 +1,5 @@
+use std::io::{self, Write};
+
 use clap::ValueEnum;
 use serde_json::Value;
 use unicode_width::UnicodeWidthStr;
@@ -14,6 +16,23 @@ pub enum OutputFormat {
 pub struct Response {
     pub value: Value,
     pub text: Option<String>,
+}
+
+/// Writes to stdout and treats a closed pipe as success: the consumer (`head`, a failed `python3`)
+/// has stopped reading, and the command has already done its work.
+pub fn print_stdout(text: &str) -> Result<()> {
+    write_tolerating_closed_pipe(&mut io::stdout().lock(), text)
+}
+
+pub(crate) fn write_tolerating_closed_pipe(writer: &mut impl Write, text: &str) -> Result<()> {
+    match writer
+        .write_all(text.as_bytes())
+        .and_then(|_| writer.flush())
+    {
+        Err(error) if error.kind() == io::ErrorKind::BrokenPipe => Ok(()),
+        Err(error) => Err(other(format!("failed to write stdout: {error}"))),
+        Ok(()) => Ok(()),
+    }
 }
 
 pub fn render(title: &str, response: Response, format: OutputFormat) -> Result<String> {
