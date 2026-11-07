@@ -226,6 +226,19 @@ pub(crate) fn execute_batch(options: &BatchOptions) -> Result<BatchRun> {
     })
 }
 
+const STEP_KEYS: [&str; 6] = ["Type", "Name", "Args", "Label", "OnError", "Ms"];
+
+/// The step key a mistyped key stands for: the same name in another case, or the MCP spelling
+/// `arguments`.
+fn renamed_step_key(key: &str) -> Option<&'static str> {
+    if key.eq_ignore_ascii_case("arguments") {
+        return Some("Args");
+    }
+    STEP_KEYS
+        .into_iter()
+        .find(|name| name.eq_ignore_ascii_case(key))
+}
+
 pub(crate) fn validate_steps(steps: &[Value]) -> Result<()> {
     for (index, step) in steps.iter().enumerate() {
         let position = index + 1;
@@ -234,11 +247,23 @@ pub(crate) fn validate_steps(steps: &[Value]) -> Result<()> {
                 "step {position} is not an object: expected {STEP_SHAPE_HINT}"
             )));
         };
-        let allowed = ["Type", "Name", "Args", "Label", "OnError", "Ms"];
-        if let Some(unknown) = object.keys().find(|key| !allowed.contains(&key.as_str())) {
+        let unknown_keys = object
+            .keys()
+            .filter(|key| !STEP_KEYS.contains(&key.as_str()))
+            .collect::<Vec<_>>();
+        if let Some(unknown) = unknown_keys.first() {
+            let renames = unknown_keys
+                .iter()
+                .filter_map(|key| renamed_step_key(key).map(|name| format!("{key} -> {name}")))
+                .collect::<Vec<_>>();
+            let renames = if renames.is_empty() {
+                String::new()
+            } else {
+                format!("; rename the keys: {}", renames.join(", "))
+            };
             return Err(parameter(format!(
-                "step {position} has unknown key '{unknown}' (keys: {}): expected {STEP_SHAPE_HINT}",
-                allowed.join(", ")
+                "step {position} has unknown key '{unknown}' (keys: {}): expected {STEP_SHAPE_HINT}{renames}",
+                STEP_KEYS.join(", ")
             )));
         }
         let Some(step_type) = step.get("Type").and_then(Value::as_str) else {

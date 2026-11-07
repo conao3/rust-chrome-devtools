@@ -13,11 +13,13 @@ mod router;
 #[cfg(test)]
 mod tests;
 
+use std::io::Write;
+
 fn main() {
     let code = match cli::run() {
         Ok(()) => 0,
         Err(error) => {
-            eprintln!("error: {error}");
+            let _ = writeln!(std::io::stderr(), "error: {error}");
             error.exit_code()
         }
     };

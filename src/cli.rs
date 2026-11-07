@@ -91,7 +91,7 @@ enum Command {
 
 #[derive(Subcommand)]
 enum SessionCommand {
-    /// Start the profile daemon if needed and mint a new session. Sessions expire after 30 minutes idle (24 hours without a tab)
+    /// Start the profile daemon if needed and mint a new session. Sessions expire after 2 hours idle (24 hours without a tab)
     #[command(name = "create-session")]
     Create(ProfileArgs),
     /// List the sessions held by the profile daemon (empty when the daemon is not running)
@@ -229,10 +229,7 @@ pub(crate) fn run() -> Result<()> {
     match output_file {
         Some(path) => fs::write(&path, rendered)
             .map_err(|error| other(format!("failed to write {}: {error}", path.display()))),
-        None => {
-            print!("{rendered}");
-            Ok(())
-        }
+        None => output::print_stdout(&rendered),
     }
 }
 
@@ -393,7 +390,7 @@ fn run_batch(config: &Config, args: RunBatchArgs) -> Result<Dispatched> {
                 Some(path) => {
                     let _ = fs::write(path, format!("{rendered}\n"));
                 }
-                None => println!("{rendered}"),
+                None => output::print_stdout(&format!("{rendered}\n"))?,
             }
             Err(error)
         }

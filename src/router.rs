@@ -43,7 +43,7 @@ struct PollFd {
 
 const POLLHUP: i16 = 0x10;
 
-pub(crate) const SESSION_IDLE_TTL: Duration = Duration::from_secs(30 * 60);
+pub(crate) const SESSION_IDLE_TTL: Duration = Duration::from_secs(2 * 60 * 60);
 
 /// A session that owns no tab costs nothing to keep, so it outlives `SESSION_IDLE_TTL`.
 pub(crate) const PAGELESS_SESSION_IDLE_TTL: Duration = Duration::from_secs(24 * 60 * 60);

@@ -599,8 +599,8 @@ fn unknown_session_message_names_why_the_session_is_gone() {
 
     let message = registry.unknown_session_message(&reaped.id);
     assert!(message.starts_with(&format!("unknown session: {}", reaped.id)));
-    assert!(message.contains("reaped after 31m idle"), "{message}");
-    assert!(message.contains("reaped after 30m"), "{message}");
+    assert!(message.contains("reaped after 2h01m idle"), "{message}");
+    assert!(message.contains("reaped after 2h00m"), "{message}");
 
     let message = registry.unknown_session_message(&closed.id);
     assert!(
@@ -955,4 +955,63 @@ fn format_clickable_includes_kind_label_href_and_disabled() {
         format_clickable(2, &submit),
         "3. [input type=submit] \"Send\" (disabled)"
     );
+}
+
+struct FailingWriter(std::io::ErrorKind);
+
+impl std::io::Write for FailingWriter {
+    fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+        Err(std::io::Error::from(self.0))
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn write_tolerating_closed_pipe_ignores_a_closed_consumer() {
+    let mut writer = FailingWriter(std::io::ErrorKind::BrokenPipe);
+    crate::output::write_tolerating_closed_pipe(&mut writer, "{}\n").unwrap();
+}
+
+#[test]
+fn write_tolerating_closed_pipe_reports_other_write_errors() {
+    let mut writer = FailingWriter(std::io::ErrorKind::PermissionDenied);
+    let error = crate::output::write_tolerating_closed_pipe(&mut writer, "{}\n").unwrap_err();
+    assert!(error.message().contains("failed to write stdout"));
+}
+
+#[test]
+fn write_tolerating_closed_pipe_writes_the_text() {
+    let mut written: Vec<u8> = Vec::new();
+    crate::output::write_tolerating_closed_pipe(&mut written, "{}\n").unwrap();
+    assert_eq!(written, b"{}\n");
+}
+
+#[test]
+fn parse_steps_suggests_the_pascal_case_key_for_a_lowercase_or_mcp_style_key() {
+    let error = parse_steps(&args(&[
+        r#"[{"type":"tool","name":"goto","args":{"url":"https://example.com/"}}]"#,
+    ]))
+    .unwrap_err();
+    assert!(
+        error
+            .message()
+            .contains("rename the keys: type -> Type, name -> Name, args -> Args"),
+        "{error}"
+    );
+    let error = parse_steps(&args(&[
+        r#"[{"Type":"tool","Name":"goto","Arguments":{"url":"https://example.com/"}}]"#,
+    ]))
+    .unwrap_err();
+    assert!(
+        error
+            .message()
+            .contains("rename the keys: Arguments -> Args"),
+        "{error}"
+    );
+    let error =
+        parse_steps(&args(&[r#"[{"Type":"tool","Name":"goto","Whatever":1}]"#])).unwrap_err();
+    assert!(!error.message().contains("rename the keys"), "{error}");
 }
