@@ -1053,7 +1053,56 @@ fn list_page_targets(port: u16) -> Result<Vec<PageTarget>, String> {
         .collect())
 }
 
+pub(crate) fn new_target(port: u16, url: &str) -> Result<(String, String, String), String> {
+    let path = format!("/json/new?{}", encode_new_target_url(url));
+    let response = http_put(port, &path)?;
+    parse_new_target(&response)
+}
+
+fn http_put(port: u16, path: &str) -> Result<String, String> {
+    http_request(port, "PUT", path)
+}
+
+/// /json/new takes the whole query string as the URL, so URL structure
+/// characters stay intact; only bytes that would break the request line
+/// or the query are percent-encoded.
+pub(crate) fn encode_new_target_url(url: &str) -> String {
+    let mut out = String::with_capacity(url.len());
+    for byte in url.bytes() {
+        match byte {
+            b' ' | b'#' | b'<' | b'>' | b'"' | 0..=0x1f | 0x7f..=0xff => {
+                out.push_str(&format!("%{byte:02X}"));
+            }
+            _ => out.push(byte as char),
+        }
+    }
+    out
+}
+
+pub(crate) fn parse_new_target(response: &str) -> Result<(String, String, String), String> {
+    let value = parse_cdp_value(response, "/json/new response")?;
+    let field = |key: &str| {
+        value
+            .get(key)
+            .and_then(|field| field.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+    let id = field("id");
+    if id.is_empty() {
+        return Err(format!(
+            "unexpected /json/new response: {}",
+            response.trim()
+        ));
+    }
+    Ok((id, field("url"), field("title")))
+}
+
 fn http_get(port: u16, path: &str) -> Result<String, String> {
+    http_request(port, "GET", path)
+}
+
+fn http_request(port: u16, method: &str, path: &str) -> Result<String, String> {
     let mut stream = TcpStream::connect(("127.0.0.1", port))
         .map_err(|error| format!("failed to connect DevTools HTTP: {error}"))?;
     stream
@@ -1061,8 +1110,10 @@ fn http_get(port: u16, path: &str) -> Result<String, String> {
         .map_err(|error| format!("failed to configure DevTools HTTP timeout: {error}"))?;
     stream
         .write_all(
-            format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n")
-                .as_bytes(),
+            format!(
+                "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+            )
+            .as_bytes(),
         )
         .map_err(|error| format!("failed to request DevTools HTTP: {error}"))?;
     // Chrome may keep the connection open even after sending Connection: close, so an EOF-based

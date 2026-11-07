@@ -119,6 +119,7 @@ chrome-devtools daemon get-daemon-status --profile default
 chrome-devtools daemon stop-daemon --profile default
 chrome-devtools profile list-profiles
 chrome-devtools profile get-profile-status --profile default
+chrome-devtools profile new-tab --profile default [--url <url>]
 chrome-devtools profile stop-profile --profile default
 ```
 

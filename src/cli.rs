@@ -84,7 +84,7 @@ enum Command {
     /// Start, inspect, and stop the per-profile daemon
     #[command(subcommand)]
     Daemon(DaemonCommand),
-    /// List profiles and inspect or stop the Chrome bound to a profile
+    /// List profiles, inspect or stop the Chrome bound to a profile, and open tabs in it
     #[command(subcommand)]
     Profile(ProfileCommand),
 }
@@ -148,6 +148,9 @@ enum ProfileCommand {
     /// Stop the Chrome bound to the profile. Refused while the profile daemon runs unless --force
     #[command(name = "stop-profile")]
     Stop(ForceArgs),
+    /// Open a new tab in the profile's Chrome (starts the daemon and Chrome when needed)
+    #[command(name = "new-tab")]
+    NewTab(NewTabArgs),
 }
 
 #[derive(Args)]
@@ -155,6 +158,16 @@ struct ProfileArgs {
     /// Profile name from ~/.config/chrome-devtools/config.toml
     #[arg(long)]
     profile: String,
+}
+
+#[derive(Args)]
+struct NewTabArgs {
+    /// Profile name from ~/.config/chrome-devtools/config.toml
+    #[arg(long)]
+    profile: String,
+    /// URL to open in the new tab
+    #[arg(long, default_value = "about:blank")]
+    url: String,
 }
 
 #[derive(Args)]
@@ -352,6 +365,28 @@ fn dispatch(config: &Config, command: Command) -> Result<Dispatched> {
             done(
                 "stop-profile",
                 json!({"Profile": profile.name, "Stopped": stopped}),
+            )
+        }
+        Command::Profile(ProfileCommand::NewTab(args)) => {
+            let profile = profile(config, &args.profile)?;
+            let port = match current_port(&profile).filter(|port| is_devtools_ready(*port)) {
+                Some(port) => port,
+                None => {
+                    ensure_daemon(&profile)?;
+                    current_port(&profile)
+                        .filter(|port| is_devtools_ready(*port))
+                        .ok_or_else(|| {
+                            target(format!(
+                                "Chrome for profile {} did not become ready",
+                                profile.name
+                            ))
+                        })?
+                }
+            };
+            let (id, url, title) = crate::cdp::new_target(port, &args.url)?;
+            done(
+                "new-tab",
+                json!({"Profile": profile.name, "TargetId": id, "Url": url, "Title": title}),
             )
         }
     }

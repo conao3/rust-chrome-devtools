@@ -1015,3 +1015,27 @@ fn parse_steps_suggests_the_pascal_case_key_for_a_lowercase_or_mcp_style_key() {
         parse_steps(&args(&[r#"[{"Type":"tool","Name":"goto","Whatever":1}]"#])).unwrap_err();
     assert!(!error.message().contains("rename the keys"), "{error}");
 }
+
+#[test]
+fn encode_new_target_url_keeps_structure_and_encodes_breakers() {
+    assert_eq!(encode_new_target_url("about:blank"), "about:blank");
+    assert_eq!(
+        encode_new_target_url("https://example.com/a b?x=1&y=2#frag"),
+        "https://example.com/a%20b?x=1&y=2%23frag"
+    );
+}
+
+#[test]
+fn parse_new_target_reads_id_url_and_title() {
+    let response =
+        r#"{"id":"ABC123","type":"page","title":"Example","url":"https://example.com/"}"#;
+    assert_eq!(
+        parse_new_target(response).unwrap(),
+        (
+            "ABC123".to_string(),
+            "https://example.com/".to_string(),
+            "Example".to_string()
+        )
+    );
+    assert!(parse_new_target("{}").is_err());
+}

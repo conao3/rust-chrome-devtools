@@ -81,6 +81,7 @@ Check profiles before operating:
 ```sh
 chrome-devtools profile list-profiles
 chrome-devtools profile get-profile-status --profile conao3
+chrome-devtools profile new-tab --profile conao3 [--url https://example.com]
 ```
 
 ## Session Lifecycle
