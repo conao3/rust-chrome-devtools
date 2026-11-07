@@ -15,7 +15,7 @@ workflows:
         - 'actions/cache@v6.1.0'
         - 'actions/checkout@v6.1.0'
         - 'dtolnay/rust-toolchain@stable'
-        - 'rust-lang/crates-io-auth-action@v1.0.4'
+        - 'rust-lang/crates-io-auth-action@v1.0.6'
 dependencies:
     'actions/cache@v6.1.0':
         ref: 'v6.1.0'
@@ -42,8 +42,8 @@ dependencies:
         commit: 'sha1-5f6978faf089d4d20b00c7766989d076bb2fc7f1'
         owner_id: 18365890
         repo_id: 197176365
-    'rust-lang/crates-io-auth-action@v1.0.4':
-        ref: 'v1.0.4'
-        commit: 'sha1-bbd81622f20ce9e2dd9622e3218b975523e45bbe'
+    'rust-lang/crates-io-auth-action@v1.0.6':
+        ref: 'v1.0.6'
+        commit: 'sha1-3268eb413133e2960fa4ae0e963ca76380c54cd9'
         owner_id: 5430905
         repo_id: 1008931044
