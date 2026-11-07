@@ -369,20 +369,7 @@ fn dispatch(config: &Config, command: Command) -> Result<Dispatched> {
         }
         Command::Profile(ProfileCommand::NewTab(args)) => {
             let profile = profile(config, &args.profile)?;
-            let port = match current_port(&profile).filter(|port| is_devtools_ready(*port)) {
-                Some(port) => port,
-                None => {
-                    ensure_daemon(&profile)?;
-                    current_port(&profile)
-                        .filter(|port| is_devtools_ready(*port))
-                        .ok_or_else(|| {
-                            target(format!(
-                                "Chrome for profile {} did not become ready",
-                                profile.name
-                            ))
-                        })?
-                }
-            };
+            let port = ready_chrome_port(&profile)?;
             let (id, url, title) = crate::cdp::new_target(port, &args.url)?;
             done(
                 "new-tab",
@@ -390,6 +377,51 @@ fn dispatch(config: &Config, command: Command) -> Result<Dispatched> {
             )
         }
     }
+}
+
+fn wait_ready_port(profile: &Profile, timeout: std::time::Duration) -> Option<u16> {
+    let started = std::time::Instant::now();
+    loop {
+        if let Some(port) = current_port(profile).filter(|port| is_devtools_ready(*port)) {
+            return Some(port);
+        }
+        if started.elapsed() >= timeout {
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+}
+
+fn ready_chrome_port(profile: &Profile) -> Result<u16> {
+    if let Some(port) = wait_ready_port(profile, std::time::Duration::from_secs(2)) {
+        return Ok(port);
+    }
+    ensure_daemon(profile)?;
+    if let Some(port) = wait_ready_port(profile, std::time::Duration::from_secs(20)) {
+        return Ok(port);
+    }
+    // The daemon can be running while its Chrome is gone; a fresh daemon
+    // starts Chrome again. Recycle it only when no session is active, so
+    // other agents are not cut off.
+    let status = daemon_status(profile)?;
+    let active = status
+        .get("ActiveSessions")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0);
+    if active > 0 {
+        return Err(target(format!(
+            "Chrome for profile {} is unreachable and {active} session(s) are active; not restarting the daemon under them",
+            profile.name
+        )));
+    }
+    let _ = stop_daemon(profile, true);
+    ensure_daemon(profile)?;
+    wait_ready_port(profile, std::time::Duration::from_secs(20)).ok_or_else(|| {
+        target(format!(
+            "Chrome for profile {} did not become ready",
+            profile.name
+        ))
+    })
 }
 
 fn profile(config: &Config, name: &str) -> Result<Profile> {
