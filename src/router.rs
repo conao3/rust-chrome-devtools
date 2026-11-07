@@ -1727,6 +1727,8 @@ pub(crate) fn is_native_tool(name: &str) -> bool {
             | "wait_for_js"
             | "click_at"
             | "click_selector"
+            | "click_text"
+            | "list_clickables"
             | "dispatch_key"
             | "set_file_input"
             | "type_into"
@@ -1799,6 +1801,30 @@ fn native_tool_defs() -> Vec<serde_json::Value> {
                     "selector": {"type": "string", "description": "CSS selector; prefix iframe selectors with >>> to reach inside iframes, e.g. iframe#a >>> input"}
                 },
                 "required": ["selector"]
+            }
+        }),
+        serde_json::json!({
+            "name": "click_text",
+            "description": "Daemon-native: click a visible clickable element (link, button, input, ...) chosen by its visible text or aria-label, resolved in the page at call time, so no snapshot uid is needed. Top frame only; for elements inside iframes use click_selector. If several elements match, the error lists them with the numbers list_clickables shows; pass index to pick one.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "text": {"type": "string", "description": "visible text or aria-label to match; case and whitespace are normalized"},
+                    "exact": {"type": "boolean", "description": "match the whole label instead of a substring (default false)"},
+                    "index": {"type": "number", "description": "1-based number from list_clickables, to disambiguate when text matches several elements"}
+                },
+                "required": ["text"]
+            }
+        }),
+        serde_json::json!({
+            "name": "list_clickables",
+            "description": "Daemon-native: list the visible clickable elements of the top frame (links, buttons, inputs, ...) as compact numbered lines, without a full snapshot. The numbers are the index values click_text accepts. Top frame only.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "filter": {"type": "string", "description": "only list elements whose label contains this text"}
+                },
+                "required": []
             }
         }),
         serde_json::json!({
@@ -2038,6 +2064,25 @@ fn run_native_tool(
                 .ok_or_else(|| "click_selector requires 'selector'".to_string())?;
             let (x, y) = cdp::click_selector(port, target_id, selector)?;
             Ok(format!("clicked {selector} at ({x:.0}, {y:.0})"))
+        }
+        "click_text" => {
+            let text = arguments
+                .get("text")
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| "click_text requires 'text'".to_string())?;
+            let exact = arguments
+                .get("exact")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false);
+            let index = arguments
+                .get("index")
+                .and_then(|value| value.as_u64())
+                .map(|n| n as usize);
+            cdp::click_text(port, target_id, text, exact, index)
+        }
+        "list_clickables" => {
+            let filter = arguments.get("filter").and_then(|value| value.as_str());
+            cdp::list_clickables(port, target_id, filter)
         }
         "dispatch_key" => {
             let key = arguments

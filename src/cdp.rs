@@ -623,6 +623,207 @@ pub(crate) fn click_selector(
     Ok((x, y))
 }
 
+/// The visible clickable elements of the top frame, in document order.
+/// One collection serves both click_text and list_clickables, so the
+/// 1-based numbers list_clickables prints are the indexes click_text
+/// resolves against. Resolving at call time keeps clicks independent of
+/// snapshot uids, which change on every snapshot.
+const CLICKABLES_FN: &str = r#"() => {
+  const els = [];
+  const seen = new Set();
+  for (const el of document.querySelectorAll('a, button, input, select, textarea, summary, [role="button"], [role="link"], [role="menuitem"], [role="tab"], [role="checkbox"], [role="radio"], [onclick]')) {
+    if (seen.has(el)) continue;
+    seen.add(el);
+    const style = getComputedStyle(el);
+    const rect = el.getBoundingClientRect();
+    if (style.display === 'none' || style.visibility === 'hidden' || rect.width === 0 || rect.height === 0) continue;
+    els.push(el);
+  }
+  return els;
+}"#;
+
+const CLICKABLE_DESCRIBE_JS: &str = r#"el => {
+  let label = (el.innerText || '').trim().replace(/\s+/g, ' ');
+  if (!label) label = (el.getAttribute('aria-label') || '').trim();
+  if (!label && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA')) label = el.value || el.placeholder || '';
+  if (!label) label = (el.getAttribute('title') || '').trim();
+  return {
+    tag: el.tagName.toLowerCase(),
+    type: el.getAttribute('type') || '',
+    label: label.slice(0, 80),
+    href: el.tagName === 'A' ? (el.getAttribute('href') || '') : '',
+    disabled: !!el.disabled,
+  };
+}"#;
+
+fn collect_clickables(client: &mut CdpClient) -> Result<Vec<Value>, String> {
+    let expression = format!("({CLICKABLES_FN})().map({CLICKABLE_DESCRIBE_JS})");
+    let value = evaluate_value(client, &expression)?;
+    Ok(value.as_array().cloned().unwrap_or_default())
+}
+
+fn clickable_str<'a>(clickable: &'a Value, key: &str) -> &'a str {
+    clickable.get(key).and_then(|v| v.as_str()).unwrap_or("")
+}
+
+fn clickable_disabled(clickable: &Value) -> bool {
+    clickable.get("disabled").and_then(|v| v.as_bool()) == Some(true)
+}
+
+pub(crate) fn format_clickable(index: usize, clickable: &Value) -> String {
+    let tag = clickable_str(clickable, "tag");
+    let ty = clickable_str(clickable, "type");
+    let kind = if ty.is_empty() {
+        tag.to_string()
+    } else {
+        format!("{tag} type={ty}")
+    };
+    let mut line = format!(
+        "{}. [{}] \"{}\"",
+        index + 1,
+        kind,
+        clickable_str(clickable, "label")
+    );
+    let href = clickable_str(clickable, "href");
+    if !href.is_empty() {
+        line.push_str(&format!(" -> {href}"));
+    }
+    if clickable_disabled(clickable) {
+        line.push_str(" (disabled)");
+    }
+    line
+}
+
+fn normalize_label(text: &str) -> String {
+    text.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+pub(crate) fn label_matches(label: &str, query: &str, exact: bool) -> bool {
+    let label = normalize_label(label);
+    let query = normalize_label(query);
+    if exact {
+        label == query
+    } else {
+        label.contains(&query)
+    }
+}
+
+pub(crate) fn list_clickables(
+    port: u16,
+    target_id: &str,
+    filter: Option<&str>,
+) -> Result<String, String> {
+    let mut client = connect_page_client(port, target_id)?;
+    let candidates = collect_clickables(&mut client)?;
+    let mut lines = Vec::new();
+    let mut matched = 0;
+    for (index, clickable) in candidates.iter().enumerate() {
+        if let Some(filter) = filter {
+            if !label_matches(clickable_str(clickable, "label"), filter, false) {
+                continue;
+            }
+        }
+        matched += 1;
+        if lines.len() < 100 {
+            lines.push(format_clickable(index, clickable));
+        }
+    }
+    if lines.is_empty() {
+        return Ok(match filter {
+            Some(filter) => {
+                format!(
+                    "no clickable elements match \"{filter}\" ({})",
+                    candidates.len()
+                )
+            }
+            None => "no clickable elements on the page".to_string(),
+        });
+    }
+    let mut out = lines.join("\n");
+    if matched > lines.len() {
+        out.push_str(&format!("\n... and {} more", matched - lines.len()));
+    }
+    Ok(out)
+}
+
+pub(crate) fn click_text(
+    port: u16,
+    target_id: &str,
+    text: &str,
+    exact: bool,
+    index: Option<usize>,
+) -> Result<String, String> {
+    let mut client = connect_page_client(port, target_id)?;
+    let candidates = collect_clickables(&mut client)?;
+    let matches: Vec<usize> = candidates
+        .iter()
+        .enumerate()
+        .filter(|(_, clickable)| {
+            !clickable_disabled(clickable)
+                && label_matches(clickable_str(clickable, "label"), text, exact)
+        })
+        .map(|(index, _)| index)
+        .collect();
+    let chosen = match (matches.len(), index) {
+        (0, _) => {
+            return Err(format!(
+                "no clickable element matches \"{text}\" ({} clickable elements on the page)",
+                candidates.len()
+            ));
+        }
+        (1, _) => matches[0],
+        (_, Some(number)) => {
+            let idx = number.saturating_sub(1);
+            if !matches.contains(&idx) {
+                return Err(format!(
+                    "index {number} does not match \"{text}\"; matching numbers: {}",
+                    matches
+                        .iter()
+                        .map(|i| (i + 1).to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+            idx
+        }
+        (_, None) => {
+            let listing = matches
+                .iter()
+                .map(|&i| format_clickable(i, &candidates[i]))
+                .collect::<Vec<_>>()
+                .join("\n");
+            return Err(format!(
+                "\"{text}\" matches {} clickable elements; pass 'index' to choose one:\n{listing}",
+                matches.len()
+            ));
+        }
+    };
+    let expression = format!(
+        "(() => {{ const els = ({CLICKABLES_FN})(); const el = els[{chosen}]; \
+         if (!el) return null; \
+         el.scrollIntoView({{ block: 'center', inline: 'center', behavior: 'instant' }}); \
+         const r = el.getBoundingClientRect(); \
+         return {{ x: r.x + r.width / 2, y: r.y + r.height / 2 }}; }})()"
+    );
+    let point = evaluate_value(&mut client, &expression)?;
+    let x = point
+        .get("x")
+        .and_then(|v| v.as_f64())
+        .ok_or_else(|| format!("clickable element {} is no longer on the page", chosen + 1))?;
+    let y = point
+        .get("y")
+        .and_then(|v| v.as_f64())
+        .ok_or_else(|| format!("clickable element {} is no longer on the page", chosen + 1))?;
+    dispatch_click(&mut client, x, y)?;
+    Ok(format!(
+        "clicked \"{}\" at ({x:.0}, {y:.0})",
+        clickable_str(&candidates[chosen], "label")
+    ))
+}
+
 fn key_info(key: &str) -> (String, i64, Option<String>) {
     // Maps to (code, windowsVirtualKeyCode, text). text is set only for keys that produce character
     // input.

@@ -1,4 +1,5 @@
 use crate::batch::*;
+use crate::cdp::*;
 use crate::cli::*;
 use crate::config::*;
 use crate::daemon::*;
@@ -933,5 +934,25 @@ fn systemd_scope_unit_name_formats_profile_role_and_nonce() {
     assert_eq!(
         systemd_scope_unit_name("agent.001", "chrome", 42),
         "chrome-devtools-agent_001-chrome-42.scope"
+    );
+}
+
+#[test]
+fn label_matches_normalizes_case_and_whitespace() {
+    assert!(label_matches("  Sign   In ", "sign in", false));
+    assert!(label_matches("Sign in", "SIGN", false));
+    assert!(!label_matches("Sign in", "sign in now", false));
+    assert!(label_matches("Sign in", "sign in", true));
+    assert!(!label_matches("Sign in", "sign", true));
+}
+
+#[test]
+fn format_clickable_includes_kind_label_href_and_disabled() {
+    let link = serde_json::json!({"tag": "a", "type": "", "label": "Pricing", "href": "/pricing", "disabled": false});
+    assert_eq!(format_clickable(0, &link), "1. [a] \"Pricing\" -> /pricing");
+    let submit = serde_json::json!({"tag": "input", "type": "submit", "label": "Send", "href": "", "disabled": true});
+    assert_eq!(
+        format_clickable(2, &submit),
+        "3. [input type=submit] \"Send\" (disabled)"
     );
 }
