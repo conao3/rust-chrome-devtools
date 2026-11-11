@@ -6,7 +6,7 @@ workflows:
     '.github/workflows/bump-chrome-devtools-mcp.yml':
         - 'actions/checkout@v7.0.1'
         - 'cachix/install-nix-action@v31.11.3'
-        - 'peter-evans/create-pull-request@v8.1.1'
+        - 'peter-evans/create-pull-request@v8.1.2'
     '.github/workflows/ci.yml':
         - 'actions/cache@v6.1.0'
         - 'actions/checkout@v7.0.1'
@@ -37,9 +37,9 @@ dependencies:
         commit: 'sha1-b725eda525362e7cf34af9a7243cac1e3f01a7ec'
         owner_id: 1940490
         repo_id: 260749683
-    'peter-evans/create-pull-request@v8.1.1':
-        ref: 'v8.1.1'
-        commit: 'sha1-5f6978faf089d4d20b00c7766989d076bb2fc7f1'
+    'peter-evans/create-pull-request@v8.1.2':
+        ref: 'v8.1.2'
+        commit: 'sha1-15733dbdfeedb4f7fdb73d13c6f5ac83b710fab8'
         owner_id: 18365890
         repo_id: 197176365
     'rust-lang/crates-io-auth-action@v1.0.6':
