@@ -153,7 +153,7 @@ A session-owned page is idle-managed with the session.
 
 - When the session expires, pages created by the daemon are closed when Chrome has another tab.
 - Pages attached from an existing tab stay open when the session expires.
-- `session close-session` closes daemon-created pages when they are idle.
+- `session close-session` closes daemon-created pages when they are idle. The daemon answers once the session is dropped and the page close is queued behind the MCP requests already queued, so the command does not wait for a long tool call of another session.
 - `daemon stop-daemon` keeps Chrome ownership behavior unchanged: stopping the daemon ends in-memory sessions and leaves Chrome cleanup to existing profile/daemon commands.
 
 The page close policy should preserve the last browser tab rule used by MCP's `close_page`: the last open page remains open.

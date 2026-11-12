@@ -127,7 +127,7 @@ Output is JSON with PascalCase keys. Exit codes: `0` success, `252` a syntax or 
 
 `session create-session` starts the profile daemon when needed and mints a new in-memory session id. The session expires after 2 hours of inactivity or when the daemon stops. Output looks like `{"SessionId": "sess-xxxxxxxxxxxxxxxx", "Created": <ts>, "LastUsed": <ts>, "Owned": false, ...}`; take the id with `jq -r .SessionId`.
 
-`session list-sessions` prints `{"Sessions": [...]}` with one object per active session (`SessionId`, `Owned`, `OwnerPid`, `Page`, `PageUrl`, `TargetId`, ...). `session close-session` drops the named session when it is idle and closes its daemon-created page when Chrome has another tab.
+`session list-sessions` prints `{"Sessions": [...]}` with one object per active session (`SessionId`, `Owned`, `OwnerPid`, `Page`, `PageUrl`, `TargetId`, ...). `session close-session` drops the named session when it is idle and answers right away; the daemon then closes its daemon-created page when Chrome has another tab, after the MCP requests already queued, so a request sent after the answer sees the page closed.
 
 `mcp list-tools` starts the profile daemon when needed, queries `tools/list` through that daemon, and prints `{"Tools": [...]}` with the MCP tool objects as MCP returns them.
 
