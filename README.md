@@ -107,7 +107,7 @@ The CLI takes input in the AWS CLI grammar: `chrome-devtools [global options] <c
 
 ```sh
 chrome-devtools session create-session --profile default
-chrome-devtools session list-sessions --profile default
+chrome-devtools session list-sessions [--profile default]
 chrome-devtools session close-session --profile default --session-id <id>
 chrome-devtools mcp list-tools --profile default
 chrome-devtools mcp run-batch --profile default --session-id <id> --steps file://steps.json
@@ -115,7 +115,7 @@ chrome-devtools mcp forward-requests --profile default --session-id <id>
 chrome-devtools mcp list-direct-tools --profile default
 chrome-devtools mcp forward-direct-requests --profile default
 chrome-devtools daemon start-daemon --profile default
-chrome-devtools daemon get-daemon-status --profile default
+chrome-devtools daemon get-daemon-status [--profile default]
 chrome-devtools daemon stop-daemon --profile default
 chrome-devtools profile list-profiles
 chrome-devtools profile get-profile-status --profile default
@@ -127,13 +127,13 @@ Output is JSON with PascalCase keys. Exit codes: `0` success, `252` a syntax or 
 
 `session create-session` starts the profile daemon when needed and mints a new in-memory session id. The session expires after 2 hours of inactivity or when the daemon stops. Output looks like `{"SessionId": "sess-xxxxxxxxxxxxxxxx", "Created": <ts>, "LastUsed": <ts>, "Owned": false, ...}`; take the id with `jq -r .SessionId`.
 
-`session list-sessions` prints `{"Sessions": [...]}` with one object per active session (`SessionId`, `Owned`, `OwnerPid`, `Page`, `PageUrl`, `TargetId`, ...). `session close-session` drops the named session when it is idle and answers right away; the daemon then closes its daemon-created page when Chrome has another tab, after the MCP requests already queued, so a request sent after the answer sees the page closed.
+`session list-sessions` prints `{"Sessions": [...]}` with one object per active session (`Profile`, `SessionId`, `Owned`, `OwnerPid`, `Page`, `PageUrl`, `TargetId`, ...). Without `--profile` it lists the sessions of every profile in the config file. `session close-session` drops the named session when it is idle and answers right away; the daemon then closes its daemon-created page when Chrome has another tab, after the MCP requests already queued, so a request sent after the answer sees the page closed.
 
 `mcp list-tools` starts the profile daemon when needed, queries `tools/list` through that daemon, and prints `{"Tools": [...]}` with the MCP tool objects as MCP returns them.
 
 `mcp forward-requests` binds the given session, forwards stdin JSON-RPC lines to the daemon-owned `chrome-devtools-mcp` process, and streams the JSON-RPC responses to stdout as they arrive (`--output` does not apply to the stream). The session is held for the lifetime of this invocation; other clients can use control commands while the bind is active, and another MCP bind waits up to `CHROME_DEVTOOLS_BIND_TIMEOUT_SECS`. Activity refreshes the session's idle timer.
 
-`daemon get-daemon-status` includes `QueuedMcpRequests`, `MaxControlLatencyMs`, and `MaxForwardLatencyMs` for the recent diagnostic window, `Chrome` (`ready`, `unreachable` or `unknown`) with `ChromePort`, and `Respawns`, `AbnormalExits` and `LastEvent` from the health file. The default window is 600 seconds and can be changed with `CHROME_DEVTOOLS_DIAGNOSTIC_WINDOW_SECS`. When Chrome is `unreachable`, restart the daemon to reattach it.
+`daemon get-daemon-status` without `--profile` prints `{"Daemons": [...]}` with the status of every profile in the config file. The status includes `QueuedMcpRequests`, `MaxControlLatencyMs`, and `MaxForwardLatencyMs` for the recent diagnostic window, `Chrome` (`ready`, `unreachable` or `unknown`) with `ChromePort`, and `Respawns`, `AbnormalExits` and `LastEvent` from the health file. The default window is 600 seconds and can be changed with `CHROME_DEVTOOLS_DIAGNOSTIC_WINDOW_SECS`. When Chrome is `unreachable`, restart the daemon to reattach it.
 
 `upload_file` first uses `chrome-devtools-mcp`. When MCP reports that direct upload and file chooser triggering both failed, the daemon sets the page's `input[type=file]` through Chrome DevTools Protocol as a fallback and logs `upload_file_fallback`.
 

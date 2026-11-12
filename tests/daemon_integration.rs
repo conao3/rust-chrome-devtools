@@ -2250,6 +2250,42 @@ fn session_close_closes_daemon_created_page() {
 }
 
 #[test]
+fn list_sessions_and_daemon_status_cover_every_profile_without_profile() {
+    let mut env = TestEnv::new("allprofiles");
+    env.start_daemon();
+    let session = env.create_session();
+
+    let (ok, value, output) = env.run_json(&["session", "list-sessions"]);
+    assert!(ok, "session list-sessions failed: {output}");
+    let sessions = value["Sessions"].as_array().unwrap();
+    assert!(
+        sessions
+            .iter()
+            .any(|state| state["SessionId"] == session.as_str() && state["Profile"] == "default"),
+        "sessions: {value}"
+    );
+
+    let (ok, value, output) = env.run_json(&["session", "list-sessions", "--profile", "default"]);
+    assert!(ok, "session list-sessions failed: {output}");
+    assert_eq!(value["Sessions"][0]["Profile"], "default", "{value}");
+
+    let (ok, value, output) = env.run_json(&["daemon", "get-daemon-status"]);
+    assert!(ok, "daemon get-daemon-status failed: {output}");
+    let daemons = value["Daemons"].as_array().unwrap();
+    assert_eq!(daemons.len(), 1, "{value}");
+    assert_eq!(daemons[0]["Profile"], "default", "{value}");
+    assert_eq!(daemons[0]["Daemon"], "ready", "{value}");
+
+    let (ok, value, output) =
+        env.run_json(&["daemon", "get-daemon-status", "--profile", "default"]);
+    assert!(ok, "daemon get-daemon-status failed: {output}");
+    assert_eq!(value["Daemon"], "ready", "{value}");
+
+    let (ok, output) = env.run_cli(&["session", "create-session"]);
+    assert!(!ok && output.contains("--profile"), "{output}");
+}
+
+#[test]
 fn session_close_answers_while_another_session_holds_the_mcp_process() {
     let mut env = TestEnv::new_with_options(
         "closebusy",
