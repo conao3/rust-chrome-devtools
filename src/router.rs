@@ -1043,6 +1043,14 @@ impl RouterHandle {
         if pages.is_empty() {
             return Ok(());
         }
+        let response_rx = self.queue_close_pages(pages)?;
+        wait_close_pages(response_rx)
+    }
+
+    pub(crate) fn queue_close_pages(
+        &self,
+        pages: Vec<PageCleanup>,
+    ) -> Result<mpsc::Receiver<Result<(), String>>, DaemonError> {
         let (response_tx, response_rx) = mpsc::channel();
         self.queued.fetch_add(1, Ordering::SeqCst);
         if let Err(error) = self.sender.send(RouterRequest::ClosePages {
@@ -1054,14 +1062,7 @@ impl RouterHandle {
                 "failed to queue MCP page cleanup: {error}"
             )));
         }
-        response_rx
-            .recv()
-            .map_err(|error| {
-                DaemonError::Fatal(format!(
-                    "failed to receive MCP page cleanup response: {error}"
-                ))
-            })?
-            .map_err(DaemonError::Fatal)
+        Ok(response_rx)
     }
 
     pub(crate) fn queued_requests(&self) -> usize {
@@ -1093,6 +1094,17 @@ impl RouterHandle {
                 max_forward_latency_ms: 0,
             })
     }
+}
+
+fn wait_close_pages(response_rx: mpsc::Receiver<Result<(), String>>) -> Result<(), DaemonError> {
+    response_rx
+        .recv()
+        .map_err(|error| {
+            DaemonError::Fatal(format!(
+                "failed to receive MCP page cleanup response: {error}"
+            ))
+        })?
+        .map_err(DaemonError::Fatal)
 }
 
 pub(crate) const PAGE_SCOPED_TOOLS: &[&str] = &[
@@ -3326,10 +3338,14 @@ pub(crate) fn handle_control_command(
             let result = lock_sessions(sessions)?.close(&id);
             match result {
                 Ok(cleanup) => {
-                    if let Some(cleanup) = cleanup {
-                        router.close_pages(vec![cleanup])?;
-                    }
+                    let pending = cleanup
+                        .map(|cleanup| router.queue_close_pages(vec![cleanup]))
+                        .transpose()?;
                     write_control_line(stream, &format!("closed={id}"))?;
+                    let _ = stream.shutdown(std::net::Shutdown::Both);
+                    if let Some(pending) = pending {
+                        wait_close_pages(pending)?;
+                    }
                 }
                 Err(message) => write_control_line(stream, &format!("error={message}"))?,
             }

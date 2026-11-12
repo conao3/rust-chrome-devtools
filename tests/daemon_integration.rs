@@ -2250,6 +2250,73 @@ fn session_close_closes_daemon_created_page() {
 }
 
 #[test]
+fn session_close_answers_while_another_session_holds_the_mcp_process() {
+    let mut env = TestEnv::new_with_options(
+        "closebusy",
+        None,
+        None,
+        Some(30),
+        None,
+        Some("take_snapshot".to_string()),
+        Some(4),
+    );
+    env.start_daemon();
+    let session = env.create_session();
+    let mut stream = env.connect();
+    bind_stream(&mut stream, &session);
+    let page = selected_page_id(&tool_call(
+        &mut stream,
+        120,
+        "new_page",
+        serde_json::json!({"url": "https://closebusy.test/"}),
+    ));
+    drop(stream);
+
+    let busy = env.create_session();
+    let mut busy_stream = env.connect();
+    bind_stream(&mut busy_stream, &busy);
+    let snapshot = thread::spawn(move || {
+        tool_call(
+            &mut busy_stream,
+            121,
+            "take_snapshot",
+            serde_json::json!({}),
+        )
+    });
+    thread::sleep(Duration::from_millis(500));
+
+    let started = Instant::now();
+    let output = env
+        .cli()
+        .env("CHROME_DEVTOOLS_CONTROL_TIMEOUT_SECS", "2")
+        .args([
+            "session",
+            "close-session",
+            "--profile",
+            "default",
+            "--session-id",
+            &session,
+        ])
+        .output()
+        .unwrap();
+    let elapsed = started.elapsed();
+    assert!(
+        output.status.success(),
+        "close-session failed after {elapsed:?}: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(elapsed < Duration::from_secs(2), "elapsed: {elapsed:?}");
+
+    snapshot.join().unwrap();
+    let probe = env.create_session();
+    let mut probe_stream = env.connect();
+    bind_stream(&mut probe_stream, &probe);
+    let pages = tool_call(&mut probe_stream, 122, "list_pages", serde_json::json!({}));
+    assert!(!page_ids(&pages).contains(&page), "pages: {pages}");
+}
+
+#[test]
 fn session_close_keeps_attached_page() {
     let mut env = TestEnv::new("closeattached");
     env.start_daemon();
