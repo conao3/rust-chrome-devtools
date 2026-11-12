@@ -96,7 +96,7 @@ chrome-devtools session create-session --profile conao3
 # Capture the id for later use
 SESSION=$(chrome-devtools session create-session --profile conao3 | jq -r .SessionId)
 
-# Inspect active sessions ({"Sessions": [...]}; TargetId is the session's tab)
+# Inspect active sessions ({"Sessions": [...]}; TargetId is the session's tab; without --profile, every profile)
 chrome-devtools session list-sessions --profile conao3
 
 # Drop a session when finished
@@ -236,6 +236,7 @@ chrome-devtools daemon get-daemon-status --profile conao3
 # {"Profile": "conao3", "Daemon": "ready", "Version": "1.6.0", "Sessions": 1, "ActiveSessions": 0, "Pages": [2],
 #  "QueuedMcpRequests": 0, "MaxControlLatencyMs": 0, "MaxForwardLatencyMs": 42, "DiagnosticWindowSecs": 600,
 #  "Chrome": "ready", "ChromePort": 46071, "Pid": ..., "Socket": ..., "AbnormalExits": 0, "Respawns": 0, "LastEvent": ...}
+# Without --profile: {"Daemons": [<the status above for every profile>]}
 ```
 
 `Respawns` counts daemon-managed MCP respawns. After a respawn, mint a new session. `ChromePort` is the DevTools port of the profile's Chrome (also in `profile get-profile-status` as `Port`).

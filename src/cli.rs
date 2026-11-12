@@ -94,9 +94,9 @@ enum SessionCommand {
     /// Start the profile daemon if needed and mint a new session. Sessions expire after 2 hours idle (24 hours without a tab)
     #[command(name = "create-session")]
     Create(ProfileArgs),
-    /// List the sessions held by the profile daemon (empty when the daemon is not running)
+    /// List the sessions held by the profile daemon (empty when the daemon is not running); every profile without --profile
     #[command(name = "list-sessions")]
-    List(ProfileArgs),
+    List(ProfileScopeArgs),
     /// Drop a session and close its daemon-created tab (Chrome's last tab is kept)
     #[command(name = "close-session")]
     Close(SessionArgs),
@@ -126,9 +126,9 @@ enum DaemonCommand {
     /// Start the background daemon for the profile, or report the one already running
     #[command(name = "start-daemon")]
     Start(ProfileArgs),
-    /// Show the daemon's version, sessions, tabs, queue, latency, Chrome reachability, and exit history
+    /// Show the daemon's version, sessions, tabs, queue, latency, Chrome reachability, and exit history; every profile without --profile
     #[command(name = "get-daemon-status")]
-    Status(ProfileArgs),
+    Status(ProfileScopeArgs),
     /// Stop the daemon. Refused while sessions exist unless --force (their sessions are destroyed)
     #[command(name = "stop-daemon")]
     Stop(ForceArgs),
@@ -158,6 +158,13 @@ struct ProfileArgs {
     /// Profile name from ~/.config/chrome-devtools/config.toml
     #[arg(long)]
     profile: String,
+}
+
+#[derive(Args)]
+struct ProfileScopeArgs {
+    /// Profile name from ~/.config/chrome-devtools/config.toml (every profile when omitted)
+    #[arg(long)]
+    profile: Option<String>,
 }
 
 #[derive(Args)]
@@ -260,7 +267,7 @@ fn dispatch(config: &Config, command: Command) -> Result<Dispatched> {
         ),
         Command::Session(SessionCommand::List(args)) => done(
             "list-sessions",
-            list_sessions(&profile(config, &args.profile)?)?,
+            all_sessions(&profiles_in_scope(config, args.profile.as_deref())?)?,
         ),
         Command::Session(SessionCommand::Close(args)) => done(
             "close-session",
@@ -320,7 +327,17 @@ fn dispatch(config: &Config, command: Command) -> Result<Dispatched> {
         }
         Command::Daemon(DaemonCommand::Status(args)) => done(
             "get-daemon-status",
-            daemon_status(&profile(config, &args.profile)?)?,
+            match args.profile.as_deref() {
+                Some(name) => daemon_status(&profile(config, name)?)?,
+                None => {
+                    let daemons = config
+                        .profiles
+                        .iter()
+                        .map(daemon_status)
+                        .collect::<Result<Vec<_>>>()?;
+                    json!({ "Daemons": daemons })
+                }
+            },
         ),
         Command::Daemon(DaemonCommand::Stop(args)) => {
             let profile = profile(config, &args.profile)?;
@@ -428,6 +445,13 @@ fn profile(config: &Config, name: &str) -> Result<Profile> {
     find_profile(config, name).map_err(target)
 }
 
+fn profiles_in_scope(config: &Config, name: Option<&str>) -> Result<Vec<Profile>> {
+    match name {
+        Some(name) => Ok(vec![profile(config, name)?]),
+        None => Ok(config.profiles.clone()),
+    }
+}
+
 fn run_batch(config: &Config, args: RunBatchArgs) -> Result<Dispatched> {
     let steps = parse_steps(&args.steps)?;
     let options = BatchOptions {
@@ -494,17 +518,30 @@ fn create_session(profile: &Profile) -> Result<Value> {
     Ok(session_value(&control_line(profile, "session_create")?))
 }
 
-fn list_sessions(profile: &Profile) -> Result<Value> {
+fn all_sessions(profiles: &[Profile]) -> Result<Value> {
+    let mut sessions = Vec::new();
+    for profile in profiles {
+        sessions.extend(list_sessions(profile)?);
+    }
+    Ok(json!({ "Sessions": sessions }))
+}
+
+fn list_sessions(profile: &Profile) -> Result<Vec<Value>> {
     if !is_daemon_ready(profile)? {
-        return Ok(json!({ "Sessions": [] }));
+        return Ok(Vec::new());
     }
     let response = send_daemon_control(profile, "session_list")?;
-    let sessions: Vec<Value> = response
+    Ok(response
         .lines()
         .filter(|line| !line.trim().is_empty())
-        .map(session_value)
-        .collect();
-    Ok(json!({ "Sessions": sessions }))
+        .map(|line| {
+            let mut session = session_value(line);
+            if let Value::Object(map) = &mut session {
+                map.insert("Profile".to_string(), json!(profile.name));
+            }
+            session
+        })
+        .collect())
 }
 
 fn close_session(profile: &Profile, session_id: &str) -> Result<Value> {

@@ -45,7 +45,7 @@ Sessions are minted, listed, and dropped over the daemon control protocol:
 
 ```text
 chrome-devtools session create-session --profile <name>
-chrome-devtools session list-sessions --profile <name>
+chrome-devtools session list-sessions [--profile <name>]
 chrome-devtools session close-session --profile <name> --session-id <id>
 ```
 
