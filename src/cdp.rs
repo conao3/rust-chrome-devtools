@@ -1053,6 +1053,30 @@ fn list_page_targets(port: u16) -> Result<Vec<PageTarget>, String> {
         .collect())
 }
 
+/// Opens `url` in a new window without activating it (`Target.createTarget` with `newWindow` and
+/// `background`). Returns the target id.
+pub(crate) fn create_background_window(port: u16, url: &str) -> Result<String, String> {
+    let version = parse_cdp_value(&http_get(port, "/json/version")?, "/json/version response")?;
+    let websocket_path = version
+        .get("webSocketDebuggerUrl")
+        .and_then(|value| value.as_str())
+        .and_then(|websocket| websocket.split_once("://"))
+        .and_then(|(_, rest)| rest.split_once('/'))
+        .map(|(_, path)| format!("/{path}"))
+        .ok_or_else(|| "/json/version has no browser webSocketDebuggerUrl".to_string())?;
+    let mut client = CdpClient::connect(port, &websocket_path)?;
+    let response = client.call(serde_json::json!({
+        "method": "Target.createTarget",
+        "params": { "url": url, "newWindow": true, "background": true }
+    }))?;
+    response
+        .get("result")
+        .and_then(|result| result.get("targetId"))
+        .and_then(|target_id| target_id.as_str())
+        .map(|target_id| target_id.to_string())
+        .ok_or_else(|| format!("Target.createTarget returned no targetId: {response}"))
+}
+
 pub(crate) fn new_target(port: u16, url: &str) -> Result<(String, String, String), String> {
     let path = format!("/json/new?{}", encode_new_target_url(url));
     let response = http_put(port, &path)?;

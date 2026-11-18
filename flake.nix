@@ -31,6 +31,8 @@
           ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
             pkgs.google-chrome
             pkgs.procps
+            pkgs.xprop
+            pkgs.xdotool
           ];
         in
         {

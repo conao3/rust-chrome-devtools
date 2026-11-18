@@ -193,6 +193,10 @@ pub(crate) fn run_daemon(profile: &Profile) -> Result<(), String> {
         })?;
     }
 
+    match crate::focus::start_focus_guard(profile) {
+        Ok(()) => eprintln!("focus guard: active"),
+        Err(reason) => eprintln!("focus guard: inactive ({reason})"),
+    }
     let mcp_runtime = start_mcp_runtime(profile)?;
     let runtime = DaemonRuntimeGuard::new(socket_path.clone(), pid_path.clone());
     let sessions: SharedSessions =

@@ -74,7 +74,7 @@ Chrome is always launched with `--disable-features=PasswordLeakDetection`: the n
 
 ## Daemon-native tools
 
-Besides forwarding the chrome-devtools-mcp tool set, the daemon implements ten tools of its own directly over CDP (they are listed in `tools/list` and called like any MCP tool). They run on the session's page without the MCP process, so they keep working while a heavy MCP tool is in flight and never trigger an accessibility snapshot:
+Besides forwarding the chrome-devtools-mcp tool set, the daemon implements tools of its own directly over CDP (they are listed in `tools/list` and called like any MCP tool). They run on the session's page without the MCP process, so they keep working while a heavy MCP tool is in flight and never trigger an accessibility snapshot:
 
 - `goto {url, waitSelector?, waitExpression?, timeout?, interval?}`: navigate the session page without foregrounding Chrome and wait in the same call. With no explicit wait condition it waits for `document.readyState === 'complete'`. A wait that times out reports the current URL, title, `readyState` and the condition's value.
 - `screenshot_quiet {filePath, format?, quality?}`: capture the visible viewport directly with `Page.captureScreenshot`, bypassing the MCP queue and leaving the user's active tab alone. `filePath` must be absolute and under `$HOME` or the OS temp directory.
@@ -86,6 +86,7 @@ Besides forwarding the chrome-devtools-mcp tool set, the daemon implements ten t
 - `dispatch_key {key, modifiers?}`: single key press (Escape, Enter, arrows, single characters; modifiers bitmask Alt=1 Ctrl=2 Meta=4 Shift=8).
 - `set_file_input {selector, filePaths}`: attach files to the `input[type=file]` matched by a selector through `DOM.setFileInputFiles`. No snapshot and no file chooser, so it picks the exact input on pages that have several and never crosses into another session's page. The element is resolved through `Runtime.evaluate`, so it works on pages with a large DOM (Gmail, for one). Paths must be absolute and under `$HOME` or the OS temp directory.
 - `print_pdf_quiet {filePath, landscape?, printBackground?, scale?}`: save the session page as a PDF with `Page.printToPDF`, without foregrounding the tab. Use it to keep invoices, receipts and emails as they were rendered. Same path rules as `screenshot_quiet`.
+- `new_window {url?}`: open the URL in a new Chrome window without activating it (`Target.createTarget` with `newWindow` and `background`) and make it the session page. Use it only when the page must be the active tab of its window, such as a browser extension's inline menu. A click on that page makes Chrome activate the window; the focus guard gives the focus back.
 - `close_page_quiet {}`: close the session's own tab through the DevTools HTTP endpoint. `close_page` queues behind the MCP tool mutex, so it cannot reach a tab that is holding the mutex open (a JavaScript dialog, a tool that never returns). Closing that tab releases the mutex, and the session picks up a fresh tab on its next call.
 
 ## JavaScript dialogs
@@ -100,6 +101,12 @@ If the watcher cannot attach, the daemon logs `dialog_watch_failed` and carries 
 `click_selector`, `set_file_input` and `type_into` reach into iframes with `>>>` in the selector (`iframe#form >>> input[name=email]`, nested as `iframe#a >>> iframe#b >>> input`), for same-origin and cross-origin (out-of-process) iframes alike. A missing element is reported with the frame, its URL and the iframes it contains; `could not focus selector` also says whether the element is hidden, disabled or read-only.
 
 Each session is pinned to the CDP target id of its tab, which stays the same for the life of that tab. Navigation, redirects and SPA route changes alter the URL but not the target, tabs that share a URL are told apart (`new_page` and `select_page` pin the target id), and daemon-native tools never fall back to another tab: if the session's tab is gone they fail with `session page target <id> is gone` instead of acting on somebody else's page. This matters when several agents share one Chrome profile.
+
+## Focus
+
+The daemon keeps the user's foreground window. `new_page` always opens a background tab and `select_page` never brings the page to the front, whatever the arguments say.
+
+On X11 the daemon also runs a focus guard. It watches `_NET_ACTIVE_WINDOW` and `_NET_CLIENT_LIST` of the root window through `xprop -spy`. When a window of this profile's Chrome (matched by the user data directory in `WM_CLASS`) becomes active within 5 seconds of appearing (Chrome launch, a popup opened by the page), or while an input tool (`click_at`, `click_selector`, `click_text`, `dispatch_key`, `type_into`, `click`, `fill`, `press_key`, `upload_file`, ...) is running or returned less than a second ago, it re-activates the previous window with `xdotool windowactivate`. The user clicking an existing Chrome window at any other time is left alone. The Nix package puts `xprop` and `xdotool` on the wrapper's PATH. The daemon log has `focus guard: active` or `focus guard: inactive (<reason>)` at start and one line per restore.
 
 ## Commands
 

@@ -9,6 +9,7 @@ Use `chrome-devtools` when you need browser automation through Chrome DevTools M
 
 ## Core Rules
 
+- Never take the user's foreground window. The daemon opens `new_page` in the background and ignores `bringToFront`; do not open windows with `window.open`. A focus guard on X11 gives the focus back when Chrome takes it (README "Focus").
 - Always choose an explicit profile with `--profile <name>`. Do not rely on an implicit browser instance.
 - The CLI takes the AWS CLI grammar: `chrome-devtools <command> <subcommand> --parameter value`. Output is JSON with PascalCase keys; pick a field with `jq` (`| jq -r .SessionId`). `help` works at every level (`chrome-devtools mcp run-batch help`). Exit code 252 is a mistake in the invocation or the steps, 254 is a target-side failure (unknown profile, unknown or busy session, refused stop, a batch stopped on an MCP error).
 - **Mint a session before running `mcp run-batch` or `mcp forward-requests`.** Both subcommands require `--session-id <id>` and refuse to start without it. Use `SESSION=$(chrome-devtools session create-session --profile <name> | jq -r .SessionId)` to get an id, then reuse the same id for every related invocation.
@@ -37,7 +38,7 @@ Use `chrome-devtools` when you need browser automation through Chrome DevTools M
 
 ## Daemon-Native Tools (no snapshot required)
 
-The daemon adds ten tools of its own on top of the MCP tool set (they appear in `tools/list` and are called like any other tool). They run over CDP directly on the session's page, bypassing the MCP process — they work even while a heavy MCP tool is still running, and they never trigger an accessibility snapshot, so they are the right choice on huge-DOM pages where `take_snapshot` is impractical.
+The daemon adds tools of its own on top of the MCP tool set (they appear in `tools/list` and are called like any other tool). They run over CDP directly on the session's page, bypassing the MCP process — they work even while a heavy MCP tool is still running, and they never trigger an accessibility snapshot, so they are the right choice on huge-DOM pages where `take_snapshot` is impractical.
 
 Each session is pinned to the CDP target id of its tab. Navigation, redirects, hash changes and SPA route changes alter the URL but not the target, and tabs that share a URL are told apart, because `new_page` and `select_page` pin the tab's target id when the session takes it. These tools never fall back to another tab: when the session's tab is gone they fail with `session page target <id> is gone; create a new session`, and a page that cannot be pinned fails with `could not tell which tab is the session page` (run `select_page` again or create a new session). Several agents can therefore drive one Chrome profile at the same time without stealing each other's tabs.
 
@@ -51,6 +52,7 @@ Each session is pinned to the CDP target id of its tab. Navigation, redirects, h
 - `dispatch_key {key, modifiers?}` — single key press (`Escape`, `Enter`, `Tab`, `ArrowDown`, single characters, ...). Modifiers bitmask: Alt=1, Ctrl=2, Meta=4, Shift=8.
 - `set_file_input {selector, filePaths}` — attach files to the `input[type=file]` matched by the selector via `DOM.setFileInputFiles`. Prefer it over `upload_file` when a page has several file inputs (a cover letter field and a resume field, say) or when no visible button opens a chooser. Works on large-DOM pages such as an open Gmail thread. Paths must be absolute and under `$HOME` or the OS temp directory.
 - `print_pdf_quiet {filePath, landscape?, printBackground?, scale?}` — save the session page as a PDF through `Page.printToPDF`. `printBackground` defaults to true, `scale` is clamped to 0.1-2.0. `filePath` must be absolute and under `$HOME` or the OS temp directory.
+- `new_window {url?}` — open the URL in a new window without activating it and make it the session page. Use it only when the page must be the active tab of its window (a browser extension's inline menu such as 1Password). Everything else works in the session's background tab.
 - `close_page_quiet {}` — close the session's own tab through the DevTools HTTP endpoint. Use it to recover when a JavaScript dialog or a tool that never returns is holding the MCP tool mutex, which is exactly when the MCP `close_page` cannot get through. The session gets a fresh tab on its next call.
 
 The daemon watches each session's tab for JavaScript dialogs and closes them on its own: `alert` and `beforeunload` are accepted, `confirm` and `prompt` are dismissed. Look for `dialog_handled` in the daemon log. A dialog left open holds the MCP tool mutex, so this keeps a page's `confirm()` from stalling every session on the profile.
