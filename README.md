@@ -86,7 +86,7 @@ Besides forwarding the chrome-devtools-mcp tool set, the daemon implements tools
 - `dispatch_key {key, modifiers?}`: single key press (Escape, Enter, arrows, single characters; modifiers bitmask Alt=1 Ctrl=2 Meta=4 Shift=8).
 - `set_file_input {selector, filePaths}`: attach files to the `input[type=file]` matched by a selector through `DOM.setFileInputFiles`. No snapshot and no file chooser, so it picks the exact input on pages that have several and never crosses into another session's page. The element is resolved through `Runtime.evaluate`, so it works on pages with a large DOM (Gmail, for one). Paths must be absolute and under `$HOME` or the OS temp directory.
 - `print_pdf_quiet {filePath, landscape?, printBackground?, scale?}`: save the session page as a PDF with `Page.printToPDF`, without foregrounding the tab. Use it to keep invoices, receipts and emails as they were rendered. Same path rules as `screenshot_quiet`.
-- `new_window {url?}`: open the URL in a new Chrome window without activating it (`Target.createTarget` with `newWindow` and `background`) and make it the session page. Use it only when the page must be the active tab of its window, such as a browser extension's inline menu. A click on that page makes Chrome activate the window; the focus guard gives the focus back.
+- `new_window {url?}`: open the URL in a new Chrome window without activating it (`Target.createTarget` with `newWindow` and `background`) and make it the session page. Use it when a page must be the active tab of a window of its own. A browser extension's inline menu also needs the OS focus, so use a new tab with `select_page {bringToFront: true}` for it (see "Focus").
 - `close_page_quiet {}`: close the session's own tab through the DevTools HTTP endpoint. `close_page` queues behind the MCP tool mutex, so it cannot reach a tab that is holding the mutex open (a JavaScript dialog, a tool that never returns). Closing that tab releases the mutex, and the session picks up a fresh tab on its next call.
 
 ## JavaScript dialogs
@@ -104,9 +104,9 @@ Each session is pinned to the CDP target id of its tab, which stays the same for
 
 ## Focus
 
-The daemon keeps the user's foreground window. `new_page` always opens a background tab and `select_page` never brings the page to the front, whatever the arguments say.
+`new_page` opens a background tab unless the call passes `background: false`. `select_page` passes `bringToFront` through to chrome-devtools-mcp: without it the page is selected in the background, and `bringToFront: true` makes it the active tab of its window. Daemon-native tools work on the session's tab without activating it.
 
-On X11 the daemon also runs a focus guard. It watches `_NET_ACTIVE_WINDOW` and `_NET_CLIENT_LIST` of the root window through `xprop -spy`. When a window of this profile's Chrome (matched by the user data directory in `WM_CLASS`) becomes active within 5 seconds of appearing (Chrome launch, a popup opened by the page), or while an input tool (`click_at`, `click_selector`, `click_text`, `dispatch_key`, `type_into`, `click`, `fill`, `press_key`, `upload_file`, ...) is running or returned less than a second ago, it re-activates the previous window with `xdotool windowactivate`. The user clicking an existing Chrome window at any other time is left alone. The Nix package puts `xprop` and `xdotool` on the wrapper's PATH. The daemon log has `focus guard: active` or `focus guard: inactive (<reason>)` at start and one line per restore.
+A browser extension's inline menu (1Password, for one) opens only in the active tab of the window that has the OS focus. To use it, open a new tab with `new_page`, make it active with `select_page {pageId, bringToFront: true}`, and if Chrome's window is not in front, raise it with `xdotool windowactivate`. The focus can stay with Chrome afterwards.
 
 ## Commands
 

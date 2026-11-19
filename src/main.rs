@@ -4,7 +4,6 @@ mod cli;
 mod config;
 mod daemon;
 mod error;
-mod focus;
 mod frame;
 mod grammar;
 mod lock;

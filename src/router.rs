@@ -1741,7 +1741,7 @@ fn native_tool_defs() -> Vec<serde_json::Value> {
     vec![
         serde_json::json!({
             "name": "new_window",
-            "description": "Daemon-native: open a URL in a new Chrome window without activating it (CDP Target.createTarget with newWindow and background) and make it the session page. The page is the active tab of its own window, which browser extensions such as 1Password require for their inline menu, while the user's foreground window stays as it is.",
+            "description": "Daemon-native: open a URL in a new Chrome window without activating it (CDP Target.createTarget with newWindow and background) and make it the session page. The page is the active tab of its own window while the user's foreground window stays as it is. For a browser extension's inline menu, which also needs the OS focus, use a new tab with select_page bringToFront: true instead.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -2209,7 +2209,6 @@ pub(crate) fn try_native_tool(
     if !is_native_tool(&name) {
         return None;
     }
-    let _input = crate::focus::is_input_tool(&name).then(crate::focus::InputScope::begin);
     // A fresh session has no MCP page id yet. Let the router allocate and record
     // one once; after that, native tools can keep bypassing the MCP queue.
     let session_id = session_id?;
@@ -2594,7 +2593,6 @@ fn route_request(
         .and_then(|name| name.as_str())
         .unwrap_or("")
         .to_string();
-    let _input = crate::focus::is_input_tool(&name).then(crate::focus::InputScope::begin);
     match name.as_str() {
         "new_page" => route_new_page(
             mcp_stdin,
@@ -2630,6 +2628,7 @@ fn route_request(
             sessions,
             session_id,
             &value,
+            line,
             next_id,
             abandoned_ids,
         ),
@@ -2818,7 +2817,9 @@ fn route_new_page(
         })
         .and_then(|arguments| arguments.as_object_mut())
     {
-        arguments.insert("background".to_string(), serde_json::json!(true));
+        arguments
+            .entry("background".to_string())
+            .or_insert_with(|| serde_json::json!(true));
     }
     let port = current_port(profile);
     let before = port
@@ -2934,6 +2935,7 @@ fn route_select_page(
     sessions: &SharedSessions,
     session_id: Option<&str>,
     value: &serde_json::Value,
+    line: &str,
     next_id: &mut u64,
     abandoned_ids: &mut HashMap<u64, Instant>,
 ) -> Result<Vec<String>, String> {
@@ -2942,21 +2944,7 @@ fn route_select_page(
         .and_then(|params| params.get("arguments"))
         .and_then(|arguments| arguments.get("pageId"))
         .and_then(|page_id| page_id.as_u64());
-    let mut forwarded = value.clone();
-    if let Some(arguments) = forwarded
-        .get_mut("params")
-        .and_then(|params| params.get_mut("arguments"))
-        .and_then(|arguments| arguments.as_object_mut())
-    {
-        arguments.insert("bringToFront".to_string(), serde_json::json!(false));
-    }
-    let lines = forward_line(
-        mcp_stdin,
-        mcp_reader,
-        &forwarded.to_string(),
-        next_id,
-        abandoned_ids,
-    )?;
+    let lines = forward_line(mcp_stdin, mcp_reader, line, next_id, abandoned_ids)?;
     if let (Some(session_id), Some(page_id)) = (session_id, requested) {
         let response = lines
             .last()

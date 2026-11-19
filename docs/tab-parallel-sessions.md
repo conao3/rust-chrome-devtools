@@ -72,7 +72,7 @@ A session can get a page in 3 ways.
 
 Page allocation uses Chrome's default browser context. `isolatedContext` is reserved for an explicit separate storage context request. The daemon's session isolation is page-id based, so regular profile extensions stay available in session tabs.
 
-`new_page` always uses `background=true` and `select_page` always uses `bringToFront=false`; the daemon overwrites the client's values so that no tool takes the user's foreground window. Routing still uses the session page id.
+`new_page` defaults to `background=true` in session-routed mode; a client may pass `background=false`. `select_page` forwards the client's `bringToFront`, so a client can make the session page the active tab of its window. Routing still uses the session page id.
 
 ## Router behavior
 
