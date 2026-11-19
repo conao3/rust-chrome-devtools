@@ -1740,16 +1740,6 @@ pub(crate) fn is_native_tool(name: &str) -> bool {
 fn native_tool_defs() -> Vec<serde_json::Value> {
     vec![
         serde_json::json!({
-            "name": "new_window",
-            "description": "Daemon-native: open a URL in a new Chrome window without activating it (CDP Target.createTarget with newWindow and background) and make it the session page. The page is the active tab of its own window while the user's foreground window stays as it is. For a browser extension's inline menu, which also needs the OS focus, use a new tab with select_page bringToFront: true instead.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "url": { "type": "string", "description": "URL to open. Default about:blank." }
-                }
-            }
-        }),
-        serde_json::json!({
             "name": "goto",
             "description": "Daemon-native: navigate the session page with CDP without bringing Chrome to the front, then wait for page readiness, a selector, or a JavaScript expression.",
             "inputSchema": {
@@ -2611,16 +2601,6 @@ fn route_request(
                 session_id.and_then(|id| session_page(sessions, id)),
             ))
         }
-        "new_window" => route_new_window(
-            mcp_stdin,
-            mcp_reader,
-            profile,
-            sessions,
-            session_id,
-            &value,
-            next_id,
-            abandoned_ids,
-        ),
         "select_page" => route_select_page(
             mcp_stdin,
             mcp_reader,
@@ -2858,73 +2838,6 @@ fn route_new_page(
         }
     }
     Ok(lines)
-}
-
-/// Opens a new window without activating it and makes it the session page. Use it when a page
-/// must be the active tab of its own window (a browser extension's inline menu) while the user keeps
-/// working in another application.
-#[allow(clippy::too_many_arguments)]
-fn route_new_window(
-    mcp_stdin: &mut impl Write,
-    mcp_reader: &mut impl BufRead,
-    profile: &Profile,
-    sessions: &SharedSessions,
-    session_id: Option<&str>,
-    value: &serde_json::Value,
-    next_id: &mut u64,
-    abandoned_ids: &mut HashMap<u64, Instant>,
-) -> Result<Vec<String>, String> {
-    let id = value.get("id").cloned().unwrap_or(serde_json::Value::Null);
-    let session_id = session_id.ok_or_else(|| "new_window requires a session".to_string())?;
-    let port = current_port(profile).ok_or_else(|| "missing DevTools port".to_string())?;
-    let url = value
-        .get("params")
-        .and_then(|params| params.get("arguments"))
-        .and_then(|arguments| arguments.get("url"))
-        .and_then(|url| url.as_str())
-        .unwrap_or("about:blank")
-        .to_string();
-    let before = list_page_ids(mcp_stdin, mcp_reader, next_id, abandoned_ids)?;
-    let target_id = cdp::create_background_window(port, &url)?;
-    let mut page_id = None;
-    for _ in 0..20 {
-        let after = list_page_ids(mcp_stdin, mcp_reader, next_id, abandoned_ids)?;
-        page_id = after.into_iter().find(|id| !before.contains(id));
-        if page_id.is_some() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    let Some(page_id) = page_id else {
-        let _ = cdp::close_target(port, &target_id);
-        return Err("the new window did not appear in list_pages".to_string());
-    };
-    let response = mcp_call(
-        mcp_stdin,
-        mcp_reader,
-        next_id,
-        abandoned_ids,
-        serde_json::json!({
-            "method": "tools/call",
-            "params": {
-                "name": "select_page",
-                "arguments": { "pageId": page_id, "bringToFront": false }
-            }
-        }),
-    )?;
-    if response.get("error").is_some() {
-        return Err(format!("select_page on the new window failed: {response}"));
-    }
-    record_session_page(sessions, session_id, page_id, true, Some(url.clone()))?;
-    set_session_target_id(sessions, session_id, Some(target_id.clone()));
-    attach_dialog_watcher(sessions, session_id, port, &target_id);
-    Ok(native_tool_response(
-        id,
-        format!(
-            "opened {url} in a new background window as page {page_id}; it is now the session page"
-        ),
-        false,
-    ))
 }
 
 #[allow(clippy::too_many_arguments)]
