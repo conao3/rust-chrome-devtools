@@ -190,7 +190,7 @@ nix develop -c cargo clippy
 
 ## Release
 
-Dispatch the Release workflow from `master`. It bumps the version, runs the checks, pushes the version commit and the tag `v<version>`, publishes `chrome-devtools` to crates.io through trusted publishing, and creates the GitHub Release.
+Dispatch the Release workflow from `master`. It bumps the version, verifies the crate, pushes the version commit and the tag `v<version>`, publishes `chrome-devtools` to crates.io through trusted publishing, and creates the GitHub Release.
 
 ```sh
 gh workflow run release.yml --ref master -f version_bump=patch

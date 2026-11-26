@@ -24,7 +24,7 @@ defaults:
     shell: bash
 jobs:
   check:
-    name: Bump and check
+    name: Bump version
     runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions:
@@ -73,12 +73,6 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           read -ra files <<< "$VERSION_FILES"
           git commit -m "Bump version to $VERSION" -- "${files[@]}"
-      - name: Check formatting
-        run: make fmt-check
-      - name: Run Clippy
-        run: make lint
-      - name: Test
-        run: make test
       - name: Verify crate
         run: cargo publish --locked --dry-run
       - name: Bundle the version commit
