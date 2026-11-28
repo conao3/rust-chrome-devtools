@@ -41,6 +41,7 @@ npx skills add ./rust-chrome-devtools
 - Profiles are read from `~/.config/chrome-devtools/config.toml`.
 - If the config file is missing on startup, the CLI creates a `default` profile using `~/.config/chrome-devtools/profiles/default`.
 - `user_data_dir` is optional; when omitted, it defaults to `~/.config/chrome-devtools/profiles/<profile-name>`.
+- `wayland_display` is optional; when set, the profile's Chrome runs on that Wayland compositor socket instead of the caller's display (see Configuration).
 - Prefer `user_data_dir` values under `~/.config/chrome-devtools/profiles/<profile-name>` so Chrome profile data stays with the tool config.
 - The CLI may execute `chrome-devtools-mcp` internally for a selected profile.
 - MCP JSON-RPC input and output are routed through one long-lived per-profile daemon by default.
@@ -57,7 +58,20 @@ npx skills add ./rust-chrome-devtools
 ```toml
 [[profiles]]
 name = "default"
+
+[[profiles]]
+name = "conao3"
+user_data_dir = "~/.config/chrome-devtools/profiles/conao3"
+wayland_display = "/run/user/1000/sellaite-chrome/wayland-0"
 ```
+
+Profile keys:
+
+- `name` (required): the profile name passed to `--profile`.
+- `user_data_dir`: Chrome's user data directory. `~/` is expanded. Default: `~/.config/chrome-devtools/profiles/<name>`.
+- `wayland_display`: absolute path of a Wayland compositor socket, such as a headless sway desktop. `~/` is expanded. When set, every Chrome the CLI launches for the profile gets `WAYLAND_DISPLAY=<path>`, runs without `DISPLAY` and with `--ozone-platform=wayland` (after any `CHROME_DEVTOOLS_CHROME_EXTRA_ARGS`), so its windows open on that desktop and never on the screen of the shell that ran the command. `XDG_RUNTIME_DIR` and the D-Bus address stay as they are, so the keyring and 1Password keep working. If the socket does not exist when Chrome has to be launched, the command fails with `wayland_display <path> of profile <name> does not exist; the systemd user unit sellaite-chrome-desktop must be running ...` instead of falling back to `DISPLAY`; `daemon start-daemon` checks this before it starts the daemon. A Chrome that is already running for the profile is reused as it is, so after adding the key stop the daemon and the profile (`daemon stop-daemon`, then `profile stop-profile`) once. `profile list-profiles` and `profile get-profile-status` show the value as `WaylandDisplay`.
+
+The deprecated `port` key is ignored with a warning; any other key is rejected with `unknown profile key`.
 
 Environment overrides:
 

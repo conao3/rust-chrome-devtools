@@ -135,6 +135,10 @@ pub(crate) fn start_daemon(profile: &Profile) -> Result<Option<u32>, String> {
         return Ok(None);
     }
 
+    if reusable_chrome_port(profile)?.is_none() {
+        profile_wayland_display(profile)?;
+    }
+
     let dir = daemon_dir()?;
     fs::create_dir_all(&dir)
         .map_err(|error| format!("failed to create {}: {error}", dir.display()))?;
@@ -684,20 +688,53 @@ fn own_scope_command(program: &Path, profile_name: &str, role: &str) -> Command 
     command
 }
 
-pub(crate) fn ensure_chrome(profile: &Profile) -> Result<(), String> {
+pub(crate) fn profile_wayland_display(profile: &Profile) -> Result<Option<PathBuf>, String> {
+    let Some(raw) = profile.wayland_display.as_deref() else {
+        return Ok(None);
+    };
+    let path = expand_home(raw)?;
+    if !path.exists() {
+        return Err(format!(
+            "wayland_display {} of profile {} does not exist; the systemd user unit sellaite-chrome-desktop must be running (systemctl --user start sellaite-chrome-desktop), or change wayland_display in ~/{CONFIG_RELATIVE_PATH}",
+            path.display(),
+            profile.name
+        ));
+    }
+    Ok(Some(path))
+}
+
+pub(crate) fn apply_wayland_display(command: &mut Command, wayland_display: Option<&Path>) {
+    if let Some(path) = wayland_display {
+        command
+            .env("WAYLAND_DISPLAY", path)
+            .env_remove("DISPLAY")
+            .arg("--ozone-platform=wayland");
+    }
+}
+
+fn reusable_chrome_port(profile: &Profile) -> Result<Option<u16>, String> {
     if let Some(port) = read_runtime_port(profile) {
         if is_devtools_ready(port) {
-            return Ok(());
+            return Ok(Some(port));
         }
     }
 
     if let Some(port) = find_running_chrome_port(profile) {
         if is_devtools_ready(port) {
             write_runtime_port(profile, port)?;
-            return Ok(());
+            return Ok(Some(port));
         }
     }
 
+    Ok(None)
+}
+
+pub(crate) fn ensure_chrome(profile: &Profile) -> Result<(), String> {
+    if reusable_chrome_port(profile)?.is_some() {
+        return Ok(());
+    }
+
+    let wayland_display = profile_wayland_display(profile)?;
     let port = pick_free_port()?;
     let chrome = env::var("CHROME").unwrap_or_else(|_| default_chrome_binary());
     let user_data_dir = expand_home(&profile.user_data_dir)?;
@@ -706,7 +743,8 @@ pub(crate) fn ensure_chrome(profile: &Profile) -> Result<(), String> {
         .try_clone()
         .map_err(|error| format!("failed to clone Chrome log handle: {error}"))?;
 
-    own_scope_command(Path::new(&chrome), &profile.name, "chrome")
+    let mut command = own_scope_command(Path::new(&chrome), &profile.name, "chrome");
+    command
         .arg("--remote-debugging-address=127.0.0.1")
         .arg(format!("--remote-debugging-port={port}"))
         .arg(format!("--user-data-dir={}", user_data_dir.display()))
@@ -717,7 +755,9 @@ pub(crate) fn ensure_chrome(profile: &Profile) -> Result<(), String> {
             env::var("CHROME_DEVTOOLS_CHROME_EXTRA_ARGS")
                 .ok()
                 .as_deref(),
-        ))
+        ));
+    apply_wayland_display(&mut command, wayland_display.as_deref());
+    command
         .stdin(Stdio::null())
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(log_for_stderr))

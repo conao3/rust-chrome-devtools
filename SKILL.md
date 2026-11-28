@@ -77,6 +77,16 @@ name = "conao3"
 ~/.config/chrome-devtools/profiles/<profile-name>
 ```
 
+`wayland_display` is optional. It runs the profile's Chrome inside a Wayland compositor, such as a headless sway desktop, instead of on the screen of the shell that started it:
+
+```toml
+[[profiles]]
+name = "conao3"
+wayland_display = "/run/user/1000/sellaite-chrome/wayland-0"
+```
+
+With it set, Chrome is launched with `WAYLAND_DISPLAY=<path>`, without `DISPLAY`, and with `--ozone-platform=wayland`, whatever `DISPLAY` the agent has. Do not prefix the commands with `DISPLAY=:0` or `env -u DISPLAY` for such a profile. If the socket is missing, `daemon start-daemon` and the first command that has to launch Chrome fail with `wayland_display <path> of profile <name> does not exist; the systemd user unit sellaite-chrome-desktop must be running ...`; start that unit (`systemctl --user start sellaite-chrome-desktop`) and retry. `profile list-profiles` shows the value as `WaylandDisplay`.
+
 Check profiles before operating:
 
 ```sh
@@ -276,4 +286,5 @@ chrome-devtools profile stop-profile --profile conao3
 - If the profile's Chrome is not running, `mcp forward-requests` / `mcp run-batch` / `mcp list-tools` will start it on first use.
 - When Chrome exits unexpectedly, read `~/.cache/chrome-devtools/daemons/<profile>.chrome.log.1` (the previous Chrome's output) for the `FATAL` line.
 - If login state is missing, verify the profile name and `user_data_dir`; login cookies are profile-specific.
+- If a command fails with `wayland_display ... does not exist`, the compositor of the profile is not running. Start the systemd user unit `sellaite-chrome-desktop` and retry; the CLI does not fall back to `DISPLAY`.
 - If `mcp run-batch` reports `unknown step type`, check the `Type` field; only `tool` and `sleep_ms` are supported.

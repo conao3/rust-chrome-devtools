@@ -353,7 +353,13 @@ fn dispatch(config: &Config, command: Command) -> Result<Dispatched> {
             let profiles: Vec<Value> = config
                 .profiles
                 .iter()
-                .map(|profile| json!({"Name": profile.name, "UserDataDir": profile.user_data_dir}))
+                .map(|profile| {
+                    json!({
+                        "Name": profile.name,
+                        "UserDataDir": profile.user_data_dir,
+                        "WaylandDisplay": profile.wayland_display
+                    })
+                })
                 .collect();
             done("list-profiles", json!({ "Profiles": profiles }))
         }
@@ -366,7 +372,8 @@ fn dispatch(config: &Config, command: Command) -> Result<Dispatched> {
                     "Profile": profile.name,
                     "Status": if port.is_some() { "ready" } else { "stopped" },
                     "Port": port,
-                    "UserDataDir": profile.user_data_dir
+                    "UserDataDir": profile.user_data_dir,
+                    "WaylandDisplay": profile.wayland_display
                 }),
             )
         }

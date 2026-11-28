@@ -8,6 +8,7 @@ use crate::router::*;
 use std::collections::HashMap;
 use std::env;
 use std::io::BufRead;
+use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -33,6 +34,32 @@ fn parse_config_accepts_explicit_user_data_dir() {
     let config =
         parse_config("[[profiles]]\nname = \"work\"\nuser_data_dir = \"/tmp/work\"\n").unwrap();
     assert_eq!(config.profiles[0].user_data_dir, "/tmp/work");
+}
+
+#[test]
+fn parse_config_reads_wayland_display() {
+    let config = parse_config(
+        "[[profiles]]\nname = \"wl\"\nwayland_display = \"/run/user/1000/sellaite-chrome/wayland-0\"\n\n[[profiles]]\nname = \"plain\"\n",
+    )
+    .unwrap();
+    assert_eq!(
+        config.profiles[0].wayland_display.as_deref(),
+        Some("/run/user/1000/sellaite-chrome/wayland-0")
+    );
+    assert_eq!(config.profiles[1].wayland_display, None);
+}
+
+#[test]
+fn parse_config_rejects_unquoted_wayland_display() {
+    let error = parse_config("[[profiles]]\nname = \"wl\"\nwayland_display = /tmp/wayland-1\n")
+        .unwrap_err();
+    assert!(error.contains("line 3: expected quoted string"), "{error}");
+}
+
+#[test]
+fn parse_config_still_rejects_unknown_profile_keys() {
+    let error = parse_config("[[profiles]]\nname = \"wl\"\ndisplay = \":1\"\n").unwrap_err();
+    assert!(error.contains("unknown profile key: display"), "{error}");
 }
 
 #[test]
@@ -654,6 +681,7 @@ fn dummy_config() -> Config {
         profiles: vec![Profile {
             name: "default".to_string(),
             user_data_dir: "/tmp/x".to_string(),
+            wayland_display: None,
         }],
     }
 }
@@ -760,6 +788,96 @@ fn chrome_extra_args_splits_on_whitespace() {
 fn chrome_extra_args_is_empty_without_value() {
     assert!(chrome_extra_args(None).is_empty());
     assert!(chrome_extra_args(Some("  ")).is_empty());
+}
+
+fn wayland_profile(wayland_display: Option<&str>) -> Profile {
+    Profile {
+        name: "wl".to_string(),
+        user_data_dir: "/tmp/wl".to_string(),
+        wayland_display: wayland_display.map(str::to_string),
+    }
+}
+
+#[test]
+fn profile_wayland_display_is_none_without_setting() {
+    assert_eq!(
+        profile_wayland_display(&wayland_profile(None)).unwrap(),
+        None
+    );
+}
+
+#[test]
+fn profile_wayland_display_returns_existing_socket_path() {
+    let path = env::temp_dir();
+    let profile = wayland_profile(Some(path.to_str().unwrap()));
+    assert_eq!(profile_wayland_display(&profile).unwrap(), Some(path));
+}
+
+#[test]
+fn profile_wayland_display_expands_home() {
+    let profile = wayland_profile(Some("~/cdt-missing-wayland/wayland-0"));
+    let error = profile_wayland_display(&profile).unwrap_err();
+    let expanded =
+        PathBuf::from(env::var_os("HOME").unwrap()).join("cdt-missing-wayland/wayland-0");
+    assert!(
+        error.starts_with(&format!(
+            "wayland_display {} of profile wl",
+            expanded.display()
+        )),
+        "{error}"
+    );
+}
+
+#[test]
+fn profile_wayland_display_names_setting_and_unit_when_missing() {
+    let profile = wayland_profile(Some("/nonexistent-cdt-test/wayland-9"));
+    let error = profile_wayland_display(&profile).unwrap_err();
+    assert!(
+        error.contains("wayland_display /nonexistent-cdt-test/wayland-9 of profile wl"),
+        "{error}"
+    );
+    assert!(error.contains("sellaite-chrome-desktop"), "{error}");
+}
+
+fn command_env(command: &Command, key: &str) -> Option<Option<String>> {
+    command
+        .get_envs()
+        .find(|(name, _)| *name == key)
+        .map(|(_, value)| value.map(|value| value.to_string_lossy().into_owned()))
+}
+
+#[test]
+fn apply_wayland_display_sets_socket_drops_display_and_adds_ozone_flag() {
+    let mut command = Command::new("chrome");
+    command.env("DISPLAY", ":0").arg("--ozone-platform=x11");
+    apply_wayland_display(
+        &mut command,
+        Some(Path::new("/run/user/1000/sellaite-chrome/wayland-0")),
+    );
+    assert_eq!(
+        command_env(&command, "WAYLAND_DISPLAY"),
+        Some(Some("/run/user/1000/sellaite-chrome/wayland-0".to_string()))
+    );
+    assert_eq!(command_env(&command, "DISPLAY"), Some(None));
+    assert_eq!(command_env(&command, "XDG_RUNTIME_DIR"), None);
+    let args: Vec<_> = command.get_args().collect();
+    assert_eq!(
+        args.last().map(|arg| arg.to_string_lossy().into_owned()),
+        Some("--ozone-platform=wayland".to_string())
+    );
+}
+
+#[test]
+fn apply_wayland_display_leaves_command_alone_without_setting() {
+    let mut command = Command::new("chrome");
+    command.env("DISPLAY", ":0");
+    apply_wayland_display(&mut command, None);
+    assert_eq!(
+        command_env(&command, "DISPLAY"),
+        Some(Some(":0".to_string()))
+    );
+    assert_eq!(command_env(&command, "WAYLAND_DISPLAY"), None);
+    assert_eq!(command.get_args().count(), 0);
 }
 
 #[test]

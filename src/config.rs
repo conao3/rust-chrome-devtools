@@ -12,12 +12,14 @@ pub(crate) struct Config {
 pub(crate) struct Profile {
     pub(crate) name: String,
     pub(crate) user_data_dir: String,
+    pub(crate) wayland_display: Option<String>,
 }
 
 #[derive(Default)]
 pub(crate) struct ProfileBuilder {
     name: Option<String>,
     user_data_dir: Option<String>,
+    wayland_display: Option<String>,
 }
 
 pub(crate) const CONFIG_RELATIVE_PATH: &str = ".config/chrome-devtools/config.toml";
@@ -94,6 +96,9 @@ pub(crate) fn parse_config(content: &str) -> Result<Config, String> {
                 );
             }
             "user_data_dir" => profile.user_data_dir = Some(parse_toml_string(value, line_number)?),
+            "wayland_display" => {
+                profile.wayland_display = Some(parse_toml_string(value, line_number)?)
+            }
             unknown => {
                 return Err(format!(
                     "line {line_number}: unknown profile key: {unknown}"
@@ -134,6 +139,7 @@ pub(crate) fn push_profile(
     profiles.push(Profile {
         name,
         user_data_dir,
+        wayland_display: builder.wayland_display,
     });
     Ok(())
 }

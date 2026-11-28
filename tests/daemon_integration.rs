@@ -2652,3 +2652,131 @@ fn status_reports_version_sessions_and_health() {
         "status: {status}"
     );
 }
+
+fn fake_chrome_path() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-chrome.sh")
+}
+
+fn write_wl_profile(env: &TestEnv, wayland_display: Option<&Path>) {
+    let mut config =
+        "[[profiles]]\nname = \"default\"\n\n[[profiles]]\nname = \"wl\"\n".to_string();
+    if let Some(path) = wayland_display {
+        config.push_str(&format!("wayland_display = \"{}\"\n", path.display()));
+    }
+    fs::write(env.home.join(".config/chrome-devtools/config.toml"), config).unwrap();
+}
+
+fn spawned_chrome_environ(env: &TestEnv) -> (Vec<String>, Vec<String>) {
+    let dump = env.home.join("chrome.env");
+    let mut child = env
+        .cli()
+        .args(["mcp", "forward-direct-requests", "--profile", "wl"])
+        .env("CHROME", fake_chrome_path())
+        .env("FAKE_CHROME_DUMP", &dump)
+        .env("DISPLAY", ":0")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let started = Instant::now();
+    while !dump.exists() {
+        if started.elapsed() >= Duration::from_secs(10) {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("fake Chrome did not dump its environment within 10s");
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    let environ = fs::read_to_string(&dump)
+        .unwrap()
+        .lines()
+        .map(str::to_string)
+        .collect();
+    let args = fs::read_to_string(env.home.join("chrome.env.args"))
+        .unwrap()
+        .lines()
+        .map(str::to_string)
+        .collect();
+    (environ, args)
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn chrome_runs_on_the_profile_wayland_display_without_x11_display() {
+    let env = TestEnv::new("wayland-env");
+    let socket = env.home.join("wayland-test");
+    fs::write(&socket, "").unwrap();
+    write_wl_profile(&env, Some(&socket));
+
+    let (environ, args) = spawned_chrome_environ(&env);
+
+    assert!(
+        environ.contains(&format!("WAYLAND_DISPLAY={}", socket.display())),
+        "environ: {environ:?}"
+    );
+    assert!(
+        !environ.iter().any(|line| line.starts_with("DISPLAY=")),
+        "environ: {environ:?}"
+    );
+    if let Some(runtime_dir) = std::env::var_os("XDG_RUNTIME_DIR") {
+        assert!(
+            environ.contains(&format!(
+                "XDG_RUNTIME_DIR={}",
+                runtime_dir.to_string_lossy()
+            )),
+            "environ: {environ:?}"
+        );
+    }
+    assert!(
+        args.contains(&"--ozone-platform=wayland".to_string()),
+        "args: {args:?}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn chrome_keeps_the_caller_display_without_wayland_display() {
+    let env = TestEnv::new("x11-env");
+    write_wl_profile(&env, None);
+
+    let (environ, args) = spawned_chrome_environ(&env);
+
+    assert!(
+        environ.contains(&"DISPLAY=:0".to_string()),
+        "environ: {environ:?}"
+    );
+    assert!(
+        !args.iter().any(|arg| arg.starts_with("--ozone-platform")),
+        "args: {args:?}"
+    );
+}
+
+#[test]
+fn start_daemon_fails_before_spawning_when_wayland_display_is_missing() {
+    let env = TestEnv::new("wayland-missing");
+    let socket = env.home.join("missing/wayland-1");
+    write_wl_profile(&env, Some(&socket));
+
+    let (ok, output) = env.run_cli(&["daemon", "start-daemon", "--profile", "wl"]);
+
+    assert!(!ok, "output: {output}");
+    assert!(
+        output.contains(&format!(
+            "wayland_display {} of profile wl does not exist",
+            socket.display()
+        )),
+        "output: {output}"
+    );
+    assert!(
+        output.contains("sellaite-chrome-desktop"),
+        "output: {output}"
+    );
+    assert!(
+        !env.home
+            .join(".cache/chrome-devtools/daemons/wl.sock")
+            .exists()
+    );
+}
