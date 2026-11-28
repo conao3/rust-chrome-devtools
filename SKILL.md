@@ -23,7 +23,7 @@ Use `chrome-devtools` when you need browser automation through Chrome DevTools M
 - Take a fresh snapshot before using `click`, `fill`, or other uid-based actions if the page may have changed.
 - On very large pages (huge DOM, e.g. big GitHub PR file views) `take_snapshot` can take minutes: Chrome's full accessibility-tree dump scales super-linearly with node count. Heavy tools (`take_snapshot`, `take_screenshot`, `performance_*`) get a 300s deadline (others 120s). If a heavy call times out it usually still completed in the background and blocks the next tool call until done — prefer targeted `evaluate_script` over full snapshots on such pages.
 - Do not start or kill the user's regular Chrome unless explicitly asked.
-- If a browser login is required, open the page and ask the user to complete the login manually.
+- Finish logins and every other browser step yourself in the profile, with its saved sessions and password manager. Hand over to the user only a step that needs the user's own device, such as a phone approval, a QR code or an SMS code.
 - The daemon and its Chrome are shared with other agents. `daemon stop-daemon` refuses while sessions are active and `profile stop-profile` refuses while the daemon is running; only pass `--force` when the user explicitly asks to tear them down.
 - If Chrome's DevTools endpoint or MCP stops responding, the daemon respawns MCP and drops in-memory sessions. Mint a new session after an `unknown session` response.
 
